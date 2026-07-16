@@ -41,19 +41,25 @@ client. See [Build & test](#build--test).
   pixels, with clipped drawing: `fb-put` / `fb-get`, `fb-fill`, `fb-rect`,
   `fb-hline` / `fb-vline`, `fb-frame` (outline), `fb-blit` (compose), `rgb`.
 - **RFB server** — the version + security handshake (`None`), `ServerInit`
-  advertising a 32-bit X8R8G8B8 pixel format, `FramebufferUpdate` (Raw encoding)
-  in response to update requests, and `KeyEvent` / `PointerEvent` dispatched to
-  caller callbacks. Each client runs in its own thread; `:once` serves a single
-  client (for tests).
+  (32-bit X8R8G8B8), and the message loop:
+  - **Dirty-region tracking** — each client keeps a snapshot; an incremental
+    `FramebufferUpdateRequest` sends only the tiles that changed since, so a
+    static screen costs almost nothing.
+  - **Encodings**: **Hextile** (lossless, negotiated via `SetEncodings`) —
+    excellent for desktop UI (solid runs cost a byte or two); ~**88× smaller than
+    Raw** on a typical 800×600 frame, pixel-identical. **Raw** as the fallback.
+  - **`KeyEvent` / `PointerEvent`** dispatched to caller callbacks.
+
+  Each client runs in its own thread; `:once` serves a single client (for tests).
 
 ## Not yet
 
-Dirty-region tracking and the compact encodings (CopyRect, RRE, Hextile, ZRLE,
-Tight) — v1 always sends the requested rect in full Raw, which every client
-understands but is bandwidth-hungry; a client's format request
+The zlib-based encodings (ZRLE, Tight) — they need a *persistent* zlib stream
+sync-flushed per rectangle (`Z_SYNC_FLUSH`), which salza2 doesn't expose, so
+they're gated on a sync-flush-capable deflate; a client's format request
 (`SetPixelFormat`) is read but not honored (we always serve X8R8G8B8); no VNC
-authentication, no `CopyRect`-based scrolling, no text/font drawing yet, no
-resize. Contributions welcome.
+authentication; no `CopyRect`-based scroll optimization; no text/font drawing
+yet; no resize. Contributions welcome.
 
 ## Build & test
 

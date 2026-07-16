@@ -113,10 +113,13 @@
           (loop for xx from x below (+ x w) for i = (+ row xx) do
             (setf (aref snap i) (aref px i))))))))
 
-;;; ---- framebuffer update (Raw encoding) -------------------------------------
+;;; ---- encodings --------------------------------------------------------------
+
+(defconstant +enc-raw+ 0)
+(defconstant +enc-hextile+ 5)
 
 (defun write-rect-raw (s fb x y w h)
-  (w-u16 s x) (w-u16 s y) (w-u16 s w) (w-u16 s h) (w-u32 s 0)   ; rect header, Raw
+  (w-u16 s x) (w-u16 s y) (w-u16 s w) (w-u16 s h) (w-u32 s +enc-raw+)
   (let ((px (fb-pixels fb)) (fw (fb-width fb))
         (buf (make-array (* w h 4) :element-type '(unsigned-byte 8))) (o 0))
     (loop for yy from y below (+ y h) for row = (* yy fw) do
@@ -128,38 +131,125 @@
         (incf o 4)))
     (w-bytes s buf)))
 
-(defun send-rects (s fb rects)
-  "One FramebufferUpdate carrying RECTS (each Raw-encoded)."
+;;; ---- Hextile encoding (RFC 6143 §7.7.4) ------------------------------------
+;;; Each 16x16 tile: a solid tile costs a byte (or a byte + colour); a tile of a
+;;; few colours is a background plus coloured sub-rectangles over it; a busy tile
+;;; falls back to raw.  Lossless (sharp text, full colour), no zlib — great for
+;;; desktop UI where most tiles are solid or near-solid.  Background persists
+;;; across tiles, so runs of the same colour cost one byte each.
+
+(defun %push-pixel (buf p)
+  (vector-push-extend (logand p #xff) buf)
+  (vector-push-extend (logand (ash p -8) #xff) buf)
+  (vector-push-extend (logand (ash p -16) #xff) buf)
+  (vector-push-extend 0 buf))
+
+(defun tile-info (px fw ax ay tw th)
+  "(values distinct-colour-count most-common-colour) for the tile."
+  (let ((counts (make-hash-table)) (best 0) (bestc 0))
+    (dotimes (ly th)
+      (let ((row (* (+ ay ly) fw)))
+        (dotimes (lx tw)
+          (let* ((c (aref px (+ row ax lx))) (n (1+ (gethash c counts 0))))
+            (setf (gethash c counts) n)
+            (when (> n best) (setf best n bestc c))))))
+    (values (hash-table-count counts) bestc)))
+
+(defun tile-subrects (px fw ax ay tw th bg)
+  "Non-background horizontal runs in the tile, each a (colour lx ly len) subrect."
+  (let ((subs '()))
+    (dotimes (ly th)
+      (let ((row (* (+ ay ly) fw)) (lx 0))
+        (loop while (< lx tw) do
+          (let ((c (aref px (+ row ax lx))))
+            (if (= c bg)
+                (incf lx)
+                (let ((start lx))
+                  (loop while (and (< lx tw) (= (aref px (+ row ax lx)) c)) do (incf lx))
+                  (push (list c start ly (- lx start)) subs)))))))
+    (nreverse subs)))
+
+(defun write-rect-hextile (s fb x y w h)
+  (w-u16 s x) (w-u16 s y) (w-u16 s w) (w-u16 s h) (w-u32 s +enc-hextile+)
+  (let ((px (fb-pixels fb)) (fw (fb-width fb)) (cur-bg -1)
+        (buf (make-array 512 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0)))
+    (loop for ty from 0 below h by 16 for th = (min 16 (- h ty)) do
+      (loop for tx from 0 below w by 16 for tw = (min 16 (- w tx)) do
+        (let ((ax (+ x tx)) (ay (+ y ty)))
+          (multiple-value-bind (ncol bg) (tile-info px fw ax ay tw th)
+            (cond
+              ((= ncol 1)                                  ; solid tile
+               (if (= bg cur-bg)
+                   (vector-push-extend 0 buf)              ; mask 0 — same background
+                   (progn (vector-push-extend 2 buf) (%push-pixel buf bg) (setf cur-bg bg))))
+              (t
+               (let* ((subs (tile-subrects px fw ax ay tw th bg))
+                      (nsub (length subs)))
+                 (if (and (<= nsub 255) (< (* nsub 6) (* tw th 4)))   ; hextile beats raw?
+                     (let ((mask (logior 8 16)))            ; AnySubrects | SubrectsColoured
+                       (unless (= bg cur-bg) (setf mask (logior mask 2)))
+                       (vector-push-extend mask buf)
+                       (unless (= bg cur-bg) (%push-pixel buf bg) (setf cur-bg bg))
+                       (vector-push-extend nsub buf)
+                       (dolist (sr subs)
+                         (destructuring-bind (c lx ly len) sr
+                           (%push-pixel buf c)
+                           (vector-push-extend (logior (ash lx 4) ly) buf)
+                           (vector-push-extend (logior (ash (1- len) 4) 0) buf))))
+                     (progn                                 ; raw tile
+                       (vector-push-extend 1 buf)           ; mask 1 = Raw
+                       (setf cur-bg -1)
+                       (dotimes (ly th)
+                         (let ((row (* (+ ay ly) fw)))
+                           (dotimes (lx tw) (%push-pixel buf (aref px (+ row ax lx)))))))))))))))
+    (w-bytes s buf)))
+
+;;; ---- update assembly --------------------------------------------------------
+
+(defun write-rect (s fb x y w h enc)
+  (if (= enc +enc-hextile+)
+      (write-rect-hextile s fb x y w h)
+      (write-rect-raw s fb x y w h)))
+
+(defun send-rects (s fb rects enc)
+  "One FramebufferUpdate carrying RECTS in encoding ENC."
   (w-u8 s 0) (w-u8 s 0) (w-u16 s (length rects))             ; msg-type, pad, #rects
-  (dolist (r rects) (destructuring-bind (x y w h) r (write-rect-raw s fb x y w h)))
+  (dolist (r rects) (destructuring-bind (x y w h) r (write-rect s fb x y w h enc)))
   (force-output s))
 
 ;;; ---- client message loop ----------------------------------------------------
 
-(defun handle-update-request (fb s snap-box inc x y w h)
-  "Answer a FramebufferUpdateRequest.  A non-incremental request (or the first
-   one) sends the whole requested rect and resets the snapshot; an incremental
-   one waits briefly for a change, then sends only the dirty tiles."
+(defun handle-update-request (fb s snap-box enc inc x y w h)
+  "Answer a FramebufferUpdateRequest in encoding ENC.  A non-incremental request
+   (or the first one) sends the whole requested rect and resets the snapshot; an
+   incremental one waits briefly for a change, then sends only the dirty tiles."
   (if (or (zerop inc) (null (car snap-box)))
       (let ((r (clip-rect fb x y w h)))
-        (send-rects s fb (list r))
+        (send-rects s fb (list r) enc)
         (setf (car snap-box) (copy-pixels fb)))
       (let ((snap (car snap-box)) (rects nil) (tries 0))
         (loop (setf rects (dirty-rects fb snap))
               (when (or rects (>= tries 300)) (return))   ; ~5s cap, then send nothing
               (sleep 1/60) (incf tries))
-        (send-rects s fb rects)
+        (send-rects s fb rects enc)
         (update-snapshot fb snap rects))))
 
+(defun choose-encoding (encs)
+  "Pick the best encoding we implement from the client's advertised list."
+  (if (member +enc-hextile+ encs) +enc-hextile+ +enc-raw+))
+
 (defun client-loop (fb s on-key on-pointer)
-  (let ((snap-box (list nil)))
+  (let ((snap-box (list nil)) (enc +enc-raw+))
     (loop
       (let ((msg (read-byte s nil :eof)))
         (case msg
           (0 (skip s 3) (r-bytes s 16))                    ; SetPixelFormat (we keep ours)
-          (2 (skip s 1) (let ((n (r-u16 s))) (dotimes (i n) (r-u32 s))))  ; SetEncodings
+          (2 (skip s 1)                                    ; SetEncodings
+             (let ((n (r-u16 s)) (encs '()))
+               (dotimes (i n) (push (r-u32 s) encs))
+               (setf enc (choose-encoding encs))))
           (3 (let ((inc (r-u8 s)) (x (r-u16 s)) (y (r-u16 s)) (w (r-u16 s)) (h (r-u16 s)))
-               (handle-update-request fb s snap-box inc x y w h)))
+               (handle-update-request fb s snap-box enc inc x y w h)))
           (4 (let ((down (r-u8 s)))                        ; KeyEvent
                (skip s 2)
                (let ((key (r-u32 s))) (when on-key (funcall on-key (plusp down) key)))))
