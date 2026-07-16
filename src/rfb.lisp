@@ -1,18 +1,19 @@
 ;;;; rfb.lisp — a VNC/RFB server (RFC 6143).
 ;;;;
 ;;;; Speaks RFB 3.8 over TCP: version + security handshake (None auth), ServerInit
-;;;; advertising our 32-bit X8R8G8B8 pixel format, then the message loop —
-;;;; FramebufferUpdateRequest is answered with a Raw-encoded update of the current
-;;;; framebuffer; KeyEvent / PointerEvent are dispatched to caller callbacks.
+;;;; advertising our 32-bit X8R8G8B8 pixel format, then the message loop.
 ;;;;
-;;;; v1 keeps it simple and always correct: every update sends the requested rect
-;;;; in full (Raw), with a short throttle on incremental polls so a client doesn't
-;;;; spin the CPU.  Dirty-region tracking and compact encodings (Hextile/ZRLE/
-;;;; Tight) are the efficiency follow-up; Raw is understood by every VNC client.
+;;;; Updates are DIRTY-REGION tracked: each client keeps a snapshot of what it has
+;;;; been shown, and an incremental FramebufferUpdateRequest sends only the tiles
+;;;; that changed since — so a mostly-static desktop costs almost nothing (the
+;;;; "fast" of fast/sharp/vibrant).  Pixels are lossless (currently Raw; ZRLE is
+;;;; the next step for the "sharp/vibrant" bandwidth win, still to stock clients).
+;;;; KeyEvent / PointerEvent are dispatched to caller callbacks.
 
 (in-package #:scry)
 
 (defvar *desktop-name* "scry")
+(defparameter *tile* 32 "Dirty-tracking granularity (pixels).")
 
 (defun string->bytes (s)
   (map '(simple-array (unsigned-byte 8) (*)) #'char-code s))
@@ -70,49 +71,102 @@
   (force-output s)
   t)
 
+;;; ---- snapshots + dirty-tile detection --------------------------------------
+
+(defun copy-pixels (fb)
+  (let* ((p (fb-pixels fb))
+         (c (make-array (length p) :element-type '(unsigned-byte 32))))
+    (replace c p) c))
+
+(defun clip-rect (fb x y w h)
+  "The requested rect clipped to the framebuffer, as (x y w h)."
+  (let ((x0 (max 0 x)) (y0 (max 0 y))
+        (x1 (min (fb-width fb) (+ x w))) (y1 (min (fb-height fb) (+ y h))))
+    (list x0 y0 (max 0 (- x1 x0)) (max 0 (- y1 y0)))))
+
+(defun tile-changed-p (fb snap x0 y0 x1 y1)
+  (let ((px (fb-pixels fb)) (fw (fb-width fb)))
+    (loop for y from y0 below y1 for row = (* y fw) do
+      (loop for x from x0 below x1 for i = (+ row x) do
+        (unless (= (aref px i) (aref snap i)) (return-from tile-changed-p t))))
+    nil))
+
+(defun dirty-rects (fb snap)
+  "Coalesced (x y w h) rectangles where FB differs from SNAP: changed tiles on a
+   *TILE* grid, merged into horizontal runs per tile-row."
+  (let ((fw (fb-width fb)) (fh (fb-height fb)) (ts *tile*) (rects '()))
+    (loop for ty from 0 below fh by ts for y1 = (min fh (+ ty ts)) do
+      (let ((run -1))
+        (loop for tx from 0 below fw by ts do
+          (if (tile-changed-p fb snap tx ty (min fw (+ tx ts)) y1)
+              (when (< run 0) (setf run tx))
+              (when (>= run 0) (push (list run ty (- tx run) (- y1 ty)) rects) (setf run -1))))
+        (when (>= run 0) (push (list run ty (- fw run) (- y1 ty)) rects))))
+    (nreverse rects)))
+
+(defun update-snapshot (fb snap rects)
+  "Copy the pixels of RECTS from FB into SNAP (they're now what the client has)."
+  (let ((px (fb-pixels fb)) (fw (fb-width fb)))
+    (dolist (r rects)
+      (destructuring-bind (x y w h) r
+        (loop for yy from y below (+ y h) for row = (* yy fw) do
+          (loop for xx from x below (+ x w) for i = (+ row xx) do
+            (setf (aref snap i) (aref px i))))))))
+
 ;;; ---- framebuffer update (Raw encoding) -------------------------------------
 
-(defun send-update (fb s x y w h)
-  "Send one FramebufferUpdate: the rect (X,Y,W,H) clipped to the framebuffer,
-   Raw-encoded (little-endian pixels, since big-endian-flag=0)."
-  (let* ((fw (fb-width fb))
-         (x0 (max 0 x)) (y0 (max 0 y))
-         (x1 (min fw (+ x w))) (y1 (min (fb-height fb) (+ y h)))
-         (rw (max 0 (- x1 x0))) (rh (max 0 (- y1 y0))))
-    (w-u8 s 0) (w-u8 s 0) (w-u16 s 1)          ; msg-type, pad, 1 rectangle
-    (w-u16 s x0) (w-u16 s y0) (w-u16 s rw) (w-u16 s rh)
-    (w-u32 s 0)                                ; encoding = Raw
-    (let ((px (fb-pixels fb))
-          (buf (make-array (* rw rh 4) :element-type '(unsigned-byte 8)))
-          (o 0))
-      (loop for yy from y0 below y1 for row = (* yy fw) do
-        (loop for xx from x0 below x1 for p = (aref px (+ row xx)) do
-          (setf (aref buf o)       (logand p #xff)          ; B
-                (aref buf (+ o 1)) (logand (ash p -8) #xff) ; G
-                (aref buf (+ o 2)) (logand (ash p -16) #xff); R
-                (aref buf (+ o 3)) 0)                        ; X
-          (incf o 4)))
-      (w-bytes s buf))
-    (force-output s)))
+(defun write-rect-raw (s fb x y w h)
+  (w-u16 s x) (w-u16 s y) (w-u16 s w) (w-u16 s h) (w-u32 s 0)   ; rect header, Raw
+  (let ((px (fb-pixels fb)) (fw (fb-width fb))
+        (buf (make-array (* w h 4) :element-type '(unsigned-byte 8))) (o 0))
+    (loop for yy from y below (+ y h) for row = (* yy fw) do
+      (loop for xx from x below (+ x w) for p = (aref px (+ row xx)) do
+        (setf (aref buf o)       (logand p #xff)             ; B (little-endian)
+              (aref buf (+ o 1)) (logand (ash p -8) #xff)    ; G
+              (aref buf (+ o 2)) (logand (ash p -16) #xff)   ; R
+              (aref buf (+ o 3)) 0)                           ; X
+        (incf o 4)))
+    (w-bytes s buf)))
+
+(defun send-rects (s fb rects)
+  "One FramebufferUpdate carrying RECTS (each Raw-encoded)."
+  (w-u8 s 0) (w-u8 s 0) (w-u16 s (length rects))             ; msg-type, pad, #rects
+  (dolist (r rects) (destructuring-bind (x y w h) r (write-rect-raw s fb x y w h)))
+  (force-output s))
 
 ;;; ---- client message loop ----------------------------------------------------
 
+(defun handle-update-request (fb s snap-box inc x y w h)
+  "Answer a FramebufferUpdateRequest.  A non-incremental request (or the first
+   one) sends the whole requested rect and resets the snapshot; an incremental
+   one waits briefly for a change, then sends only the dirty tiles."
+  (if (or (zerop inc) (null (car snap-box)))
+      (let ((r (clip-rect fb x y w h)))
+        (send-rects s fb (list r))
+        (setf (car snap-box) (copy-pixels fb)))
+      (let ((snap (car snap-box)) (rects nil) (tries 0))
+        (loop (setf rects (dirty-rects fb snap))
+              (when (or rects (>= tries 300)) (return))   ; ~5s cap, then send nothing
+              (sleep 1/60) (incf tries))
+        (send-rects s fb rects)
+        (update-snapshot fb snap rects))))
+
 (defun client-loop (fb s on-key on-pointer)
-  (loop
-    (let ((msg (read-byte s nil :eof)))
-      (case msg
-        (0 (skip s 3) (r-bytes s 16))                    ; SetPixelFormat (we keep ours)
-        (2 (skip s 1) (let ((n (r-u16 s))) (dotimes (i n) (r-u32 s))))  ; SetEncodings
-        (3 (let ((inc (r-u8 s)) (x (r-u16 s)) (y (r-u16 s)) (w (r-u16 s)) (h (r-u16 s)))
-             (when (plusp inc) (sleep 1/60))             ; throttle incremental polls
-             (send-update fb s x y w h)))
-        (4 (let ((down (r-u8 s)))                        ; KeyEvent
-             (skip s 2)
-             (let ((key (r-u32 s))) (when on-key (funcall on-key (plusp down) key)))))
-        (5 (let ((buttons (r-u8 s)) (x (r-u16 s)) (y (r-u16 s)))   ; PointerEvent
-             (when on-pointer (funcall on-pointer buttons x y))))
-        (6 (skip s 3) (let ((n (r-u32 s))) (r-bytes s n)))         ; ClientCutText
-        (t (return))))))                                 ; :eof or unknown -> done
+  (let ((snap-box (list nil)))
+    (loop
+      (let ((msg (read-byte s nil :eof)))
+        (case msg
+          (0 (skip s 3) (r-bytes s 16))                    ; SetPixelFormat (we keep ours)
+          (2 (skip s 1) (let ((n (r-u16 s))) (dotimes (i n) (r-u32 s))))  ; SetEncodings
+          (3 (let ((inc (r-u8 s)) (x (r-u16 s)) (y (r-u16 s)) (w (r-u16 s)) (h (r-u16 s)))
+               (handle-update-request fb s snap-box inc x y w h)))
+          (4 (let ((down (r-u8 s)))                        ; KeyEvent
+               (skip s 2)
+               (let ((key (r-u32 s))) (when on-key (funcall on-key (plusp down) key)))))
+          (5 (let ((buttons (r-u8 s)) (x (r-u16 s)) (y (r-u16 s)))    ; PointerEvent
+               (when on-pointer (funcall on-pointer buttons x y))))
+          (6 (skip s 3) (let ((n (r-u32 s))) (r-bytes s n)))          ; ClientCutText
+          (t (return)))))))                                ; :eof or unknown -> done
 
 ;;; ---- server -----------------------------------------------------------------
 
