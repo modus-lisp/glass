@@ -9,7 +9,7 @@ give modus a remote display, developed and tested on SBCL first."
   :version "0.0.1"
   :author "ynniv"
   :license "MIT"
-  :depends-on ("sb-bsd-sockets")
+  :depends-on ("sb-bsd-sockets" "cram")
   :serial t
   :components
   ((:module "src"
@@ -17,10 +17,13 @@ give modus a remote display, developed and tested on SBCL first."
     :components
     ((:file "packages")
      (:file "framebuffer")
-     (:file "rfb")))))
+     (:file "rfb")
+     (:file "zrle")))))
 
 (asdf:defsystem :scry/test
-  :description "Self-test for scry: an RFB client that drives the server."
-  :depends-on ("scry")
+  :description "Self-test for scry: an RFB client that drives the server.  Uses
+chipz as an independent inflate oracle for the ZRLE stream (cram compresses;
+a different library decompresses — a real cross-check)."
+  :depends-on ("scry" "chipz")
   :serial t
   :components ((:module "test" :serial t :components ((:file "oracle")))))

@@ -51,6 +51,58 @@
 (defun request (s inc w h)
   (w8 s 3) (w8 s inc) (w16 s 0) (w16 s 0) (w16 s w) (w16 s h) (force-output s))
 
+;;; ---- decode ZRLE: chipz inflates the shared stream, we parse the tiles ------
+;;;
+;;; The ZRLE zlib stream is continuous for the connection (compression state is
+;;; retained across rectangles), so *DSTATE* is a persistent chipz inflate state;
+;;; each rect's sync-flushed chunk decodes to exactly that rect's tile bytes.
+
+(defvar *dstate* nil)
+
+(defun cpixel-at (dec p)
+  "The 3-byte CPIXEL at DEC[p] as a pixel; returns (values pixel next-pos)."
+  (values (logior (ash (aref dec (+ p 2)) 16) (ash (aref dec (+ p 1)) 8) (aref dec p))
+          (+ p 3)))
+
+(defun apply-zrle-tiles (dec pos rx ry rw rh w cli)
+  "Parse 64x64 ZRLE tiles (subencodings 0 raw / 1 solid / 2-16 packed palette)
+   from DEC starting at POS, writing pixels into CLI.  Returns the new POS."
+  (loop for ty from 0 below rh by 64 for th = (min 64 (- rh ty)) do
+    (loop for tx from 0 below rw by 64 for tw = (min 64 (- rw tx)) do
+      (let ((sub (aref dec pos)))
+        (incf pos)
+        (flet ((put (lx ly c) (setf (aref cli (+ (* (+ ry ty ly) w) (+ rx tx lx))) c)))
+          (cond
+            ((= sub 0)                                      ; raw
+             (dotimes (ly th) (dotimes (lx tw)
+               (multiple-value-bind (c np) (cpixel-at dec pos) (put lx ly c) (setf pos np)))))
+            ((= sub 1)                                      ; solid
+             (multiple-value-bind (c np) (cpixel-at dec pos)
+               (setf pos np)
+               (dotimes (ly th) (dotimes (lx tw) (put lx ly c)))))
+            ((<= 2 sub 16)                                  ; packed palette
+             (let ((pal (make-array sub)))
+               (dotimes (i sub)
+                 (multiple-value-bind (c np) (cpixel-at dec pos) (setf (aref pal i) c pos np)))
+               (let ((bpp (cond ((<= sub 2) 1) ((<= sub 4) 2) (t 4))))
+                 (dotimes (ly th)
+                   (let ((acc 0) (nbits 0))                 ; MSB-first, rows byte-padded
+                     (dotimes (lx tw)
+                       (when (< nbits bpp)
+                         (setf acc (logior (ash acc 8) (aref dec pos)) nbits (+ nbits 8))
+                         (incf pos))
+                       (decf nbits bpp)
+                       (put lx ly (aref pal (logand (ash acc (- nbits)) (1- (ash 1 bpp)))))
+                       (setf acc (logand acc (1- (ash 1 nbits))))))))))
+            (t (check nil "unhandled ZRLE subencoding ~a" sub)))))))
+  pos)
+
+(defun apply-zrle (s rx ry rw rh w cli)
+  (let* ((len (r32 s)) (chunk (rn s len))
+         (dec (chipz:decompress nil *dstate* chunk)))
+    (apply-zrle-tiles dec 0 rx ry rw rh w cli))
+  (* rw rh))
+
 ;;; ---- decode Raw and Hextile into a client framebuffer ----------------------
 
 (defun apply-raw (s rx ry rw rh w cli)
@@ -88,15 +140,19 @@
       (let ((rx (r16 s)) (ry (r16 s)) (rw (r16 s)) (rh (r16 s)) (enc (r32 s)))
         (incf total (cond ((= enc 0) (apply-raw s rx ry rw rh w cli))
                           ((= enc 5) (apply-hextile s rx ry rw rh w cli))
+                          ((= enc 16) (apply-zrle s rx ry rw rh w cli))
                           (t (check nil "unknown encoding ~a" enc) 0)))))
     (values nrects total)))
 
 ;;; ---- the test ---------------------------------------------------------------
 
-(defun scenario (port hextile-p)
+(defun scenario (port mode)
   "Run a full-frame + change + incremental round trip; return T if pixels match.
-   With HEXTILE-P, advertise Hextile and check it's used + compact."
-  (let* ((w 200) (h 150) (fb (scry:make-framebuffer w h scry:+blue+)))
+   MODE is :raw, :hextile, or :zrle — advertise it and (for the compressed ones)
+   check it is used and compact."
+  (setf *dstate* (chipz:make-dstate 'chipz:zlib))          ; fresh ZRLE stream per connection
+  (let* ((w 200) (h 150) (fb (scry:make-framebuffer w h scry:+blue+))
+         (name (string-downcase (symbol-name mode))))
     (scry:fb-rect fb 40 20 60 40 scry:+red+)
     (scry:fb-put fb 5 5 scry:+green+)
     (scry:fb-frame fb 0 0 w h scry:+white+ 2)
@@ -104,17 +160,19 @@
     (let ((server (sb-thread:make-thread
                    (lambda () (ignore-errors (scry:serve-one fb port))) :name "scry-server")))
       (multiple-value-bind (s sw sh) (rfb-open port)
-        (check (and (= sw w) (= sh h)) "~a: dimensions ~ax~a" (if hextile-p "hextile" "raw") sw sh)
-        (when hextile-p (set-encodings s 5 0))
+        (check (and (= sw w) (= sh h)) "~a: dimensions ~ax~a" name sw sh)
+        (case mode
+          (:hextile (set-encodings s 5 0))
+          (:zrle    (set-encodings s 16 0)))
         (let ((cli (make-array (* w h) :element-type '(unsigned-byte 32))))
           (setf *bytes* 0)
           (request s 0 w h)
           (multiple-value-bind (nr total) (read-update s w cli)
             (declare (ignore nr))
             (check (= total (* w h)) "full frame covers all ~a px, got ~a" (* w h) total)
-            (when hextile-p
-              (check (< *bytes* 20000) "hextile full frame compact: ~a bytes (raw would be ~a)"
-                     *bytes* (* w h 4))))
+            (unless (eq mode :raw)
+              (check (< *bytes* 20000) "~a full frame compact: ~a bytes (raw would be ~a)"
+                     name *bytes* (* w h 4))))
           (check (equalp cli (scry:fb-pixels fb)) "client matches server after full frame")
           ;; dirty tracking: change one small area, request incremental
           (scry:fb-rect fb 150 100 20 20 scry:+green+)
@@ -129,8 +187,9 @@
 (defun run-tests ()
   (setf *checks* 0 *fails* 0)
   (format t "~&[scry RFB oracle]~%")
-  (format t "-- Raw --~%")     (scenario 5921 nil)
-  (format t "-- Hextile --~%") (scenario 5922 t)
+  (format t "-- Raw --~%")     (scenario 5921 :raw)
+  (format t "-- Hextile --~%") (scenario 5922 :hextile)
+  (format t "-- ZRLE --~%")    (scenario 5923 :zrle)
   (format t "----------------------------------~%")
   (format t "checks: ~d   failures: ~d   => ~a~%" *checks* *fails* (if (zerop *fails*) "PASS" "FAIL"))
   (zerop *fails*))

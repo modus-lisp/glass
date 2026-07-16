@@ -6,9 +6,10 @@
 ;;;; Updates are DIRTY-REGION tracked: each client keeps a snapshot of what it has
 ;;;; been shown, and an incremental FramebufferUpdateRequest sends only the tiles
 ;;;; that changed since — so a mostly-static desktop costs almost nothing (the
-;;;; "fast" of fast/sharp/vibrant).  Pixels are lossless (currently Raw; ZRLE is
-;;;; the next step for the "sharp/vibrant" bandwidth win, still to stock clients).
-;;;; KeyEvent / PointerEvent are dispatched to caller callbacks.
+;;;; "fast" of fast/sharp/vibrant).  Pixels stay lossless; the client gets the best
+;;;; encoding it advertises — ZRLE (zlib-compressed, see zrle.lisp), else Hextile,
+;;;; else Raw — so it is still any stock VNC client.  KeyEvent / PointerEvent are
+;;;; dispatched to caller callbacks.
 
 (in-package #:scry)
 
@@ -117,6 +118,7 @@
 
 (defconstant +enc-raw+ 0)
 (defconstant +enc-hextile+ 5)
+(defconstant +enc-zrle+ 16)     ; encoder in zrle.lisp (loaded after this file)
 
 (defun write-rect-raw (s fb x y w h)
   (w-u16 s x) (w-u16 s y) (w-u16 s w) (w-u16 s h) (w-u32 s +enc-raw+)
@@ -206,40 +208,48 @@
 
 ;;; ---- update assembly --------------------------------------------------------
 
-(defun write-rect (s fb x y w h enc)
-  (if (= enc +enc-hextile+)
-      (write-rect-hextile s fb x y w h)
-      (write-rect-raw s fb x y w h)))
+(defun write-rect (s fb x y w h enc zs)
+  (cond
+    ((= enc +enc-zrle+)    (write-rect-zrle s fb x y w h zs))
+    ((= enc +enc-hextile+) (write-rect-hextile s fb x y w h))
+    (t                     (write-rect-raw s fb x y w h))))
 
-(defun send-rects (s fb rects enc)
-  "One FramebufferUpdate carrying RECTS in encoding ENC."
+(defun send-rects (s fb rects enc zs)
+  "One FramebufferUpdate carrying RECTS in encoding ENC.  ZS is the client's
+   persistent ZRLE zlib stream (used only when ENC is ZRLE)."
   (w-u8 s 0) (w-u8 s 0) (w-u16 s (length rects))             ; msg-type, pad, #rects
-  (dolist (r rects) (destructuring-bind (x y w h) r (write-rect s fb x y w h enc)))
+  (dolist (r rects) (destructuring-bind (x y w h) r (write-rect s fb x y w h enc zs)))
   (force-output s))
 
 ;;; ---- client message loop ----------------------------------------------------
 
-(defun handle-update-request (fb s snap-box enc inc x y w h)
+(defun handle-update-request (fb s snap-box enc zs inc x y w h)
   "Answer a FramebufferUpdateRequest in encoding ENC.  A non-incremental request
    (or the first one) sends the whole requested rect and resets the snapshot; an
-   incremental one waits briefly for a change, then sends only the dirty tiles."
+   incremental one waits briefly for a change, then sends only the dirty tiles.
+   ZS is the client's persistent ZRLE zlib stream."
   (if (or (zerop inc) (null (car snap-box)))
       (let ((r (clip-rect fb x y w h)))
-        (send-rects s fb (list r) enc)
+        (send-rects s fb (list r) enc zs)
         (setf (car snap-box) (copy-pixels fb)))
       (let ((snap (car snap-box)) (rects nil) (tries 0))
         (loop (setf rects (dirty-rects fb snap))
               (when (or rects (>= tries 300)) (return))   ; ~5s cap, then send nothing
               (sleep 1/60) (incf tries))
-        (send-rects s fb rects enc)
+        (send-rects s fb rects enc zs)
         (update-snapshot fb snap rects))))
 
 (defun choose-encoding (encs)
-  "Pick the best encoding we implement from the client's advertised list."
-  (if (member +enc-hextile+ encs) +enc-hextile+ +enc-raw+))
+  "Pick the best encoding we implement from the client's advertised list.  ZRLE
+   (lossless, zlib-compressed) is preferred, then Hextile, then Raw."
+  (cond ((member +enc-zrle+ encs) +enc-zrle+)
+        ((member +enc-hextile+ encs) +enc-hextile+)
+        (t +enc-raw+)))
 
 (defun client-loop (fb s on-key on-pointer)
-  (let ((snap-box (list nil)) (enc +enc-raw+))
+  ;; ZS is one zlib stream for the whole connection: ZRLE retains compression
+  ;; state across rectangles, so it must persist here, not per update.
+  (let ((snap-box (list nil)) (enc +enc-raw+) (zs (cram:make-zstream)))
     (loop
       (let ((msg (read-byte s nil :eof)))
         (case msg
@@ -249,7 +259,7 @@
                (dotimes (i n) (push (r-u32 s) encs))
                (setf enc (choose-encoding encs))))
           (3 (let ((inc (r-u8 s)) (x (r-u16 s)) (y (r-u16 s)) (w (r-u16 s)) (h (r-u16 s)))
-               (handle-update-request fb s snap-box enc inc x y w h)))
+               (handle-update-request fb s snap-box enc zs inc x y w h)))
           (4 (let ((down (r-u8 s)))                        ; KeyEvent
                (skip s 2)
                (let ((key (r-u32 s))) (when on-key (funcall on-key (plusp down) key)))))
