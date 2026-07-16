@@ -1,14 +1,14 @@
-;;;; oracle.lisp — drive the scry RFB server with an in-process RFB client and
+;;;; oracle.lisp — drive the glass RFB server with an in-process RFB client and
 ;;;; check (a) the pixels received equal what was drawn, under BOTH Raw and
 ;;;; Hextile; (b) dirty-region tracking (incremental sends only changed tiles);
 ;;;; (c) Hextile is compact (a mostly-solid frame costs far fewer bytes than Raw).
 ;;;;
-;;;;   (asdf:load-system "scry/test") (scry/test:run-tests)
+;;;;   (asdf:load-system "glass/test") (glass/test:run-tests)
 
-(defpackage #:scry/test
+(defpackage #:glass/test
   (:use #:cl)
   (:export #:run-tests))
-(in-package #:scry/test)
+(in-package #:glass/test)
 
 (defvar *checks* 0) (defvar *fails* 0)
 (defvar *bytes* 0)                       ; wire bytes read (for compactness checks)
@@ -151,14 +151,14 @@
    MODE is :raw, :hextile, or :zrle — advertise it and (for the compressed ones)
    check it is used and compact."
   (setf *dstate* (chipz:make-dstate 'chipz:zlib))          ; fresh ZRLE stream per connection
-  (let* ((w 200) (h 150) (fb (scry:make-framebuffer w h scry:+blue+))
+  (let* ((w 200) (h 150) (fb (glass:make-framebuffer w h glass:+blue+))
          (name (string-downcase (symbol-name mode))))
-    (scry:fb-rect fb 40 20 60 40 scry:+red+)
-    (scry:fb-put fb 5 5 scry:+green+)
-    (scry:fb-frame fb 0 0 w h scry:+white+ 2)
-    (scry:fb-put fb 199 149 (scry:rgb 18 52 86))
+    (glass:fb-rect fb 40 20 60 40 glass:+red+)
+    (glass:fb-put fb 5 5 glass:+green+)
+    (glass:fb-frame fb 0 0 w h glass:+white+ 2)
+    (glass:fb-put fb 199 149 (glass:rgb 18 52 86))
     (let ((server (sb-thread:make-thread
-                   (lambda () (ignore-errors (scry:serve-one fb port))) :name "scry-server")))
+                   (lambda () (ignore-errors (glass:serve-one fb port))) :name "glass-server")))
       (multiple-value-bind (s sw sh) (rfb-open port)
         (check (and (= sw w) (= sh h)) "~a: dimensions ~ax~a" name sw sh)
         (case mode
@@ -173,20 +173,20 @@
             (unless (eq mode :raw)
               (check (< *bytes* 20000) "~a full frame compact: ~a bytes (raw would be ~a)"
                      name *bytes* (* w h 4))))
-          (check (equalp cli (scry:fb-pixels fb)) "client matches server after full frame")
+          (check (equalp cli (glass:fb-pixels fb)) "client matches server after full frame")
           ;; dirty tracking: change one small area, request incremental
-          (scry:fb-rect fb 150 100 20 20 scry:+green+)
+          (glass:fb-rect fb 150 100 20 20 glass:+green+)
           (request s 1 w h)
           (multiple-value-bind (nr total) (read-update s w cli)
             (check (< total (* w h)) "incremental (~a px) << full (~a)" total (* w h))
             (check (and (plusp total) (<= total 4096)) "incremental small: ~a px in ~a rects" total nr))
-          (check (equalp cli (scry:fb-pixels fb)) "client matches server after incremental")
+          (check (equalp cli (glass:fb-pixels fb)) "client matches server after incremental")
           (close s)
           (ignore-errors (sb-thread:join-thread server)))))))
 
 (defun run-tests ()
   (setf *checks* 0 *fails* 0)
-  (format t "~&[scry RFB oracle]~%")
+  (format t "~&[glass RFB oracle]~%")
   (format t "-- Raw --~%")     (scenario 5921 :raw)
   (format t "-- Hextile --~%") (scenario 5922 :hextile)
   (format t "-- ZRLE --~%")    (scenario 5923 :zrle)

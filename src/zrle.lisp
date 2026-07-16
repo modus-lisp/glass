@@ -13,7 +13,7 @@
 ;;;; in the low 3 bytes, so a CPIXEL is just those 3 bytes (B,G,R) — the X byte
 ;;;; that Raw/Hextile carry is dropped, per the spec's compressed-pixel rule.
 
-(in-package #:scry)
+(in-package #:glass)
 
 ;; +enc-zrle+ is defined in rfb.lisp alongside the other encoding constants.
 (defparameter *zrle-tile* 64 "ZRLE tile size (pixels); fixed by the spec.")

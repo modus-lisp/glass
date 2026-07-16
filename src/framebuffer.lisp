@@ -5,7 +5,7 @@
 ;;;; just writing the pixels out little-endian.  All drawing is clipped to the
 ;;;; framebuffer bounds, so callers never have to bounds-check.
 
-(in-package #:scry)
+(in-package #:glass)
 
 (declaim (inline rgb))
 (defun rgb (r g b)

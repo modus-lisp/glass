@@ -11,9 +11,9 @@
 ;;;; else Raw — so it is still any stock VNC client.  KeyEvent / PointerEvent are
 ;;;; dispatched to caller callbacks.
 
-(in-package #:scry)
+(in-package #:glass)
 
-(defvar *desktop-name* "scry")
+(defvar *desktop-name* "glass")
 (defparameter *tile* 32 "Dirty-tracking granularity (pixels).")
 
 (defun string->bytes (s)
@@ -275,7 +275,7 @@
    (button-mask x y) are optional input callbacks.  With :ONCE, handle a single
    client and return; otherwise loop, each client in its own thread."
   (let ((listen (tcp-listen port)))
-    (format *error-output* "~&scry: RFB server listening on port ~d (~dx~d)~%"
+    (format *error-output* "~&glass: RFB server listening on port ~d (~dx~d)~%"
             port (fb-width fb) (fb-height fb))
     (force-output *error-output*)
     (flet ((run (stream)
@@ -289,7 +289,7 @@
                (if once
                    (progn (run stream) (return))
                    (sb-thread:make-thread (lambda () (ignore-errors (run stream)))
-                                          :name "scry-client"))))
+                                          :name "glass-client"))))
         (ignore-errors (sb-bsd-sockets:socket-close listen))))))
 
 (defun serve-one (fb port &rest args)

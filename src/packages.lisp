@@ -1,10 +1,10 @@
-;;;; packages.lisp — scry
+;;;; packages.lisp — glass
 
-(defpackage #:scry
+(defpackage #:glass
   (:use #:cl)
   (:documentation
-   "scry — a framebuffer and a from-scratch VNC/RFB server in pure Common Lisp.
-    To scry is to see at a distance; a VNC server does exactly that — it exports a
+   "glass — a framebuffer and a from-scratch VNC/RFB server in pure Common Lisp.
+    To glass is to see at a distance; a VNC server does exactly that — it exports a
     framebuffer so a remote client can view and drive it.  Draw into an in-memory
     FRAMEBUFFER with simple primitives, then SERVE it over RFB (RFC 6143) to any
     VNC client.  Clean-room, no FFI; sb-bsd-sockets is the only platform seam.
