@@ -18,7 +18,8 @@
    (port-num :initarg :port :initform 5900 :accessor glass-port-num)
    (mailbox  :initform (sb-concurrency:make-mailbox) :reader glass-port-mailbox)
    (fb       :initform nil :accessor glass-port-fb)
-   (top      :initform nil :accessor glass-port-top)          ; top-level sheet
+   (top      :initform nil :accessor glass-port-top)          ; the MAIN top-level sheet
+   (mirrors  :initform '() :accessor glass-port-mirrors)      ; all top-level mirrors, newest-first
    (mods     :initform 0   :accessor glass-port-mods)         ; CLIM modifier state
    (buttons  :initform 0   :accessor glass-port-buttons)      ; RFB button mask
    (px       :initform 0   :accessor glass-port-px)           ; last pointer x
@@ -67,24 +68,32 @@
 (defclass glass-frame-manager (climi::standard-frame-manager) ())
 
 ;;; ---- mirror ----------------------------------------------------------------
-;;; One mirror per top-level sheet; in single-mirror McCLIM that is the whole UI.
-;;; It carries mcclim-render's image plus the glass framebuffer we copy into.
+;;; One mirror per top-level sheet.  The MAIN one (the application frame) owns the
+;;; framebuffer and drives its size; secondary ones (menus, dialogs, tooltips) are
+;;; composited on top of it at their screen position — glass serves one screen, so
+;;; the backend is a tiny compositor over all the top-level mirrors.
 
 (defclass glass-mirror (mcclim-render::image-mirror-mixin)
-  ((fb :initform nil :accessor glass-mirror-fb)))
+  ((x    :initform 0   :accessor glass-mirror-x)             ; screen position (from set-mirror-geometry)
+   (y    :initform 0   :accessor glass-mirror-y)
+   (main :initform nil :accessor glass-mirror-main)))        ; owns the fb + the RFB server?
 
 (defmethod realize-mirror ((port glass-port) (sheet climi::mirrored-sheet-mixin))
   (let ((mirror (make-instance 'glass-mirror)))
     (setf (sheet-direct-mirror sheet) mirror)
-    (climi::update-mirror-geometry sheet)          ; creates the render image (via set-mirror-geometry)
     (when (typep sheet 'climi::top-level-sheet-mixin)
-      (setf (glass-port-top port) sheet))                    ; server starts lazily on first force-output
+      (when (null (glass-port-top port))                     ; first top-level = the main frame
+        (setf (glass-port-top port) sheet (glass-mirror-main mirror) t))
+      (push mirror (glass-port-mirrors port)))
+    (climi::update-mirror-geometry sheet)          ; creates the render image (via set-mirror-geometry)
     (dispatch-repaint sheet climi::+everywhere+)
     mirror))
 
 (defmethod destroy-mirror ((port glass-port) (sheet climi::mirrored-sheet-mixin))
   (when-let ((mirror (sheet-direct-mirror sheet)))
-    (setf (mcclim-render::image-mirror-image mirror) nil)))
+    (setf (glass-port-mirrors port) (remove mirror (glass-port-mirrors port))
+          (mcclim-render::image-mirror-image mirror) nil)
+    (composite-all port)))                          ; erase a closed menu/dialog
 
 (defmethod enable-mirror ((port glass-port) (sheet climi::mirrored-sheet-mixin)) nil)
 (defmethod disable-mirror ((port glass-port) (sheet climi::mirrored-sheet-mixin)) nil)
@@ -96,15 +105,14 @@
     (values (array-dimension a 1) (array-dimension a 0))))
 
 (defun ensure-fb-and-server (port mirror)
-  "Once the render image exists (so we know the size), allocate the glass fb and
-   start the RFB server thread.  Idempotent."
-  (unless (glass-mirror-fb mirror)
+  "The MAIN mirror allocates the framebuffer (sized to its image) and starts the
+   RFB server thread, once its image exists.  Idempotent."
+  (unless (glass-port-fb port)
     (when-let ((image (mcclim-render::image-mirror-image mirror)))
       (multiple-value-bind (w h) (image-wh image)
-        (let ((fb (glass:make-framebuffer w h)))
-          (setf (glass-mirror-fb mirror) fb
-                (glass-port-fb port) fb)
-          (unless (glass-port-server port)
+        (setf (glass-port-fb port) (glass:make-framebuffer w h))
+        (unless (glass-port-server port)
+          (let ((fb (glass-port-fb port)))
             (setf (glass-port-server port)
                   (sb-thread:make-thread
                    (lambda ()
@@ -115,47 +123,51 @@
                                   :name "glass-mcclim"))
                    :name "glass-server"))))))))
 
-(defun blit-dirty (port mirror)
-  "Copy the mirror image's dirty region into the glass framebuffer."
-  (let ((fb (glass-mirror-fb mirror)))
-    (when fb
-      (mcclim-render::with-image-locked (mirror)
-        (let ((dirty (mcclim-render::image-dirty-region mirror)))
-          (unless (region-equal dirty climi::+nowhere+)
-            (setf (mcclim-render::image-dirty-region mirror) climi::+nowhere+)
-            (let* ((image (mcclim-render::image-mirror-image mirror))
-                   (arr (climi::pattern-array image))
-                   (dpx (glass:fb-pixels fb))
-                   (fw (glass:fb-width fb)) (fh (glass:fb-height fb))
-                   (clip (region-intersection dirty (make-rectangle* 0 0 fw fh))))
-              (declare (ignore port))
-              (unless (region-equal clip climi::+nowhere+)
-                (with-bounding-rectangle* (x1 y1 x2 y2) clip
-                  (let ((x1 (max 0 (floor x1))) (y1 (max 0 (floor y1)))
-                        (x2 (min fw (ceiling x2))) (y2 (min fh (ceiling y2))))
-                    (loop for y from y1 below y2 for row = (* y fw) do
-                      (loop for x from x1 below x2 do
-                        (setf (aref dpx (+ row x)) (logand (aref arr y x) #x00ffffff))))))))))))))
+(defun blit-mirror (mirror fb)
+  "Composite one mirror's image into FB at the mirror's screen position (opaque)."
+  (when-let ((image (mcclim-render::image-mirror-image mirror)))
+    (mcclim-render::with-image-locked (mirror)
+      (let* ((arr (climi::pattern-array image))
+             (ih (array-dimension arr 0)) (iw (array-dimension arr 1))
+             (ox (glass-mirror-x mirror)) (oy (glass-mirror-y mirror))
+             (dpx (glass:fb-pixels fb)) (fw (glass:fb-width fb)) (fh (glass:fb-height fb)))
+        (dotimes (iy ih)
+          (let ((fy (+ oy iy)))
+            (when (< -1 fy fh)
+              (let ((frow (* fy fw)))
+                (dotimes (ix iw)
+                  (let ((fx (+ ox ix)))
+                    (when (< -1 fx fw)
+                      (setf (aref dpx (+ frow fx)) (logand (aref arr iy ix) #x00ffffff)))))))))))))
 
-(defun sync-fb-size (mirror)
-  "Keep the glass fb the same size as the (possibly just-relaid-out) render image.
-   On a change, resize the fb and mark the whole image dirty so the next blit
-   repaints all of it; the RFB client learns the new size via DesktopSize."
-  (let ((fb (glass-mirror-fb mirror))
+(defun composite-all (port)
+  "Redraw the whole screen: the main frame at the bottom, then every secondary
+   top-level sheet (menus/dialogs) on top in creation order.  glass's own dirty
+   diff then ships only what actually changed."
+  (when-let ((fb (glass-port-fb port)))
+    (glass:with-fb-locked (fb)
+      ;; mirrors is newest-first; composite oldest (main) first so newer are on top
+      (dolist (mirror (reverse (glass-port-mirrors port)))
+        (blit-mirror mirror fb)))))
+
+(defun sync-fb-size (port mirror)
+  "Keep the framebuffer the same size as the MAIN frame's image; on a change the
+   RFB client is told the new size via DesktopSize."
+  (let ((fb (glass-port-fb port))
         (image (mcclim-render::image-mirror-image mirror)))
-    (when (and fb image)
+    (when (and fb image (glass-mirror-main mirror))
       (multiple-value-bind (w h) (image-wh image)
         (unless (and (= w (glass:fb-width fb)) (= h (glass:fb-height fb)))
-          (glass:fb-resize fb w h)
-          (setf (mcclim-render::image-dirty-region mirror) (make-rectangle* 0 0 w h)))))))
+          (glass:fb-resize fb w h))))))
 
 (defun %mirror-force-output (port mirror)
-  (ensure-fb-and-server port mirror)
-  (sync-fb-size mirror)
-  (blit-dirty port mirror))
+  (when (glass-mirror-main mirror)
+    (ensure-fb-and-server port mirror)         ; main mirror creates the fb + starts the server
+    (sync-fb-size port mirror))
+  (composite-all port))
 
 (defmethod port-force-output ((port glass-port))
-  (when-let* ((sheet (glass-port-top port))
+  (when-let* ((sheet (glass-port-top port))     ; drive through the main mirror so the server starts
               (mirror (sheet-direct-mirror sheet)))
     (%mirror-force-output port mirror)))
 
@@ -297,8 +309,15 @@
 
 ;;; misc no-ops the frame machinery expects
 (defmethod set-mirror-geometry ((port glass-port) sheet region)
-  (declare (ignore sheet))
-  (bounding-rectangle* region))         ; render-port-mixin's :after resizes the image
+  ;; REGION is the mirror's rectangle in screen coordinates — remember where to
+  ;; composite this top-level sheet.  render-port-mixin's :after resizes the image
+  ;; (always at a 0,0 origin), so position lives here, size in the image.
+  (multiple-value-bind (x1 y1 x2 y2) (bounding-rectangle* region)
+    (when-let ((mirror (sheet-direct-mirror sheet)))
+      (when (typep mirror 'glass-mirror)
+        (setf (glass-mirror-x mirror) (floor x1)
+              (glass-mirror-y mirror) (floor y1))))
+    (values x1 y1 x2 y2)))
 (defmethod port-modifier-state ((port glass-port)) (glass-port-mods port))
 (defmethod (setf port-keyboard-input-focus) (focus (port glass-port)) focus)
 (defmethod port-keyboard-input-focus ((port glass-port)) nil)

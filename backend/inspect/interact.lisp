@@ -101,7 +101,15 @@
                (diff (loop for i below (length before) count (/= (aref before i) (aref after i)))))
           (save-png after sw sh "/tmp/glass-interact-1.png")
           (format t "~&click (~d,~d): ~d px changed -> ~a~%" cx cy diff
-                  (if (plusp diff) "REACTED" "no change")))))
+                  (if (plusp diff) "REACTED" "no change"))
+          ;; dismiss by clicking outside the menu; confirm the popup is erased
+          ;; (menu sheet destroyed -> destroy-mirror -> recomposite)
+          (send-ptr s 0 500 300) (send-ptr s 1 500 300) (send-ptr s 0 500 300) (sleep 1.0)
+          (let* ((dismissed (read-frame s sw sh dstate))
+                 (d2 (loop for i below (length after) count (/= (aref after i) (aref dismissed i)))))
+            (save-png dismissed sw sh "/tmp/glass-interact-2.png")
+            (format t "dismiss (click outside): ~d px changed -> ~a~%" d2
+                    (if (plusp d2) "POPUP CLOSED" "no change"))))))
       (ignore-errors (close s)))))
 (finish-output)
 (sb-ext:exit)
