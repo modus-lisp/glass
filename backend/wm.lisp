@@ -285,23 +285,47 @@
                        :on-key (lambda (down k) (glass-term:tabterm-on-key tt down k))
                        :on-pointer (lambda (mask lx ly) (glass-term:tabterm-on-mouse tt mask lx ly))))))
 
+(defun wm-run-frame (port frame &optional (name "frame"))
+  "Host a McCLIM application FRAME in its own thread on PORT (realize-mirror
+   decorates it as a managed window)."
+  (sb-thread:make-thread
+   (lambda ()
+     (handler-case (run-frame-top-level frame)
+       (error (e) (format *trace-output* "~&[wm] ~a: ~a~%" name e))))
+   :name (format nil "wm-~a" name)))
+
+(defun wm-inspect (port form)
+  "Open Clouseau (the McCLIM object inspector, Genera's lineage) on the value of
+   FORM — a decorated window with clickable slot drill-down.  Clouseau is an
+   OPTIONAL runtime dependency, resolved by name so the backend needn't load it."
+  (let ((fn (and (find-package '#:clouseau) (find-symbol "INSPECT" '#:clouseau))))
+    (unless (and fn (fboundp fn)) (error "clouseau is not loaded — (ql:quickload :clouseau)"))
+    (let ((object (eval form))
+          (fm (find-frame-manager :port port)))
+      (sb-thread:make-thread
+       (lambda ()
+         (handler-case
+             (let ((climi::*default-frame-manager* fm))   ; land on OUR glass port
+               (funcall fn object :new-process nil))       ; runs the frame in this thread
+           (error (e) (format *trace-output* "~&[wm] inspect: ~a~%" e))))
+       :name "wm-inspect"))))
+
 ;;; A window spec is the shared launch vocabulary — used both for run-wm's
 ;;; initial windows AND for the root-menu items, so a menu is just a list of
-;;; labelled specs.  (:terminal ...) / (:tabterm ...) open surface windows;
-;;; anything else is (FRAME-CLASS &key WIDTH HEIGHT) → a McCLIM application frame.
+;;; labelled specs:
+;;;   (:terminal &key cols rows ppem)   a shell terminal (surface window)
+;;;   (:tabterm  &key cols rows ppem)   a tabbed terminal
+;;;   (:inspect FORM)                   Clouseau inspecting the value of FORM
+;;;   (FRAME-CLASS &key width height)   any McCLIM application frame
 (defun wm-spawn-spec (port spec)
   (case (car spec)
     (:terminal (apply #'wm-add-terminal port (cdr spec)))
     (:tabterm  (apply #'wm-add-tabterm  port (cdr spec)))
+    (:inspect  (wm-inspect port (cadr spec)))
     (t (destructuring-bind (class &key (width 480) (height 320)) spec
-         (let ((fm (find-frame-manager :port port)))
-           (sb-thread:make-thread
-            (lambda ()
-              (handler-case
-                  (run-frame-top-level (make-application-frame class :frame-manager fm
-                                                               :width width :height height))
-                (error (e) (format *trace-output* "~&[wm] frame ~a: ~a~%" class e))))
-            :name (format nil "wm-~a" class)))))))
+         (wm-run-frame port (make-application-frame class :frame-manager (find-frame-manager :port port)
+                                                    :width width :height height)
+                       (princ-to-string class))))))
 
 (defun wm-menu-run (port action)
   "Run a chosen menu ACTION: a window spec (launch it) or, as an escape hatch, a
