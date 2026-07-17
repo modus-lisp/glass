@@ -74,77 +74,124 @@
       (h* x (- (+ y h) 1) n) (v* x (- (+ y h) n) n)           ; bottom-left
       (h* (- (+ x w) n) (- (+ y h) 1) n) (v* (- (+ x w) 1) (- (+ y h) n) n)))) ; bottom-right
 
+;;; A surface window is a non-McCLIM window: a glass framebuffer somebody else
+;;; renders into (e.g. a terminal) plus input callbacks.  The WM decorates,
+;;; composites, drags, raises and focuses it just like a McCLIM window.
+(defstruct wm-surface
+  fb (x 60) (y 60) (title "window")
+  (deco nil) (deco-w -1) on-key on-pointer)
+
+(defun wm-surface-deco* (surf cw)
+  (when (or (null (wm-surface-deco surf)) (/= cw (wm-surface-deco-w surf)))
+    (setf (wm-surface-deco surf) (wm-render-titlebar (wm-surface-title surf) cw)
+          (wm-surface-deco-w surf) cw))
+  (wm-surface-deco surf))
+
+(defun wm-frame (fb cx cy cw ch deco content-fn)
+  "Draw a decorated window: DECO title bar above the content at (cx,cy) size
+   (cw,ch), the content via CONTENT-FN, then a border + corner marks."
+  (let* ((ty (- cy +wm-titleh+)) (wx (- cx +wm-border+)) (wy (- ty +wm-border+))
+         (ww (+ cw (* 2 +wm-border+))) (wh (+ +wm-titleh+ ch (* 2 +wm-border+))))
+    (blit-fb deco cx ty fb)
+    (funcall content-fn)
+    (glass:fb-frame fb wx wy ww wh glass:+black+ +wm-border+)
+    (wm-corners fb wx wy ww wh)))
+
 (defun wm-draw-window (mirror fb)
   (when-let ((image (mcclim-render::image-mirror-image mirror)))
     (multiple-value-bind (cw ch) (image-wh image)
-      (let* ((cx (glass-mirror-x mirror)) (cy (glass-mirror-y mirror))
-             (tx cx) (ty (- cy +wm-titleh+))                  ; title bar just above content
-             (wx (- cx +wm-border+)) (wy (- ty +wm-border+))
-             (ww (+ cw (* 2 +wm-border+))) (wh (+ +wm-titleh+ ch (* 2 +wm-border+))))
-        (blit-fb (wm-deco mirror cw) tx ty fb)                            ; title bar
-        (blit-mirror mirror fb)                                           ; content at (cx,cy)
-        (glass:fb-frame fb wx wy ww wh glass:+black+ +wm-border+)         ; window border
-        (wm-corners fb wx wy ww wh)))))
+      (wm-frame fb (glass-mirror-x mirror) (glass-mirror-y mirror) cw ch
+                (wm-deco mirror cw) (lambda () (blit-mirror mirror fb))))))
+
+(defun wm-draw-surface (surf fb)
+  (let* ((sfb (wm-surface-fb surf)) (cw (glass:fb-width sfb)) (ch (glass:fb-height sfb)))
+    (wm-frame fb (wm-surface-x surf) (wm-surface-y surf) cw ch (wm-surface-deco* surf cw)
+              (lambda () (blit-fb sfb (wm-surface-x surf) (wm-surface-y surf) fb)))))
 
 (defun wm-composite (port fb)
   (glass:fb-fill fb +wm-teal+)
-  (dolist (mirror (reverse (glass-port-mirrors port)))        ; bottom-to-top
-    (if (glass-mirror-managed mirror)
-        (wm-draw-window mirror fb)
-        (blit-mirror mirror fb))))                            ; menus: undecorated, at their pos
+  (dolist (mirror (reverse (glass-port-mirrors port)))        ; McCLIM windows (bottom-to-top)
+    (if (glass-mirror-managed mirror) (wm-draw-window mirror fb) (blit-mirror mirror fb)))
+  (dolist (surf (reverse (glass-port-surfaces port)))         ; surface windows, on top
+    (wm-draw-surface surf fb)))
 
 ;;; ---- pointer routing --------------------------------------------------------
 
-(defun wm-window-under (port x y)
-  "Topmost managed window whose DECORATION (title bar or content) contains (X,Y),
-   with the region — (values mirror :title|:content cx cy cw ch) — or NIL."
-  (dolist (mirror (glass-port-mirrors port))                 ; newest-first = topmost
-    (when (glass-mirror-managed mirror)
-      (when-let ((image (mcclim-render::image-mirror-image mirror)))
-        (multiple-value-bind (cw ch) (image-wh image)
-          (let ((cx (glass-mirror-x mirror)) (cy (glass-mirror-y mirror)))
-            (cond
-              ((and (<= cx x (+ cx cw)) (<= cy y (+ cy ch)))
-               (return (values mirror :content cx cy cw ch)))
-              ((and (<= cx x (+ cx cw)) (<= (- cy +wm-titleh+) y cy))
-               (return (values mirror :title cx cy cw ch))))))))))
+(defun wm-pos-x (obj) (if (wm-surface-p obj) (wm-surface-x obj) (glass-mirror-x obj)))
+(defun wm-pos-y (obj) (if (wm-surface-p obj) (wm-surface-y obj) (glass-mirror-y obj)))
+(defun wm-move (obj x y)
+  (if (wm-surface-p obj) (setf (wm-surface-x obj) x (wm-surface-y obj) y)
+      (setf (glass-mirror-x obj) x (glass-mirror-y obj) y)))
 
-(defun wm-raise (port mirror)
-  "Move MIRROR to the front (top) of the z-order."
-  (setf (glass-port-mirrors port)
-        (cons mirror (remove mirror (glass-port-mirrors port)))))
+(defun wm-hit (port x y)
+  "Topmost window (surfaces are above mirrors) whose title bar or content contains
+   (X,Y): (values obj :title|:content cx cy cw ch), or NIL over the workspace."
+  (flet ((test (cx cy cw ch obj)
+           (cond ((and (<= cx x (+ cx cw)) (<= cy y (+ cy ch))) (list obj :content cx cy cw ch))
+                 ((and (<= cx x (+ cx cw)) (<= (- cy +wm-titleh+) y cy)) (list obj :title cx cy cw ch)))))
+    (dolist (surf (glass-port-surfaces port))
+      (let ((hit (test (wm-surface-x surf) (wm-surface-y surf)
+                       (glass:fb-width (wm-surface-fb surf)) (glass:fb-height (wm-surface-fb surf)) surf)))
+        (when hit (return-from wm-hit (values-list hit)))))
+    (dolist (mirror (glass-port-mirrors port))
+      (when (glass-mirror-managed mirror)
+        (when-let ((image (mcclim-render::image-mirror-image mirror)))
+          (multiple-value-bind (cw ch) (image-wh image)
+            (let ((hit (test (glass-mirror-x mirror) (glass-mirror-y mirror) cw ch mirror)))
+              (when hit (return-from wm-hit (values-list hit))))))))))
+
+(defun wm-raise (port obj)
+  "Move OBJ to the top of its z-order (surfaces and mirrors are separate stacks)."
+  (if (wm-surface-p obj)
+      (setf (glass-port-surfaces port) (cons obj (remove obj (glass-port-surfaces port))))
+      (setf (glass-port-mirrors port) (cons obj (remove obj (glass-port-mirrors port))))))
 
 (defun wm-on-pointer (port mask x y)
   (let ((down (logtest mask 1)))
     (cond
-      ;; dragging a title bar: follow the mouse
-      ((glass-port-drag port)
-       (destructuring-bind (mirror dx dy) (glass-port-drag port)
-         (setf (glass-mirror-x mirror) (- x dx)
-               (glass-mirror-y mirror) (- y dy))
+      ((glass-port-drag port)                                 ; dragging a title bar
+       (destructuring-bind (obj dx dy) (glass-port-drag port)
+         (wm-move obj (- x dx) (- y dy))
          (composite-all port)
-         (unless down (setf (glass-port-drag port) nil))))    ; released
+         (unless down (setf (glass-port-drag port) nil))))
       (t
-       (multiple-value-bind (mirror region cx cy) (wm-window-under port x y)
+       (multiple-value-bind (obj region cx cy) (wm-hit port x y)
          (cond
-           ((null mirror))                                    ; over the workspace: ignore
+           ((null obj))                                       ; workspace: ignore
            ((eq region :title)
-            (when down                                        ; grab: raise + begin move
-              (wm-raise port mirror)
-              (setf (glass-port-drag port) (list mirror (- x (glass-mirror-x mirror))
-                                                        (- y (glass-mirror-y mirror))))
+            (when down
+              (wm-raise port obj)
+              (when (wm-surface-p obj) (setf (glass-port-focus-surface port) obj))
+              (setf (glass-port-drag port) (list obj (- x (wm-pos-x obj)) (- y (wm-pos-y obj))))
               (composite-all port)))
-           ((eq region :content)
-            (when (and down (not (eq mirror (first (glass-port-mirrors port)))))
-              (wm-raise port mirror) (composite-all port))    ; click-to-raise
-            (emit-pointer-events port (glass-mirror-sheet mirror) mask (- x cx) (- y cy)))))))))
+           ((wm-surface-p obj)                                ; content of a surface window
+            (when down (setf (glass-port-focus-surface port) obj) (wm-raise port obj) (composite-all port))
+            (when (wm-surface-on-pointer obj) (funcall (wm-surface-on-pointer obj) mask (- x cx) (- y cy))))
+           (t                                                 ; content of a McCLIM window
+            (when down (setf (glass-port-focus-surface port) nil))   ; keyboard back to CLIM
+            (when (and down (not (eq obj (first (glass-port-mirrors port)))))
+              (wm-raise port obj) (composite-all port))
+            (emit-pointer-events port (glass-mirror-sheet obj) mask (- x cx) (- y cy)))))))))
 
 ;;; ---- run ---------------------------------------------------------------------
 
+(defun wm-add-terminal (port &key (cols 80) (rows 24) (ppem 14))
+  "Create a terminal (shell in a pty) and add it as a WM surface window."
+  (let* ((tm (glass-term:make-terminal :cols cols :rows rows :ppem ppem))
+         (c (glass-port-cascade port))
+         (surf (make-wm-surface :fb (glass-term:terminal-fb tm)
+                                :x (+ 40 c) :y (+ 40 c +wm-titleh+) :title "terminal"
+                                :on-key (lambda (down k) (glass-term:on-key tm down k)))))
+    (glass-term:start-pump tm)
+    (setf (glass-port-cascade port) (mod (+ c 28) 200))
+    (push surf (glass-port-surfaces port))
+    (setf (glass-port-focus-surface port) surf)
+    surf))
+
 (defun run-wm (specs &key (port 5900) (width 1000) (height 720))
-  "Run a mini OPEN LOOK desktop over VNC.  SPECS is a list of frame specs, each
-   (FRAME-CLASS &key WIDTH HEIGHT) — one decorated window per spec.  Serves on
-   PORT; point any VNC client at localhost:PORT.  Blocks until interrupted."
+  "Run a mini OPEN LOOK desktop over VNC.  Each spec is a decorated window:
+   (FRAME-CLASS &key WIDTH HEIGHT) for a McCLIM app, or (:terminal &key COLS ROWS
+   PPEM) for a shell terminal.  Serves on PORT; point any VNC client there."
   (let ((p (find-glass-port :port port)))
     (setf (glass-port-wm-p p) t
           (glass-port-screen-w p) width (glass-port-screen-h p) height
@@ -153,14 +200,16 @@
     (climi::restart-port p)                                   ; event-loop thread
     (let ((fm (find-frame-manager :port p)))
       (dolist (spec specs)
-        (destructuring-bind (class &key (width 480) (height 320)) spec
-          (sb-thread:make-thread
-           (lambda ()
-             (handler-case
-                 (run-frame-top-level (make-application-frame class :frame-manager fm
-                                                              :width width :height height))
-               (error (e) (format *trace-output* "~&[wm] frame ~a: ~a~%" class e))))
-           :name (format nil "wm-~a" class))
-          (sleep 0.6))))                                      ; stagger so cascade positions differ
-    ;; keep the driver thread alive; the frames run in their own threads
+        (if (eq (car spec) :terminal)
+            (apply #'wm-add-terminal p (cdr spec))
+            (destructuring-bind (class &key (width 480) (height 320)) spec
+              (sb-thread:make-thread
+               (lambda ()
+                 (handler-case
+                     (run-frame-top-level (make-application-frame class :frame-manager fm
+                                                                  :width width :height height))
+                   (error (e) (format *trace-output* "~&[wm] frame ~a: ~a~%" class e))))
+               :name (format nil "wm-~a" class))))
+        (sleep 0.7)                                           ; stagger for distinct cascade slots
+        (composite-all p)))
     (loop (sleep 10))))

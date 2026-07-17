@@ -9,7 +9,7 @@
 
 (defpackage #:glass-term
   (:use #:cl)
-  (:export #:run #:make-terminal #:terminal))
+  (:export #:run #:make-terminal #:terminal #:terminal-fb #:on-key #:start-pump))
 (in-package #:glass-term)
 
 ;;; ---- palette (Tango 16-colour) ---------------------------------------------
@@ -557,6 +557,11 @@
         (stream-error () (return-from pump)))
       (when got (render tm))
       (sleep 1/60))))
+
+(defun start-pump (tm)
+  "Spawn the shell-output pump thread; it renders into (terminal-fb TM).  Use
+   when embedding a terminal (e.g. as a WM window) rather than the standalone RUN."
+  (sb-thread:make-thread (lambda () (ignore-errors (pump tm))) :name "glass-term-pump"))
 
 (defun run (&key (port 5900) (cols 80) (rows 24) (ppem 16) (shell "/bin/bash") emoji-font)
   "Open SHELL in a pseudo-terminal and serve it as a terminal over VNC on PORT.

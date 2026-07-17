@@ -7,7 +7,7 @@
   :description "McCLIM backend on the glass VNC server: run CLIM apps over VNC, no X."
   :author "ynniv"
   :license "MIT"
-  :depends-on ("mcclim" "mcclim-render" "glass" "glass/text" "sb-concurrency")
+  :depends-on ("mcclim" "mcclim-render" "glass" "glass/text" "glass/term" "sb-concurrency")
   :serial t
   :components ((:file "package")
                (:file "backend")
