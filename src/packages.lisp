@@ -15,5 +15,7 @@
    #:fb-width #:fb-height #:fb-pixels #:fb-resize #:with-fb-locked
    #:fb-put #:fb-get #:fb-fill #:fb-rect #:fb-hline #:fb-vline #:fb-frame #:fb-blit
    #:rgb #:+black+ #:+white+ #:+red+ #:+green+ #:+blue+
+   ;; text (the :glass/text system; scribe-backed)
+   #:fb-text #:text-width #:load-font #:default-font
    ;; server: (serve fb port &key on-key on-pointer on-resize name once)
    #:serve #:serve-one #:*desktop-name* #:tcp-listen))

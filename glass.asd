@@ -20,6 +20,14 @@ give modus a remote display, developed and tested on SBCL first."
      (:file "rfb")
      (:file "zrle")))))
 
+(asdf:defsystem :glass/text
+  :description "First-class text on a glass framebuffer, via scribe (fb-text) —
+a real, anti-aliased, gamma-correct text primitive with no McCLIM dependency.
+Kept separate so the core framebuffer + RFB server stay dependency-light."
+  :depends-on ("glass" "scribe")
+  :serial t
+  :components ((:module "src" :serial t :components ((:file "text")))))
+
 (asdf:defsystem :glass/test
   :description "Self-test for glass: an RFB client that drives the server.  Uses
 chipz as an independent inflate oracle for the ZRLE stream (cram compresses;

@@ -22,26 +22,27 @@
       "window"))
 
 (defun wm-render-titlebar (title width)
-  "An mcclim-render image of an OPEN LOOK title bar WIDTH px wide."
-  (clime:with-output-to-drawing-stream (s :raster :pattern :width (max 1 width) :height +wm-titleh+)
-    (clim:draw-rectangle* s 0 0 width +wm-titleh+ :ink (clim:make-gray-color 0.80))
-    (clim:draw-line* s 0 (1- +wm-titleh+) width (1- +wm-titleh+) :ink (clim:make-gray-color 0.45))
-    ;; menu button box, raised bevel, with the abbreviated-menu wedge
-    (let* ((bs (- +wm-titleh+ 8)) (bx 4) (by 4) (bx2 (+ bx bs)) (by2 (+ by bs)))
-      (clim:draw-rectangle* s bx by bx2 by2 :ink (clim:make-gray-color 0.72))
-      (clim:draw-line* s bx by bx2 by :ink clim:+white+)
-      (clim:draw-line* s bx by bx by2 :ink clim:+white+)
-      (clim:draw-line* s bx by2 bx2 by2 :ink (clim:make-gray-color 0.30))
-      (clim:draw-line* s bx2 by bx2 by2 :ink (clim:make-gray-color 0.30))
-      (let ((cx (+ bx (floor bs 2))) (cy (+ by (floor bs 2))))
-        (clim:draw-polygon* s (list (- cx 3) (- cy 1) (+ cx 3) (- cy 1) cx (+ cy 3)) :ink clim:+black+)))
-    ;; centred bold title
-    (let ((tw (* (length title) 7)))
-      (clim:draw-text* s title (max (+ +wm-titleh+ 6) (floor (- width tw) 2)) 15
-                       :ink clim:+black+ :text-size 12 :text-face :bold))))
+  "A glass framebuffer of an OPEN LOOK title bar WIDTH px wide — drawn entirely
+   with glass primitives + scribe text (no McCLIM)."
+  (let ((tb (glass:make-framebuffer (max 1 width) +wm-titleh+ (glass:rgb 204 204 204))))
+    (glass:fb-hline tb 0 (1- +wm-titleh+) width (glass:rgb 120 120 120))       ; bottom shadow line
+    ;; menu button box: raised bevel + abbreviated-menu wedge
+    (let* ((bs (- +wm-titleh+ 8)) (bx 4) (by 4))
+      (glass:fb-rect tb bx by bs bs (glass:rgb 188 188 188))
+      (glass:fb-hline tb bx by bs glass:+white+)                                ; top light
+      (glass:fb-vline tb bx by bs glass:+white+)                               ; left light
+      (glass:fb-hline tb bx (+ by bs -1) bs (glass:rgb 77 77 77))              ; bottom dark
+      (glass:fb-vline tb (+ bx bs -1) by bs (glass:rgb 77 77 77))             ; right dark
+      (let ((cx (+ bx (floor bs 2))) (cy (+ by (floor bs 2) -2)))              ; downward wedge
+        (dotimes (i 4) (glass:fb-hline tb (- cx (- 3 i)) (+ cy i) (max 1 (- 7 (* 2 i))) glass:+black+))))
+    ;; centred bold title, anti-aliased via scribe
+    (let ((tw (glass:text-width title :size 12 :font (glass:default-font t))))
+      (glass:fb-text tb (max (+ +wm-titleh+ 6) (floor (- width tw) 2)) 3 title
+                     :size 12 :color glass:+black+ :font (glass:default-font t)))
+    tb))
 
 (defun wm-deco (mirror cw)
-  "Cached title-bar image for MIRROR at content width CW."
+  "Cached title-bar framebuffer for MIRROR at content width CW."
   (when (or (null (glass-mirror-deco mirror)) (/= cw (glass-mirror-deco-w mirror)))
     (setf (glass-mirror-deco mirror) (wm-render-titlebar (glass-mirror-title mirror) cw)
           (glass-mirror-deco-w mirror) cw))
@@ -49,18 +50,19 @@
 
 ;;; ---- compositing ------------------------------------------------------------
 
-(defun blit-argb (arr ox oy fb)
-  "Composite the ARGB 2D array ARR into FB with its top-left at (OX,OY), opaque."
-  (let* ((ih (array-dimension arr 0)) (iw (array-dimension arr 1))
-         (dpx (glass:fb-pixels fb)) (fw (glass:fb-width fb)) (fh (glass:fb-height fb)))
-    (dotimes (iy ih)
-      (let ((fy (+ oy iy)))
-        (when (< -1 fy fh)
-          (let ((frow (* fy fw)))
-            (dotimes (ix iw)
-              (let ((fx (+ ox ix)))
-                (when (< -1 fx fw)
-                  (setf (aref dpx (+ frow fx)) (logand (aref arr iy ix) #x00ffffff)))))))))))
+(defun blit-fb (src ox oy dst)
+  "Copy glass framebuffer SRC into DST with its top-left at (OX,OY)."
+  (let* ((sw (glass:fb-width src)) (sh (glass:fb-height src))
+         (spx (glass:fb-pixels src)) (dpx (glass:fb-pixels dst))
+         (dw (glass:fb-width dst)) (dh (glass:fb-height dst)))
+    (dotimes (sy sh)
+      (let ((dy (+ oy sy)))
+        (when (< -1 dy dh)
+          (let ((drow (* dy dw)) (srow (* sy sw)))
+            (dotimes (sx sw)
+              (let ((dx (+ ox sx)))
+                (when (< -1 dx dw)
+                  (setf (aref dpx (+ drow dx)) (aref spx (+ srow sx))))))))))))
 
 (defun wm-corners (fb x y w h)
   "OPEN LOOK L-shaped resize corner marks."
@@ -79,7 +81,7 @@
              (tx cx) (ty (- cy +wm-titleh+))                  ; title bar just above content
              (wx (- cx +wm-border+)) (wy (- ty +wm-border+))
              (ww (+ cw (* 2 +wm-border+))) (wh (+ +wm-titleh+ ch (* 2 +wm-border+))))
-        (blit-argb (climi::pattern-array (wm-deco mirror cw)) tx ty fb)   ; title bar
+        (blit-fb (wm-deco mirror cw) tx ty fb)                            ; title bar
         (blit-mirror mirror fb)                                           ; content at (cx,cy)
         (glass:fb-frame fb wx wy ww wh glass:+black+ +wm-border+)         ; window border
         (wm-corners fb wx wy ww wh)))))
