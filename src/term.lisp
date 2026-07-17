@@ -15,25 +15,35 @@
 ;;; ---- palette (Tango 16-colour) ---------------------------------------------
 
 (defparameter *palette*
-  (map 'vector (lambda (rgb) (glass:rgb (first rgb) (second rgb) (third rgb)))
-       '((0 0 0) (204 0 0) (78 154 6) (196 160 0) (52 101 164) (117 80 123)
-         (6 152 154) (211 215 207) (85 87 83) (239 41 41) (138 226 52) (252 233 79)
-         (114 159 207) (173 127 168) (52 226 226) (238 238 236))))
-(defun pal (i) (aref *palette* (logand i 15)))
+  (let ((v (make-array 256)))
+    (loop for i from 0 for rgb in       ; 0-15: the 16 ANSI colours (Tango)
+          '((0 0 0) (204 0 0) (78 154 6) (196 160 0) (52 101 164) (117 80 123)
+            (6 152 154) (211 215 207) (85 87 83) (239 41 41) (138 226 52) (252 233 79)
+            (114 159 207) (173 127 168) (52 226 226) (238 238 236))
+          do (setf (aref v i) (glass:rgb (first rgb) (second rgb) (third rgb))))
+    (flet ((lvl (x) (if (zerop x) 0 (+ 55 (* x 40)))))         ; 16-231: 6x6x6 cube
+      (loop for i from 16 below 232 for n = (- i 16) do
+        (setf (aref v i) (glass:rgb (lvl (floor n 36)) (lvl (mod (floor n 6) 6)) (lvl (mod n 6))))))
+    (loop for i from 232 below 256 for l = (+ 8 (* (- i 232) 10)) do   ; 232-255: greys
+      (setf (aref v i) (glass:rgb l l l)))
+    v))
+(defun pal (i) (aref *palette* (logand i 255)))
+(defun q6 (x) (cond ((< x 48) 0) ((< x 115) 1) ((< x 155) 2) ((< x 195) 3) ((< x 235) 4) (t 5)))
+(defun rgb->256 (r g b) (+ 16 (* 36 (q6 r)) (* 6 (q6 g)) (q6 b)))   ; truecolor -> nearest cube
 (defconstant +def-fg+ 7)
 (defconstant +def-bg+ 0)
 
 ;;; ---- cell packing: char | fg<<21 | bg<<25 | bold<<29 -----------------------
 
 (declaim (inline mkcell cell-char cell-fg cell-bg cell-wide-p cell-spacer-p))
-(defun mkcell (ch fg bg bold &key wide spacer)
-  (logior (logand ch #x1fffff) (ash (logand fg 15) 21) (ash (logand bg 15) 25)
-          (ash (if bold 1 0) 29) (ash (if wide 1 0) 30) (ash (if spacer 1 0) 31)))
+(defun mkcell (ch fg bg bold &key wide spacer)   ; char(21) fg(8) bg(8) bold wide spacer -> 40 bits
+  (logior (logand ch #x1fffff) (ash (logand fg 255) 21) (ash (logand bg 255) 29)
+          (ash (if bold 1 0) 37) (ash (if wide 1 0) 38) (ash (if spacer 1 0) 39)))
 (defun cell-char (c) (logand c #x1fffff))
-(defun cell-fg (c) (logand (ash c -21) 15))
-(defun cell-bg (c) (logand (ash c -25) 15))
-(defun cell-wide-p (c) (logbitp 30 c))          ; glyph spans this + the next cell
-(defun cell-spacer-p (c) (logbitp 31 c))        ; right half of a wide char (draw nothing)
+(defun cell-fg (c) (logand (ash c -21) 255))
+(defun cell-bg (c) (logand (ash c -29) 255))
+(defun cell-wide-p (c) (logbitp 38 c))          ; glyph spans this + the next cell
+(defun cell-spacer-p (c) (logbitp 39 c))        ; right half of a wide char (draw nothing)
 (defun blank-cell () (mkcell (char-code #\Space) +def-fg+ +def-bg+ nil))
 
 ;;; ---- character width (wcwidth-lite: 0 combining, 2 CJK/emoji, else 1) -------
@@ -65,7 +75,10 @@
   (ctrl nil)                            ; keyboard: control held?
   (u8-need 0) (u8-cp 0)                 ; UTF-8 decoder state (bytes remaining, accumulator)
   (dcs nil)                             ; DCS payload buffer (sixel), while collecting
-  (graphics nil))                       ; placed sixel images: list of (px py . framebuffer)
+  (graphics nil)                        ; placed sixel images: list of (px py . framebuffer)
+  (cursor-vis t)                        ; DECTCEM (?25): draw the cursor block?
+  (alt nil)                             ; saved main screen while on the alternate buffer
+  (dec-saved nil))                      ; DECSC cursor+attrs save
 
 (defun cell (tm x y) (aref (terminal-cells tm) (+ (* y (terminal-cols tm)) x)))
 (defun (setf cell) (v tm x y) (setf (aref (terminal-cells tm) (+ (* y (terminal-cols tm)) x)) v))
@@ -115,23 +128,97 @@
     (loop for x from (if (= y from-y) from-x 0) to (if (= y to-y) to-x (1- (terminal-cols tm)))
           do (setf (cell tm x y) (blank-cell)))))
 
+(defun scroll-down (tm)
+  "Scroll the region down one line (blank line inserted at the top)."
+  (let ((cols (terminal-cols tm)) (cells (terminal-cells tm)))
+    (loop for y from (terminal-bot tm) above (terminal-top tm) do
+      (replace cells cells :start1 (* y cols) :end1 (* (1+ y) cols) :start2 (* (1- y) cols)))
+    (fill cells (blank-cell) :start (* (terminal-top tm) cols) :end (* (1+ (terminal-top tm)) cols))))
+
+(defun ins-lines (tm n)                 ; IL: insert N blank lines at the cursor row
+  (let ((cols (terminal-cols tm)) (cells (terminal-cells tm))
+        (cy (terminal-cy tm)) (bot (terminal-bot tm)))
+    (loop for y from bot downto (+ cy n) do
+      (replace cells cells :start1 (* y cols) :end1 (* (1+ y) cols) :start2 (* (- y n) cols)))
+    (loop for y from cy below (min (+ cy n) (1+ bot)) do
+      (fill cells (blank-cell) :start (* y cols) :end (* (1+ y) cols)))))
+
+(defun del-lines (tm n)                 ; DL: delete N lines at the cursor row
+  (let ((cols (terminal-cols tm)) (cells (terminal-cells tm))
+        (cy (terminal-cy tm)) (bot (terminal-bot tm)))
+    (loop for y from cy to (- bot n) do
+      (replace cells cells :start1 (* y cols) :end1 (* (1+ y) cols) :start2 (* (+ y n) cols)))
+    (loop for y from (max cy (1+ (- bot n))) to bot do
+      (fill cells (blank-cell) :start (* y cols) :end (* (1+ y) cols)))))
+
+(defun ins-chars (tm n)                 ; ICH: shift the line right by N at the cursor
+  (let ((y (terminal-cy tm)) (cols (terminal-cols tm)) (cx (terminal-cx tm)))
+    (loop for x from (1- cols) downto (+ cx n) do (setf (cell tm x y) (cell tm (- x n) y)))
+    (loop for x from cx below (min (+ cx n) cols) do (setf (cell tm x y) (blank-cell)))))
+
+(defun ech (tm n)                       ; ECH: erase N chars from the cursor (no shift)
+  (let ((y (terminal-cy tm)) (cx (terminal-cx tm)) (cols (terminal-cols tm)))
+    (loop for x from cx below (min (+ cx n) cols) do (setf (cell tm x y) (blank-cell)))))
+
+(defun set-alt (tm on)
+  "Switch to / from the alternate screen buffer (?1049/?47/?1047)."
+  (cond
+    ((and on (not (terminal-alt tm)))
+     (setf (terminal-alt tm) (list (terminal-cells tm) (terminal-cx tm) (terminal-cy tm)
+                                   (terminal-fg tm) (terminal-bg tm) (terminal-bold tm))
+           (terminal-cells tm) (make-grid (terminal-cols tm) (terminal-rows tm))
+           (terminal-cx tm) 0 (terminal-cy tm) 0))
+    ((and (not on) (terminal-alt tm))
+     (destructuring-bind (cells cx cy fg bg bold) (terminal-alt tm)
+       (setf (terminal-cells tm) cells (terminal-cx tm) cx (terminal-cy tm) cy
+             (terminal-fg tm) fg (terminal-bg tm) bg (terminal-bold tm) bold
+             (terminal-alt tm) nil)))))
+
+(defun private-mode (tm set-p)
+  "DEC private mode set/reset (CSI ? Pn h / l)."
+  (dolist (n (or (terminal-params tm) '(0)))
+    (case n
+      (25 (setf (terminal-cursor-vis tm) set-p))          ; DECTCEM cursor visibility
+      ((47 1047 1049) (set-alt tm set-p)))))              ; alternate screen
+
+(defun decsc (tm)
+  (setf (terminal-dec-saved tm) (list (terminal-cx tm) (terminal-cy tm)
+                                      (terminal-fg tm) (terminal-bg tm) (terminal-bold tm))))
+(defun decrc (tm)
+  (when (terminal-dec-saved tm)
+    (destructuring-bind (cx cy fg bg bold) (terminal-dec-saved tm)
+      (setf (terminal-cx tm) cx (terminal-cy tm) cy (terminal-fg tm) fg
+            (terminal-bg tm) bg (terminal-bold tm) bold))))
+
 (defun p (tm n default) (or (nth n (terminal-params tm)) default))
 
+(defun sgr-ext (ps i)
+  "Parse an extended colour after 38/48 at PS[I]: 5;n (256) or 2;r;g;b (truecolor
+   -> nearest 256).  Returns (values colour-index params-consumed)."
+  (let ((kind (nth i ps)))
+    (cond ((eql kind 5) (values (or (nth (1+ i) ps) 0) 2))
+          ((eql kind 2) (values (rgb->256 (or (nth (1+ i) ps) 0) (or (nth (+ i 2) ps) 0) (or (nth (+ i 3) ps) 0)) 4))
+          (t (values +def-fg+ 1)))))
+
 (defun sgr (tm)
-  (let ((ps (or (terminal-params tm) '(0))))
-    (dolist (n ps)
-      (cond ((= n 0) (setf (terminal-fg tm) +def-fg+ (terminal-bg tm) +def-bg+
-                           (terminal-bold tm) nil (terminal-reverse tm) nil))
-            ((= n 1) (setf (terminal-bold tm) t))
-            ((= n 7) (setf (terminal-reverse tm) t))
-            ((or (= n 22) (= n 21)) (setf (terminal-bold tm) nil))
-            ((= n 27) (setf (terminal-reverse tm) nil))
-            ((<= 30 n 37) (setf (terminal-fg tm) (- n 30)))
-            ((= n 39) (setf (terminal-fg tm) +def-fg+))
-            ((<= 40 n 47) (setf (terminal-bg tm) (- n 40)))
-            ((= n 49) (setf (terminal-bg tm) +def-bg+))
-            ((<= 90 n 97) (setf (terminal-fg tm) (+ 8 (- n 90))))
-            ((<= 100 n 107) (setf (terminal-bg tm) (+ 8 (- n 100))))))))
+  (let* ((ps (or (terminal-params tm) '(0))) (i 0) (len (length ps)))
+    (loop while (< i len) do
+      (let ((n (nth i ps)))
+        (cond ((= n 0) (setf (terminal-fg tm) +def-fg+ (terminal-bg tm) +def-bg+
+                             (terminal-bold tm) nil (terminal-reverse tm) nil))
+              ((= n 1) (setf (terminal-bold tm) t))
+              ((= n 7) (setf (terminal-reverse tm) t))
+              ((or (= n 22) (= n 21)) (setf (terminal-bold tm) nil))
+              ((= n 27) (setf (terminal-reverse tm) nil))
+              ((<= 30 n 37) (setf (terminal-fg tm) (- n 30)))
+              ((= n 38) (multiple-value-bind (col adv) (sgr-ext ps (1+ i)) (setf (terminal-fg tm) col) (incf i adv)))
+              ((= n 39) (setf (terminal-fg tm) +def-fg+))
+              ((<= 40 n 47) (setf (terminal-bg tm) (- n 40)))
+              ((= n 48) (multiple-value-bind (col adv) (sgr-ext ps (1+ i)) (setf (terminal-bg tm) col) (incf i adv)))
+              ((= n 49) (setf (terminal-bg tm) +def-bg+))
+              ((<= 90 n 97) (setf (terminal-fg tm) (+ 8 (- n 90))))
+              ((<= 100 n 107) (setf (terminal-bg tm) (+ 8 (- n 100)))))
+        (incf i)))))
 
 (defun csi-dispatch (tm final)
   (case final
@@ -154,11 +241,17 @@
     (#\r (setf (terminal-top tm) (1- (p tm 0 1)) (terminal-bot tm) (1- (p tm 1 (terminal-rows tm)))))
     (#\s (setf (terminal-saved-cx tm) (terminal-cx tm) (terminal-saved-cy tm) (terminal-cy tm)))
     (#\u (setf (terminal-cx tm) (terminal-saved-cx tm) (terminal-cy tm) (terminal-saved-cy tm)))
-    (#\P (let ((n (p tm 0 1)) (y (terminal-cy tm)))   ; delete chars: shift line left
+    (#\P (let ((n (p tm 0 1)) (y (terminal-cy tm)))   ; DCH delete chars: shift line left
            (loop for x from (terminal-cx tm) below (- (terminal-cols tm) n)
                  do (setf (cell tm x y) (cell tm (+ x n) y)))
            (loop for x from (max 0 (- (terminal-cols tm) n)) below (terminal-cols tm)
                  do (setf (cell tm x y) (blank-cell)))))
+    (#\@ (ins-chars tm (p tm 0 1)))                    ; ICH
+    (#\X (ech tm (p tm 0 1)))                          ; ECH
+    (#\L (ins-lines tm (p tm 0 1)))                    ; IL
+    (#\M (del-lines tm (p tm 0 1)))                    ; DL
+    (#\S (dotimes (k (p tm 0 1)) (scroll-up tm)))      ; SU
+    (#\T (dotimes (k (p tm 0 1)) (scroll-down tm)))    ; SD
     (t nil)))                                          ; ignore the rest
 
 (defun feed-char (tm c)
@@ -180,7 +273,11 @@
          (#\P (setf (terminal-pstate tm) :dcs           ; DCS (sixel graphics): collect to ST
                     (terminal-dcs tm) (make-array 64 :element-type 'character :adjustable t :fill-pointer 0)))
          ((#\( #\)) (setf (terminal-pstate tm) :charset))
-         (#\M (if (<= (terminal-cy tm) (terminal-top tm)) nil (decf (terminal-cy tm)))  ; reverse index
+         (#\7 (decsc tm) (setf (terminal-pstate tm) :ground))          ; DECSC save cursor
+         (#\8 (decrc tm) (setf (terminal-pstate tm) :ground))          ; DECRC restore cursor
+         (#\D (line-feed tm) (setf (terminal-pstate tm) :ground))      ; IND index
+         (#\E (setf (terminal-cx tm) 0) (line-feed tm) (setf (terminal-pstate tm) :ground))  ; NEL
+         (#\M (if (<= (terminal-cy tm) (terminal-top tm)) (scroll-down tm) (decf (terminal-cy tm)))  ; RI
               (setf (terminal-pstate tm) :ground))
          (t (setf (terminal-pstate tm) :ground))))
       (:charset (setf (terminal-pstate tm) :ground))
@@ -198,7 +295,8 @@
                               (terminal-pcur tm) nil))
          ((<= 64 code 126)
           (when (terminal-pcur tm) (setf (terminal-params tm) (append (terminal-params tm) (list (terminal-pcur tm)))))
-          (unless (terminal-ppriv tm) (csi-dispatch tm c))
+          (cond ((and (terminal-ppriv tm) (member c '(#\h #\l))) (private-mode tm (char= c #\h)))
+                ((not (terminal-ppriv tm)) (csi-dispatch tm c)))
           (setf (terminal-pstate tm) :ground)))))))
 
 ;;; ---- sixel graphics (DCS <params> q <data> ST) -----------------------------
@@ -307,7 +405,7 @@
          (cw (terminal-cell-w tm)) (ch (terminal-cell-h tm))
          (span (if (cell-wide-p c) 2 1))
          (px0 (* x cw)) (py0 (* y ch))
-         (cursor (and (= x (terminal-cx tm)) (= y (terminal-cy tm))))
+         (cursor (and (terminal-cursor-vis tm) (= x (terminal-cx tm)) (= y (terminal-cy tm))))
          (fg (pal (if cursor (cell-bg c) (cell-fg c))))
          (bg (pal (if cursor (cell-fg c) (cell-bg c)))))   ; cursor = inverse block
     (glass:fb-rect fb px0 py0 (* cw span) ch bg)
