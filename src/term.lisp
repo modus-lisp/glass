@@ -9,7 +9,7 @@
 
 (defpackage #:glass-term
   (:use #:cl)
-  (:export #:run #:make-terminal #:terminal #:terminal-fb #:on-key #:start-pump))
+  (:export #:run #:make-terminal #:terminal #:terminal-fb #:on-key #:on-mouse #:start-pump))
 (in-package #:glass-term)
 
 ;;; ---- palette (Tango 16-colour) ---------------------------------------------
@@ -78,7 +78,9 @@
   (graphics nil)                        ; placed sixel images: list of (px py . framebuffer)
   (cursor-vis t)                        ; DECTCEM (?25): draw the cursor block?
   (alt nil)                             ; saved main screen while on the alternate buffer
-  (dec-saved nil))                      ; DECSC cursor+attrs save
+  (dec-saved nil)                       ; DECSC cursor+attrs save
+  (mouse-mode nil) (mouse-sgr nil)      ; mouse tracking: nil/:normal/:button/:any, SGR (1006)?
+  (mouse-buttons 0) (mouse-col 0) (mouse-row 0))   ; last mouse state (for diffing)
 
 (defun cell (tm x y) (aref (terminal-cells tm) (+ (* y (terminal-cols tm)) x)))
 (defun (setf cell) (v tm x y) (setf (aref (terminal-cells tm) (+ (* y (terminal-cols tm)) x)) v))
@@ -179,7 +181,11 @@
   (dolist (n (or (terminal-params tm) '(0)))
     (case n
       (25 (setf (terminal-cursor-vis tm) set-p))          ; DECTCEM cursor visibility
-      ((47 1047 1049) (set-alt tm set-p)))))              ; alternate screen
+      ((47 1047 1049) (set-alt tm set-p))                 ; alternate screen
+      (1000 (setf (terminal-mouse-mode tm) (and set-p :normal)))  ; mouse: press/release
+      (1002 (setf (terminal-mouse-mode tm) (and set-p :button)))  ; + motion while pressed
+      (1003 (setf (terminal-mouse-mode tm) (and set-p :any)))     ; + all motion
+      (1006 (setf (terminal-mouse-sgr tm) set-p)))))      ; SGR extended encoding
 
 (defun decsc (tm)
   (setf (terminal-dec-saved tm) (list (terminal-cx tm) (terminal-cy tm)
@@ -505,6 +511,39 @@
          (when bytes
            (write-string bytes (terminal-pty tm)) (force-output (terminal-pty tm)))))))
 
+(defun mouse-send (tm cb col row press-p)
+  (let ((out (terminal-pty tm)))
+    (if (terminal-mouse-sgr tm)
+        (format out "~c[<~d;~d;~d~a" (code-char 27) cb col row (if press-p "M" "m"))
+        (let ((b (if press-p cb 3)))                       ; legacy X10: release is button 3
+          (write-char (code-char 27) out) (write-char #\[ out) (write-char #\M out)
+          (write-char (code-char (min 255 (+ b 32))) out)
+          (write-char (code-char (min 255 (+ col 32))) out)
+          (write-char (code-char (min 255 (+ row 32))) out)))
+    (force-output out)))
+
+(defun on-mouse (tm mask lx ly)
+  "Feed a pointer event (RFB button MASK; content-pixel LX,LY).  If the app has
+   enabled mouse tracking, encode it (SGR or legacy) and write it to the shell."
+  (when (terminal-mouse-mode tm)
+    (let* ((col (max 1 (1+ (floor lx (terminal-cell-w tm)))))
+           (row (max 1 (1+ (floor ly (terminal-cell-h tm)))))
+           (real (logand mask 7)) (changed (logxor real (terminal-mouse-buttons tm))))
+      (when (logtest mask 8)  (mouse-send tm 64 col row t))    ; wheel up
+      (when (logtest mask 16) (mouse-send tm 65 col row t))    ; wheel down
+      (cond
+        ((plusp changed)                                       ; a button pressed / released
+         (loop for (bit . code) in '((1 . 0) (2 . 1) (4 . 2))
+               when (logtest changed bit)
+               do (mouse-send tm code col row (logtest real bit))))
+        ((and (or (eq (terminal-mouse-mode tm) :any)
+                  (and (eq (terminal-mouse-mode tm) :button) (plusp real)))
+              (or (/= col (terminal-mouse-col tm)) (/= row (terminal-mouse-row tm))))
+         (mouse-send tm (+ 32 (cond ((logtest real 1) 0) ((logtest real 2) 1) ((logtest real 4) 2) (t 3)))
+                     col row t)))                              ; motion (drag / any)
+      (setf (terminal-mouse-buttons tm) real
+            (terminal-mouse-col tm) col (terminal-mouse-row tm) row))))
+
 ;;; ---- PTY + run --------------------------------------------------------------
 
 (defun set-winsize (stream rows cols)
@@ -531,7 +570,10 @@
          (asc (round (* (scribe:font-ascent font) ppem) upem))
          (desc (round (* (- (scribe:font-descent font)) ppem) upem))
          (cell-h (+ asc desc 2))
-         (proc (sb-ext:run-program shell '("--norc" "-i") :pty t :wait nil
+         ;; setsid -c makes the pty the controlling terminal: real job control,
+         ;; no "cannot set process group" warning, and readline echoes normally.
+         (proc (sb-ext:run-program "/usr/bin/setsid" (list "-c" shell "--norc" "-i")
+                                   :pty t :wait nil
                                    :external-format :latin-1   ; read raw bytes; we UTF-8 decode
                                    :environment (list "TERM=xterm-256color" "PS1=\\w $ "
                                                       "PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"

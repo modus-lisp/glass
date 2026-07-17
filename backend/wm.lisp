@@ -181,7 +181,8 @@
          (c (glass-port-cascade port))
          (surf (make-wm-surface :fb (glass-term:terminal-fb tm)
                                 :x (+ 40 c) :y (+ 40 c +wm-titleh+) :title "terminal"
-                                :on-key (lambda (down k) (glass-term:on-key tm down k)))))
+                                :on-key (lambda (down k) (glass-term:on-key tm down k))
+                                :on-pointer (lambda (mask lx ly) (glass-term:on-mouse tm mask lx ly)))))
     (glass-term:start-pump tm)
     (setf (glass-port-cascade port) (mod (+ c 28) 200))
     (push surf (glass-port-surfaces port))
