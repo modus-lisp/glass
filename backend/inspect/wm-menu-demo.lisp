@@ -66,7 +66,12 @@
 
 (let ((port 5957))
   (sb-thread:make-thread
-   (lambda () (handler-case (clim-glass:run-wm '() :port port :width 720 :height 460)
+   (lambda () (handler-case
+                  ;; custom menu: labelled window specs (LABEL . SPEC), same
+                  ;; vocabulary as run-wm's initial windows.
+                  (clim-glass:run-wm '() :port port :width 720 :height 460
+                                     :menu '(("Terminal"        :terminal :cols 90 :rows 26)
+                                             ("Terminal (tabs)" :tabterm)))
                 (error (e) (format t "~&WM ERROR ~a~%" e)))))
   (let ((s (connect port)))
     (multiple-value-bind (w h) (handshake s)

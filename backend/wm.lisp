@@ -217,9 +217,9 @@
        (unless (eql idx (wm-menu-hover menu))                  ; hover follows the pointer
          (setf (wm-menu-hover menu) idx) (wm-menu-render menu) (composite-all port))
        (when left                                              ; left-press selects the item
-         (let ((thunk (cdr (nth idx (wm-menu-items menu)))))
+         (let ((action (cdr (nth idx (wm-menu-items menu)))))
            (setf (glass-port-menu port) nil) (composite-all port)
-           (when thunk (funcall thunk)))))
+           (when action (wm-menu-run port action)))))
       (t                                                       ; over the title strip
        (unless (eql (wm-menu-hover menu) -1)
          (setf (wm-menu-hover menu) -1) (wm-menu-render menu) (composite-all port))))))
@@ -285,39 +285,54 @@
                        :on-key (lambda (down k) (glass-term:tabterm-on-key tt down k))
                        :on-pointer (lambda (mask lx ly) (glass-term:tabterm-on-mouse tt mask lx ly))))))
 
-(defun wm-default-menu (port)
-  "The default workspace root menu: launchers for our own surface windows."
-  (list (cons "Terminal"        (lambda () (wm-add-terminal port) (composite-all port)))
-        (cons "Terminal (tabs)" (lambda () (wm-add-tabterm  port) (composite-all port)))
-        (cons "Refresh"         (lambda () (composite-all port)))))
+;;; A window spec is the shared launch vocabulary — used both for run-wm's
+;;; initial windows AND for the root-menu items, so a menu is just a list of
+;;; labelled specs.  (:terminal ...) / (:tabterm ...) open surface windows;
+;;; anything else is (FRAME-CLASS &key WIDTH HEIGHT) → a McCLIM application frame.
+(defun wm-spawn-spec (port spec)
+  (case (car spec)
+    (:terminal (apply #'wm-add-terminal port (cdr spec)))
+    (:tabterm  (apply #'wm-add-tabterm  port (cdr spec)))
+    (t (destructuring-bind (class &key (width 480) (height 320)) spec
+         (let ((fm (find-frame-manager :port port)))
+           (sb-thread:make-thread
+            (lambda ()
+              (handler-case
+                  (run-frame-top-level (make-application-frame class :frame-manager fm
+                                                               :width width :height height))
+                (error (e) (format *trace-output* "~&[wm] frame ~a: ~a~%" class e))))
+            :name (format nil "wm-~a" class)))))))
+
+(defun wm-menu-run (port action)
+  "Run a chosen menu ACTION: a window spec (launch it) or, as an escape hatch, a
+   thunk (call it)."
+  (if (functionp action)
+      (funcall action)
+      (progn (wm-spawn-spec port action) (composite-all port))))
+
+(defun wm-default-menu ()
+  "The default workspace root menu: labelled window specs (LABEL . SPEC)."
+  '(("Terminal"        :terminal)
+    ("Terminal (tabs)" :tabterm)))
 
 (defun run-wm (specs &key (port 5900) (width 1000) (height 720) menu)
   "Run a mini OPEN LOOK desktop over VNC.  Each spec is a decorated window:
    (FRAME-CLASS &key WIDTH HEIGHT) for a McCLIM app, or (:terminal &key COLS ROWS
    PPEM) for a shell terminal.  Right-click the workspace for a root menu; pass
-   MENU (a list of (LABEL . THUNK)) to override its items.  Serves on PORT."
+   MENU — a list of (LABEL . SPEC) labelled window specs (same vocabulary as
+   SPECS), or (LABEL . THUNK) for an arbitrary action — to override its items.
+   Serves on PORT."
   (let ((p (find-glass-port :port port)))
     (setf (glass-port-wm-p p) t
           (glass-port-screen-w p) width (glass-port-screen-h p) height
           (glass-port-fb p) (glass:make-framebuffer width height +wm-teal+)
-          (glass-port-menu-items p) (or menu (wm-default-menu p)))
+          (glass-port-menu-items p) (or menu (wm-default-menu)))
     (start-glass-server p)
     (climi::restart-port p)                                   ; event-loop thread
-    (let ((fm (find-frame-manager :port p)))
-      (dolist (spec specs)
-        (case (car spec)
-          (:terminal (apply #'wm-add-terminal p (cdr spec)))
-          (:tabterm  (apply #'wm-add-tabterm p (cdr spec)))
-          (t (destructuring-bind (class &key (width 480) (height 320)) spec
-               (sb-thread:make-thread
-                (lambda ()
-                  (handler-case
-                      (run-frame-top-level (make-application-frame class :frame-manager fm
-                                                                   :width width :height height))
-                    (error (e) (format *trace-output* "~&[wm] frame ~a: ~a~%" class e))))
-                :name (format nil "wm-~a" class)))))
-        (sleep 0.7)                                           ; stagger for distinct cascade slots
-        (composite-all p)))
+    (dolist (spec specs)
+      (wm-spawn-spec p spec)
+      (sleep 0.7)                                             ; stagger for distinct cascade slots
+      (composite-all p))
     ;; Surface windows (terminals) render asynchronously in their own threads, so
     ;; tick the compositor to pick up shell output; glass's dirty diff ships only
     ;; changed tiles, so an idle desktop costs next to nothing.
