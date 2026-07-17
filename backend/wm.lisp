@@ -310,18 +310,38 @@
            (error (e) (format *trace-output* "~&[wm] inspect: ~a~%" e))))
        :name "wm-inspect"))))
 
+(defun wm-debug (port form)
+  "Evaluate FORM with McCLIM's graphical debugger installed, so any UNHANDLED
+   error pops up clim-debugger (condition + restarts + inspectable backtrace) as
+   a decorated window — the Genera debugger.  clim-debugger is an OPTIONAL runtime
+   dependency, resolved by name.  NB: we must NOT wrap FORM in an error handler
+   (that would preempt the debugger); instead we provide a clean ABORT restart."
+  (let ((dbg (and (find-package '#:clim-debugger) (find-symbol "DEBUGGER" '#:clim-debugger))))
+    (unless (and dbg (fboundp dbg)) (error "clim-debugger not loaded — (ql:quickload :clim-debugger)"))
+    (let ((fm (find-frame-manager :port port)))
+      (sb-thread:make-thread
+       (lambda ()
+         (let ((*debugger-hook* dbg)                  ; ANSI hook…
+               (sb-ext:*invoke-debugger-hook* dbg)    ; …and SBCL's (takes precedence)
+               (climi::*default-frame-manager* fm))   ; land the debugger on OUR port
+           (with-simple-restart (abort "Close the debugger")
+             (eval form))))
+       :name "wm-debug"))))
+
 ;;; A window spec is the shared launch vocabulary — used both for run-wm's
 ;;; initial windows AND for the root-menu items, so a menu is just a list of
 ;;; labelled specs:
 ;;;   (:terminal &key cols rows ppem)   a shell terminal (surface window)
 ;;;   (:tabterm  &key cols rows ppem)   a tabbed terminal
 ;;;   (:inspect FORM)                   Clouseau inspecting the value of FORM
+;;;   (:debug FORM)                     evaluate FORM under the CLIM debugger
 ;;;   (FRAME-CLASS &key width height)   any McCLIM application frame
 (defun wm-spawn-spec (port spec)
   (case (car spec)
     (:terminal (apply #'wm-add-terminal port (cdr spec)))
     (:tabterm  (apply #'wm-add-tabterm  port (cdr spec)))
     (:inspect  (wm-inspect port (cadr spec)))
+    (:debug    (wm-debug   port (cadr spec)))
     (t (destructuring-bind (class &key (width 480) (height 320)) spec
          (wm-run-frame port (make-application-frame class :frame-manager (find-frame-manager :port port)
                                                     :width width :height height)
