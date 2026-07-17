@@ -41,6 +41,14 @@ Kept separate so the core framebuffer + RFB server stay dependency-light."
   :serial t
   :components ((:module "src" :serial t :components ((:file "text")))))
 
+(asdf:defsystem :glass/term
+  :description "A terminal emulator on glass: a real PTY + shell, an ANSI/VT
+parser, and a character grid rendered with scribe, served over VNC.  No xterm,
+no X.  (sb-ext:run-program + one winsize ioctl are the platform seam.)"
+  :depends-on ("glass" "glass/text" "scribe")
+  :serial t
+  :components ((:module "src" :serial t :components ((:file "term")))))
+
 (asdf:defsystem :glass/test
   :description "Self-test for glass: an RFB client that drives the server.  Uses
 chipz as an independent inflate oracle for the ZRLE stream (cram compresses;
