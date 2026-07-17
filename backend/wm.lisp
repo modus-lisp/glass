@@ -175,19 +175,32 @@
 
 ;;; ---- run ---------------------------------------------------------------------
 
+(defun wm-add-surface* (port surf)
+  (setf (glass-port-cascade port) (mod (+ (glass-port-cascade port) 28) 200))
+  (push surf (glass-port-surfaces port))
+  (setf (glass-port-focus-surface port) surf)
+  surf)
+
 (defun wm-add-terminal (port &key (cols 80) (rows 24) (ppem 14))
   "Create a terminal (shell in a pty) and add it as a WM surface window."
   (let* ((tm (glass-term:make-terminal :cols cols :rows rows :ppem ppem))
-         (c (glass-port-cascade port))
-         (surf (make-wm-surface :fb (glass-term:terminal-fb tm)
-                                :x (+ 40 c) :y (+ 40 c +wm-titleh+) :title "terminal"
-                                :on-key (lambda (down k) (glass-term:on-key tm down k))
-                                :on-pointer (lambda (mask lx ly) (glass-term:on-mouse tm mask lx ly)))))
+         (c (glass-port-cascade port)))
     (glass-term:start-pump tm)
-    (setf (glass-port-cascade port) (mod (+ c 28) 200))
-    (push surf (glass-port-surfaces port))
-    (setf (glass-port-focus-surface port) surf)
-    surf))
+    (wm-add-surface* port
+      (make-wm-surface :fb (glass-term:terminal-fb tm)
+                       :x (+ 40 c) :y (+ 40 c +wm-titleh+) :title "terminal"
+                       :on-key (lambda (down k) (glass-term:on-key tm down k))
+                       :on-pointer (lambda (mask lx ly) (glass-term:on-mouse tm mask lx ly))))))
+
+(defun wm-add-tabterm (port &key (cols 80) (rows 24) (ppem 14))
+  "A tabbed terminal (several shells, a tab bar) as a WM surface window."
+  (let ((tt (glass-term:make-tabbed-terminal :cols cols :rows rows :ppem ppem))
+        (c (glass-port-cascade port)))
+    (wm-add-surface* port
+      (make-wm-surface :fb (glass-term:tabterm-fb tt)
+                       :x (+ 40 c) :y (+ 40 c +wm-titleh+) :title "terminal"
+                       :on-key (lambda (down k) (glass-term:tabterm-on-key tt down k))
+                       :on-pointer (lambda (mask lx ly) (glass-term:tabterm-on-mouse tt mask lx ly))))))
 
 (defun run-wm (specs &key (port 5900) (width 1000) (height 720))
   "Run a mini OPEN LOOK desktop over VNC.  Each spec is a decorated window:
@@ -201,16 +214,17 @@
     (climi::restart-port p)                                   ; event-loop thread
     (let ((fm (find-frame-manager :port p)))
       (dolist (spec specs)
-        (if (eq (car spec) :terminal)
-            (apply #'wm-add-terminal p (cdr spec))
-            (destructuring-bind (class &key (width 480) (height 320)) spec
-              (sb-thread:make-thread
-               (lambda ()
-                 (handler-case
-                     (run-frame-top-level (make-application-frame class :frame-manager fm
-                                                                  :width width :height height))
-                   (error (e) (format *trace-output* "~&[wm] frame ~a: ~a~%" class e))))
-               :name (format nil "wm-~a" class))))
+        (case (car spec)
+          (:terminal (apply #'wm-add-terminal p (cdr spec)))
+          (:tabterm  (apply #'wm-add-tabterm p (cdr spec)))
+          (t (destructuring-bind (class &key (width 480) (height 320)) spec
+               (sb-thread:make-thread
+                (lambda ()
+                  (handler-case
+                      (run-frame-top-level (make-application-frame class :frame-manager fm
+                                                                   :width width :height height))
+                    (error (e) (format *trace-output* "~&[wm] frame ~a: ~a~%" class e))))
+                :name (format nil "wm-~a" class)))))
         (sleep 0.7)                                           ; stagger for distinct cascade slots
         (composite-all p)))
     (loop (sleep 10))))

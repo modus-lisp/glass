@@ -9,7 +9,9 @@
 
 (defpackage #:glass-term
   (:use #:cl)
-  (:export #:run #:make-terminal #:terminal #:terminal-fb #:on-key #:on-mouse #:start-pump))
+  (:export #:run #:make-terminal #:terminal #:terminal-fb #:on-key #:on-mouse #:start-pump
+           ;; tabbed terminal (multiple shells, a tab bar)
+           #:make-tabbed-terminal #:tabterm-fb #:tabterm-on-key #:tabterm-on-mouse #:tabterm-new))
 (in-package #:glass-term)
 
 ;;; ---- palette (Tango 16-colour) ---------------------------------------------
@@ -604,6 +606,68 @@
   "Spawn the shell-output pump thread; it renders into (terminal-fb TM).  Use
    when embedding a terminal (e.g. as a WM window) rather than the standalone RUN."
   (sb-thread:make-thread (lambda () (ignore-errors (pump tm))) :name "glass-term-pump"))
+
+;;; ---- tabbed terminal --------------------------------------------------------
+;;; One window, several shells: a tab bar across the top, the active shell below.
+;;; It is just a glass framebuffer + input handlers — the WM adds it as a surface
+;;; window like any other.  A render thread composites the tab bar and the active
+;;; terminal's framebuffer; clicking a tab switches, clicking "+" opens a new one.
+
+(defstruct tabterm terminals (active 0) cols rows ppem cell-w cell-h (tab-h 22) fb (last-mask 0))
+
+(defun tabterm-active-term (tt) (nth (tabterm-active tt) (tabterm-terminals tt)))
+(defun tabterm-tabw (tt)
+  (min 130 (floor (glass:fb-width (tabterm-fb tt)) (1+ (length (tabterm-terminals tt))))))
+
+(defun tabterm-new (tt)
+  "Open a new shell tab and make it active."
+  (let ((term (make-terminal :cols (tabterm-cols tt) :rows (tabterm-rows tt) :ppem (tabterm-ppem tt))))
+    (start-pump term)
+    (setf (tabterm-terminals tt) (append (tabterm-terminals tt) (list term))
+          (tabterm-active tt) (1- (length (tabterm-terminals tt))))
+    term))
+
+(defun tabterm-render (tt)
+  (let* ((fb (tabterm-fb tt)) (th (tabterm-tab-h tt)) (n (length (tabterm-terminals tt)))
+         (tabw (tabterm-tabw tt)))
+    (glass:with-fb-locked (fb)
+      (glass:fb-rect fb 0 0 (glass:fb-width fb) th (glass:rgb 38 38 44))
+      (dotimes (i n)                                         ; the tabs
+        (let* ((x (* i tabw)) (active (= i (tabterm-active tt))))
+          (glass:fb-rect fb (1+ x) 2 (- tabw 2) (- th 3) (if active (glass:rgb 20 20 24) (glass:rgb 58 58 66)))
+          (when active (glass:fb-rect fb (1+ x) (- th 2) (- tabw 2) 2 (glass:rgb 114 159 207)))
+          (glass:fb-text fb (+ x 10) 4 (format nil "sh ~d" (1+ i)) :size 12
+                         :color (if active glass:+white+ (glass:rgb 185 185 195)))))
+      (let ((x (* n tabw)))                                  ; the "+" new-tab button
+        (glass:fb-rect fb (1+ x) 2 (- tabw 2) (- th 3) (glass:rgb 48 48 56))
+        (glass:fb-text fb (+ x (floor tabw 2) -4) 3 "+" :size 15 :color (glass:rgb 150 220 150)))
+      (blit-image (terminal-fb (tabterm-active-term tt)) 0 th fb))))   ; active shell
+
+(defun tabterm-on-key (tt down keysym) (on-key (tabterm-active-term tt) down keysym))
+
+(defun tabterm-on-mouse (tt mask lx ly)
+  (let ((th (tabterm-tab-h tt))
+        (press (and (logtest mask 1) (not (logtest (tabterm-last-mask tt) 1)))))
+    (setf (tabterm-last-mask tt) mask)
+    (if (< ly th)                                            ; on the tab bar
+        (when press
+          (let ((n (length (tabterm-terminals tt))) (idx (floor lx (tabterm-tabw tt))))
+            (cond ((< idx n) (setf (tabterm-active tt) idx))
+                  ((= idx n) (tabterm-new tt)))))
+        (on-mouse (tabterm-active-term tt) mask lx (- ly th)))))  ; forward to the active shell
+
+(defun make-tabbed-terminal (&key (cols 80) (rows 24) (ppem 14))
+  "A tabbed terminal: a glass framebuffer showing a tab bar and one of several
+   shells.  Use TABTERM-FB / TABTERM-ON-KEY / TABTERM-ON-MOUSE to embed it."
+  (let* ((term (make-terminal :cols cols :rows rows :ppem ppem))
+         (cw (terminal-cell-w term)) (ch (terminal-cell-h term)) (tab-h 22)
+         (tt (make-tabterm :terminals (list term) :cols cols :rows rows :ppem ppem
+                           :cell-w cw :cell-h ch :tab-h tab-h
+                           :fb (glass:make-framebuffer (* cols cw) (+ tab-h (* rows ch)) glass:+black+))))
+    (start-pump term)
+    (sb-thread:make-thread (lambda () (loop (ignore-errors (tabterm-render tt)) (sleep 1/30)))
+                           :name "tabterm-render")
+    tt))
 
 (defun run (&key (port 5900) (cols 80) (rows 24) (ppem 16) (shell "/bin/bash") emoji-font)
   "Open SHELL in a pseudo-terminal and serve it as a terminal over VNC on PORT.
