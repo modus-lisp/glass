@@ -429,9 +429,11 @@
       ((and ef (let ((g (scribe:font-glyph-index ef code))) (and g (plusp g) (scribe:color-glyph-p ef g))))
        (list* :color (multiple-value-list
                       (scribe:rasterize-color-glyph ef (scribe:font-glyph-index ef code) ppem))))
-      (t (let ((f (or (ignore-errors (scribe:fallback-font-for-codepoint code)) primary)))
-           (list* :mono (multiple-value-list
-                         (scribe:rasterize-glyph f (scribe:font-glyph-index f code) ppem))))))))
+      (t (let* ((f (or (ignore-errors (scribe:fallback-font-for-codepoint code)) primary))
+                (g (scribe:font-glyph-index f code)))
+           (if (and g (plusp g) (scribe:color-glyph-p f g))   ; scribe's emoji fallback is now COLR
+               (list* :color (multiple-value-list (scribe:rasterize-color-glyph f g ppem)))
+               (list* :mono (multiple-value-list (scribe:rasterize-glyph f g ppem)))))))))
 
 (defun glyph (tm code)
   (or (gethash code (terminal-glyphs tm))
@@ -517,14 +519,10 @@
                   (* (sb-alien:array sb-alien:unsigned-short 4))))
       (sb-sys:fd-stream-fd stream) #x5414 (sb-alien:addr ws)))))
 
-(defparameter *emoji-font-paths*
-  '("/opt/open-webui/backend/open_webui/static/fonts/Twemoji.ttf")
-  "Candidate COLR (colour) emoji fonts; the first that exists is used.  NotoColorEmoji
-   is CBDT (bitmap) so scribe can't render it — a COLR font like Twemoji is needed.")
-
+;; Colour emoji come from scribe's bundled COLR fallback (Twemoji) by default;
+;; :emoji-font is an optional override (a path to another COLR font).
 (defun load-emoji-font (&optional path)
-  (let ((p (or path (find-if #'probe-file *emoji-font-paths*))))
-    (and p (ignore-errors (glass:load-font p)))))
+  (and path (ignore-errors (glass:load-font path))))
 
 (defun make-terminal (&key (cols 80) (rows 24) (ppem 16) (shell "/bin/bash") emoji-font)
   (let* ((font (glass:load-font (asdf:system-relative-pathname :scribe "fonts/LiberationMono-Regular.ttf")))
