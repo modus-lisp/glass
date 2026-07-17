@@ -1,21 +1,18 @@
-;;;; stock-app.lisp — run an unmodified stock McCLIM example over glass + screenshot it.
-;;;;
-;;;;   sbcl --dynamic-space-size 4096 --non-interactive --load backend/inspect/stock-app.lisp -- <frame> <w> <h>
-;;;;
-;;;; e.g. clim-demo::gadget-test / clim-demo::clim-fig / clim-demo::address-book.
-;;;; Runs the frame on a glass port and saves what a VNC client sees to a PNG.
+;;;; repl.lisp — type a form into the McCLIM Listener over glass and screenshot it.
+;;;;   sbcl --dynamic-space-size 4096 --non-interactive --load backend/inspect/repl.lisp
+;;;; Proves keyboard input drives a real interactive REPL/editor over VNC.
 
 (require :asdf)
 (load "~/quicklisp/setup.lisp")
 (handler-bind ((warning #'muffle-warning))
   (let ((*standard-output* (make-broadcast-stream)))
-    (ql:quickload '(:mcclim :mcclim-render :glass :zpng :chipz :clim-examples :clim-listener :clouseau))
+    (ql:quickload '(:mcclim :mcclim-render :glass :zpng :chipz :clim-listener))
     (require :sb-concurrency)
     (asdf:load-asd "/home/claude/glass/backend/mcclim-glass.asd")
     (asdf:load-system :mcclim-glass)))
 
-(defpackage #:glass-stock (:use #:cl))
-(in-package #:glass-stock)
+(defpackage #:glass-repl (:use #:cl))
+(in-package #:glass-repl)
 
 (defun r8 (s) (read-byte s)) (defun r16 (s) (logior (ash (r8 s) 8) (r8 s)))
 (defun r32 (s) (logior (ash (r16 s) 16) (r16 s)))
@@ -35,16 +32,14 @@
 
 (defun handshake (s)
   (rn s 12) (write-sequence (map 'vector #'char-code "RFB 003.008") s) (w8 s 10) (force-output s)
-  (let ((n (r8 s))) (rn s n)) (w8 s 1) (force-output s) (r32 s)
-  (w8 s 1) (force-output s)
+  (let ((n (r8 s))) (rn s n)) (w8 s 1) (force-output s) (r32 s) (w8 s 1) (force-output s)
   (let ((w (r16 s)) (h (r16 s))) (rn s 16) (let ((nl (r32 s))) (rn s nl))
-    (w8 s 2) (w8 s 0) (w16 s 2) (w32 s 16) (w32 s 0) (force-output s)      ; ZRLE, Raw
+    (w8 s 2) (w8 s 0) (w16 s 2) (w32 s 16) (w32 s 0) (force-output s)
     (values w h)))
 
-(defun read-frame (s w h)
-  (let ((dstate (chipz:make-dstate 'chipz:zlib))
-        (cli (make-array (* w h) :element-type '(unsigned-byte 32) :initial-element 0)))
-    (w8 s 3) (w8 s 0) (w16 s 0) (w16 s 0) (w16 s w) (w16 s h) (force-output s)  ; full
+(defun read-frame (s w h dstate)
+  (let ((cli (make-array (* w h) :element-type '(unsigned-byte 32) :initial-element 0)))
+    (w8 s 3) (w8 s 0) (w16 s 0) (w16 s 0) (w16 s w) (w16 s h) (force-output s)
     (r8 s) (r8 s)
     (dotimes (i (r16 s))
       (let ((rx (r16 s)) (ry (r16 s)) (rw (r16 s)) (rh (r16 s)) (enc (r32 s)))
@@ -82,29 +77,24 @@
       (setf (aref d y x 0) (ldb (byte 8 16) p) (aref d y x 1) (ldb (byte 8 8) p) (aref d y x 2) (ldb (byte 8 0) p)))))
     (zpng:write-png png path) path))
 
-(defun nonblank (cli) (let ((distinct (make-hash-table))) (loop for p across cli do (setf (gethash p distinct) t)) (hash-table-count distinct)))
+(defun key (s keysym) (w8 s 4) (w8 s 1) (w16 s 0) (w32 s keysym) (force-output s)
+  (w8 s 4) (w8 s 0) (w16 s 0) (w32 s keysym) (force-output s) (sleep 0.03))
+(defun typ (s text) (loop for ch across text do (key s (char-code ch))))
 
-;;; ---- run ----
-
-(let* ((argv (member "--" sb-ext:*posix-argv* :test #'string=))
-       (frame-name (or (second argv) "clim-demo::gadget-test"))
-       (w (parse-integer (or (third argv) "600")))
-       (h (parse-integer (or (fourth argv) "500")))
-       (frame-class (let ((*package* (find-package :cl-user))) (read-from-string frame-name)))
-       (port 5940)
-       (out (format nil "/tmp/glass-stock-~a.png" (substitute #\- #\: (string-downcase (symbol-name frame-class))))))
+(let ((port 5943))
   (sb-thread:make-thread
-   (lambda () (handler-case (clim-glass:run-frame frame-class :port port :width w :height h)
-                (error (e) (format t "~&FRAME ERROR ~a: ~a~%" (type-of e) e) (finish-output))))
-   :name "stock-frame")
+   (lambda () (handler-case (clim-glass:run-frame 'clim-listener::listener :port port :width 760 :height 480)
+                (error (e) (format t "~&FRAME ERROR ~a~%" e))))
+   :name "listener")
   (let ((s (connect port)))
     (multiple-value-bind (sw sh) (handshake s)
-      (format t "~&~a: desktop ~dx~d~%" frame-class sw sh)
-      (sleep 2.5)                                            ; let it lay out + paint
-      (let ((cli (read-frame s sw sh)))
-        (format t "~a: ~d distinct colors -> ~a; saved ~a~%"
-                frame-class (nonblank cli) (if (> (nonblank cli) 20) "RICH RENDER" "sparse")
-                (save-png cli sw sh out)))
+      (sleep 3.0)
+      (let ((dstate (chipz:make-dstate 'chipz:zlib)))
+        (read-frame s sw sh dstate)                         ; prime
+        (typ s "(+ 40 2)") (key s #xff0d)                   ; type a form, then Return
+        (sleep 1.5)
+        (save-png (read-frame s sw sh dstate) sw sh "/tmp/glass-repl.png")
+        (format t "~&typed (+ 40 2) + Enter into the Listener; saved /tmp/glass-repl.png~%"))
       (ignore-errors (close s)))))
 (finish-output)
 (sb-ext:exit)

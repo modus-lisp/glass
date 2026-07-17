@@ -319,8 +319,9 @@
               (glass-mirror-y mirror) (floor y1))))
     (values x1 y1 x2 y2)))
 (defmethod port-modifier-state ((port glass-port)) (glass-port-mods port))
-(defmethod (setf port-keyboard-input-focus) (focus (port glass-port)) focus)
-(defmethod port-keyboard-input-focus ((port glass-port)) nil)
+;; NB: keyboard-input-focus is handled by basic-port (it tracks the focused sheet
+;; and distribute-event routes key events there) — we must NOT shadow it, or keys
+;; never reach an interactor/editor.
 (defmethod set-sheet-pointer-cursor ((port glass-port) sheet cursor)
   (declare (ignore sheet cursor)) nil)
 
