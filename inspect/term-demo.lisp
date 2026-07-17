@@ -88,8 +88,10 @@
       (format t "~&terminal desktop: ~dx~d~%" w h)
       (sleep 1.5)
       (typ s "echo hello from the glass terminal") (enter s)
-      (typ s "ls -la /") (enter s)
       (typ s "echo colors:; ls --color=always -d /etc /usr /bin") (enter s)
+      ;; Unicode via printf \xNN (all typed as ASCII): CJK, box-drawing, accents, emoji
+      (typ s "printf 'cjk: \\xe6\\x97\\xa5\\xe6\\x9c\\xac\\xe8\\xaa\\x9e  box: \\xe2\\x94\\x8c\\xe2\\x94\\x80\\xe2\\x94\\x90  accent: caf\\xc3\\xa9\\n'") (enter s)
+      (typ s "printf 'emoji: \\xf0\\x9f\\x98\\x80 \\xf0\\x9f\\x8e\\x89 \\xf0\\x9f\\x9a\\x80 \\xf0\\x9f\\x91\\x8d  greek: \\xce\\xbb\\xcf\\x86\\n'") (enter s)
       (sleep 0.6)
       (let ((dstate (chipz:make-dstate 'chipz:zlib)))
         (save-png (read-frame s w h dstate) w h "/tmp/glass-term.png")

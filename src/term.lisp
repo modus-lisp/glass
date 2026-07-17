@@ -25,13 +25,30 @@
 
 ;;; ---- cell packing: char | fg<<21 | bg<<25 | bold<<29 -----------------------
 
-(declaim (inline mkcell cell-char cell-fg cell-bg))
-(defun mkcell (ch fg bg bold) (logior (logand ch #x1fffff) (ash (logand fg 15) 21)
-                                      (ash (logand bg 15) 25) (ash (if bold 1 0) 29)))
+(declaim (inline mkcell cell-char cell-fg cell-bg cell-wide-p cell-spacer-p))
+(defun mkcell (ch fg bg bold &key wide spacer)
+  (logior (logand ch #x1fffff) (ash (logand fg 15) 21) (ash (logand bg 15) 25)
+          (ash (if bold 1 0) 29) (ash (if wide 1 0) 30) (ash (if spacer 1 0) 31)))
 (defun cell-char (c) (logand c #x1fffff))
 (defun cell-fg (c) (logand (ash c -21) 15))
 (defun cell-bg (c) (logand (ash c -25) 15))
+(defun cell-wide-p (c) (logbitp 30 c))          ; glyph spans this + the next cell
+(defun cell-spacer-p (c) (logbitp 31 c))        ; right half of a wide char (draw nothing)
 (defun blank-cell () (mkcell (char-code #\Space) +def-fg+ +def-bg+ nil))
+
+;;; ---- character width (wcwidth-lite: 0 combining, 2 CJK/emoji, else 1) -------
+
+(defun zero-width-p (cp)
+  (or (<= #x0300 cp #x036F) (<= #x1AB0 cp #x1AFF) (<= #x1DC0 cp #x1DFF)
+      (<= #x20D0 cp #x20FF) (<= #xFE20 cp #xFE2F) (<= #x200B cp #x200F) (= cp #xFEFF)))
+(defun wide-p (cp)
+  (or (<= #x1100 cp #x115F) (<= #x2E80 cp #x303E) (<= #x3041 cp #x33FF)
+      (<= #x3400 cp #x4DBF) (<= #x4E00 cp #x9FFF) (<= #xA000 cp #xA4CF)
+      (<= #xAC00 cp #xD7A3) (<= #xF900 cp #xFAFF) (<= #xFE30 cp #xFE4F)
+      (<= #xFF00 cp #xFF60) (<= #xFFE0 cp #xFFE6)
+      (<= #x1F300 cp #x1FAFF) (<= #x1F000 cp #x1F0FF) (<= #x20000 cp #x3FFFD)))
+(defun char-width (cp)
+  (cond ((< cp 32) 0) ((zero-width-p cp) 0) ((wide-p cp) 2) (t 1)))
 
 ;;; ---- terminal ---------------------------------------------------------------
 
@@ -45,7 +62,8 @@
   pty proc                              ; the shell
   fb font ppem cell-w cell-h ascent     ; rendering
   (glyphs (make-hash-table))            ; char-code -> (cov w h left top)
-  (ctrl nil))                           ; keyboard: control held?
+  (ctrl nil)                            ; keyboard: control held?
+  (u8-need 0) (u8-cp 0))                ; UTF-8 decoder state (bytes remaining, accumulator)
 
 (defun cell (tm x y) (aref (terminal-cells tm) (+ (* y (terminal-cols tm)) x)))
 (defun (setf cell) (v tm x y) (setf (aref (terminal-cells tm) (+ (* y (terminal-cols tm)) x)) v))
@@ -62,11 +80,17 @@
     (if (terminal-reverse tm) (cons bg fg) (cons fg bg))))
 
 (defun put-char (tm ch)
-  (when (>= (terminal-cx tm) (terminal-cols tm))   ; auto-wrap
-    (setf (terminal-cx tm) 0) (line-feed tm))
-  (destructuring-bind (fg . bg) (eff-colors tm)
-    (setf (cell tm (terminal-cx tm) (terminal-cy tm)) (mkcell ch fg bg (terminal-bold tm))))
-  (incf (terminal-cx tm)))
+  (let ((w (char-width ch)))
+    (when (zerop w) (return-from put-char))          ; combining/zero-width: v1 drops it
+    (when (> (+ (terminal-cx tm) w) (terminal-cols tm))   ; wrap if it won't fit
+      (setf (terminal-cx tm) 0) (line-feed tm))
+    (destructuring-bind (fg . bg) (eff-colors tm)
+      (setf (cell tm (terminal-cx tm) (terminal-cy tm))
+            (mkcell ch fg bg (terminal-bold tm) :wide (= w 2)))
+      (when (= w 2)
+        (setf (cell tm (1+ (terminal-cx tm)) (terminal-cy tm))
+              (mkcell 0 fg bg (terminal-bold tm) :spacer t))))
+    (incf (terminal-cx tm) w)))
 
 (defun scroll-up (tm)
   (let ((cols (terminal-cols tm)) (cells (terminal-cells tm)))
@@ -164,28 +188,55 @@
           (unless (terminal-ppriv tm) (csi-dispatch tm c))
           (setf (terminal-pstate tm) :ground)))))))
 
+(defun feed-cp (tm cp)
+  (when (and (plusp cp) (<= cp #x10FFFF)) (feed-char tm (code-char cp))))
+
+(defun feed-byte (tm b)
+  "Decode a UTF-8 byte stream into codepoints, feeding each to the VT parser."
+  (cond
+    ((plusp (terminal-u8-need tm))
+     (if (<= #x80 b #xBF)
+         (progn (setf (terminal-u8-cp tm) (logior (ash (terminal-u8-cp tm) 6) (logand b #x3F)))
+                (when (zerop (decf (terminal-u8-need tm))) (feed-cp tm (terminal-u8-cp tm))))
+         (progn (setf (terminal-u8-need tm) 0) (feed-byte tm b))))   ; malformed: restart
+    ((< b #x80) (feed-cp tm b))
+    ((<= #xC0 b #xDF) (setf (terminal-u8-cp tm) (logand b #x1F) (terminal-u8-need tm) 1))
+    ((<= #xE0 b #xEF) (setf (terminal-u8-cp tm) (logand b #x0F) (terminal-u8-need tm) 2))
+    ((<= #xF0 b #xF7) (setf (terminal-u8-cp tm) (logand b #x07) (terminal-u8-need tm) 3))))
+
 ;;; ---- rendering (glyph-cached scribe) ---------------------------------------
 
 (declaim (inline over))
 (defun over (dst8 fg8 a ia)
   (scribe:linear->srgb (+ (* ia (scribe:srgb->linear dst8)) (* a (scribe:srgb->linear fg8)))))
 
+(defun cell-font (tm code)
+  "The primary mono font if it covers CODE, else a bundled fallback (CJK, emoji,
+   other scripts) via scribe, else the primary (renders .notdef)."
+  (if (scribe:font-covers-p (terminal-font tm) code)
+      (terminal-font tm)
+      (or (ignore-errors (scribe:fallback-font-for-codepoint code)) (terminal-font tm))))
+
 (defun glyph (tm code)
-  "Cached (cov w h left top) for CODE at the terminal's ppem."
+  "Cached (cov w h left top) for CODE at the terminal's ppem, using the right
+   font (primary or a fallback face for CJK / emoji / other scripts)."
   (or (gethash code (terminal-glyphs tm))
       (setf (gethash code (terminal-glyphs tm))
-            (multiple-value-list
-             (scribe:rasterize-glyph (terminal-font tm) (scribe:font-glyph-index (terminal-font tm) code)
-                                     (terminal-ppem tm))))))
+            (let ((font (cell-font tm code)))
+              (multiple-value-list
+               (scribe:rasterize-glyph font (scribe:font-glyph-index font code) (terminal-ppem tm)))))))
 
 (defun draw-cell (tm x y)
-  (let* ((c (cell tm x y)) (fb (terminal-fb tm))
+  (let ((c (cell tm x y)))
+    (when (cell-spacer-p c) (return-from draw-cell))   ; right half of a wide char
+  (let* ((fb (terminal-fb tm))
          (cw (terminal-cell-w tm)) (ch (terminal-cell-h tm))
+         (span (if (cell-wide-p c) 2 1))
          (px0 (* x cw)) (py0 (* y ch))
          (cursor (and (= x (terminal-cx tm)) (= y (terminal-cy tm))))
          (fg (pal (if cursor (cell-bg c) (cell-fg c))))
          (bg (pal (if cursor (cell-fg c) (cell-bg c)))))   ; cursor = inverse block
-    (glass:fb-rect fb px0 py0 cw ch bg)
+    (glass:fb-rect fb px0 py0 (* cw span) ch bg)
     (let (( code (cell-char c)))
       (when (> code 32)
         (destructuring-bind (cov gw gh left top &rest ignore) (glyph tm code)
@@ -205,7 +256,7 @@
                               (setf (aref dpx i)
                                     (logior (ash (over (ldb (byte 8 16) d) fr a ia) 16)
                                             (ash (over (ldb (byte 8 8) d) fgc a ia) 8)
-                                            (over (ldb (byte 8 0) d) fbc a ia))))))))))))))))))
+                                            (over (ldb (byte 8 0) d) fbc a ia)))))))))))))))))))
 
 (defun render (tm)
   (glass:with-fb-locked ((terminal-fb tm))
@@ -259,6 +310,7 @@
          (desc (round (* (- (scribe:font-descent font)) ppem) upem))
          (cell-h (+ asc desc 2))
          (proc (sb-ext:run-program shell '("--norc" "-i") :pty t :wait nil
+                                   :external-format :latin-1   ; read raw bytes; we UTF-8 decode
                                    :environment (list "TERM=xterm-256color" "PS1=\\w $ "
                                                       "PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
                                                       (format nil "COLUMNS=~d" cols) (format nil "LINES=~d" rows)
@@ -278,7 +330,7 @@
       (handler-case
           (loop repeat 200000 for c = (read-char-no-hang (terminal-pty tm) nil :eof)
                 do (cond ((null c) (return)) ((eq c :eof) (return-from pump))
-                         (t (feed-char tm c) (setf got t))))
+                         (t (feed-byte tm (char-code c)) (setf got t))))
         (stream-error () (return-from pump)))
       (when got (render tm))
       (sleep 1/60))))
