@@ -32,7 +32,9 @@
    (drag     :initform nil :accessor glass-port-drag)         ; (window off-x off-y) while moving a window
    (cascade  :initform 0   :accessor glass-port-cascade)      ; next window placement offset
    (surfaces :initform '() :accessor glass-port-surfaces)     ; non-McCLIM windows (e.g. terminals)
-   (focus-surface :initform nil :accessor glass-port-focus-surface))  ; surface grabbing the keyboard
+   (focus-surface :initform nil :accessor glass-port-focus-surface)  ; surface grabbing the keyboard
+   (menu     :initform nil :accessor glass-port-menu)         ; open workspace root menu, or nil
+   (menu-items :initform '() :accessor glass-port-menu-items))  ; (label . thunk) list for the root menu
   (:default-initargs :pointer (make-instance 'climi::standard-pointer)))
 
 (defun parse-glass-server-path (path) path)     ; plist tail becomes initargs

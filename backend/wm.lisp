@@ -14,6 +14,20 @@
 
 (defparameter +wm-teal+ (glass:rgb 61 122 138) "The Sun workspace background.")
 
+;;; ---- workspace root menu (OPEN LOOK) ---------------------------------------
+;;; Right-click the bare workspace to pop up a small grey menu of things to run
+;;; (Terminal, Tabbed Terminal, ...).  It follows the pointer with a hover
+;;; highlight; a left-click on an item runs its thunk, a click off it dismisses.
+
+(defparameter +menu-bg+ (glass:rgb 208 208 208) "Menu background grey.")
+(defparameter +menu-title-bg+ (glass:rgb 188 188 188) "Menu title strip.")
+(defparameter +menu-hi+ (glass:rgb 61 122 138) "Highlighted item (teal).")
+(defconstant +menu-itemh+ 20 "Height of one menu item (px).")
+(defconstant +menu-titleh+ 20 "Height of the menu title strip (px).")
+
+(defstruct wm-menu
+  (x 0) (y 0) (hover -1) (title "Workspace") items fb)
+
 ;;; ---- decoration rendering (via mcclim-render, cached per window) ------------
 
 (defun wm-sheet-title (sheet)
@@ -113,7 +127,9 @@
   (dolist (mirror (reverse (glass-port-mirrors port)))        ; McCLIM windows (bottom-to-top)
     (if (glass-mirror-managed mirror) (wm-draw-window mirror fb) (blit-mirror mirror fb)))
   (dolist (surf (reverse (glass-port-surfaces port)))         ; surface windows, on top
-    (wm-draw-surface surf fb)))
+    (wm-draw-surface surf fb))
+  (when-let ((menu (glass-port-menu port)))                   ; root menu above everything
+    (blit-fb (wm-menu-fb menu) (wm-menu-x menu) (wm-menu-y menu) fb)))
 
 ;;; ---- pointer routing --------------------------------------------------------
 
@@ -146,7 +162,72 @@
       (setf (glass-port-surfaces port) (cons obj (remove obj (glass-port-surfaces port))))
       (setf (glass-port-mirrors port) (cons obj (remove obj (glass-port-mirrors port))))))
 
+;;; ---- workspace root menu ----------------------------------------------------
+
+(defun wm-menu-width (menu)
+  (let ((w (+ 24 (glass:text-width (wm-menu-title menu) :size 12 :font (glass:default-font t)))))
+    (dolist (it (wm-menu-items menu) (max 96 w))
+      (setf w (max w (+ 28 (glass:text-width (car it) :size 12 :font (glass:default-font t))))))))
+
+(defun wm-menu-render (menu)
+  "(Re)build the menu's framebuffer, drawing the current hover highlight."
+  (let* ((n (length (wm-menu-items menu)))
+         (w (wm-menu-width menu))
+         (h (+ +menu-titleh+ (* n +menu-itemh+)))
+         (fb (glass:make-framebuffer w h +menu-bg+))
+         (font (glass:default-font t)))
+    (glass:fb-rect fb 0 0 w +menu-titleh+ +menu-title-bg+)                 ; title strip
+    (glass:fb-text fb 8 3 (wm-menu-title menu) :size 12 :color glass:+black+ :font font)
+    (glass:fb-hline fb 0 (1- +menu-titleh+) w (glass:rgb 120 120 120))
+    (loop for it in (wm-menu-items menu) for i from 0
+          for yy = (+ +menu-titleh+ (* i +menu-itemh+))
+          for hot = (= i (wm-menu-hover menu))
+          do (when hot (glass:fb-rect fb 1 yy (- w 2) +menu-itemh+ +menu-hi+))
+             (glass:fb-text fb 14 (+ yy 3) (car it) :size 12
+                            :color (if hot glass:+white+ glass:+black+) :font font))
+    (glass:fb-frame fb 0 0 w h glass:+black+ 1)
+    (setf (wm-menu-fb menu) fb)))
+
+(defun wm-menu-index (menu x y)
+  "For screen (X,Y): an item index, :title over the title strip, or :outside."
+  (let* ((mx (wm-menu-x menu)) (my (wm-menu-y menu)) (fb (wm-menu-fb menu)))
+    (if (and (<= mx x (+ mx (glass:fb-width fb) -1)) (<= my y (+ my (glass:fb-height fb) -1)))
+        (let ((yl (- y my)))
+          (if (< yl +menu-titleh+) :title
+              (let ((i (floor (- yl +menu-titleh+) +menu-itemh+)))
+                (if (< i (length (wm-menu-items menu))) i :title))))
+        :outside)))
+
+(defun wm-open-menu (port x y)
+  (let ((menu (make-wm-menu :x x :y y :hover -1 :items (glass-port-menu-items port))))
+    (wm-menu-render menu)
+    (setf (wm-menu-x menu) (max 0 (min x (- (glass-port-screen-w port) (glass:fb-width (wm-menu-fb menu)))))
+          (wm-menu-y menu) (max 0 (min y (- (glass-port-screen-h port) (glass:fb-height (wm-menu-fb menu)))))
+          (glass-port-menu port) menu)))
+
+(defun wm-menu-pointer (port menu mask x y)
+  "Route a pointer event to the open MENU.  Returns having handled it."
+  (let ((left (logtest mask 1))
+        (idx (wm-menu-index menu x y)))
+    (cond
+      ((eq idx :outside)
+       (when (logtest mask 5)                                  ; any click off the menu dismisses
+         (setf (glass-port-menu port) nil) (composite-all port)))
+      ((integerp idx)
+       (unless (eql idx (wm-menu-hover menu))                  ; hover follows the pointer
+         (setf (wm-menu-hover menu) idx) (wm-menu-render menu) (composite-all port))
+       (when left                                              ; left-press selects the item
+         (let ((thunk (cdr (nth idx (wm-menu-items menu)))))
+           (setf (glass-port-menu port) nil) (composite-all port)
+           (when thunk (funcall thunk)))))
+      (t                                                       ; over the title strip
+       (unless (eql (wm-menu-hover menu) -1)
+         (setf (wm-menu-hover menu) -1) (wm-menu-render menu) (composite-all port))))))
+
 (defun wm-on-pointer (port mask x y)
+  (when-let ((menu (glass-port-menu port)))                    ; an open menu grabs the pointer
+    (wm-menu-pointer port menu mask x y)
+    (return-from wm-on-pointer))
   (let ((down (logtest mask 1)))
     (cond
       ((glass-port-drag port)                                 ; dragging a title bar
@@ -157,6 +238,8 @@
       (t
        (multiple-value-bind (obj region cx cy) (wm-hit port x y)
          (cond
+           ((and (null obj) (logtest mask 4))                 ; right-press on workspace: root menu
+            (wm-open-menu port x y) (composite-all port))
            ((null obj))                                       ; workspace: ignore
            ((eq region :title)
             (when down
@@ -202,14 +285,22 @@
                        :on-key (lambda (down k) (glass-term:tabterm-on-key tt down k))
                        :on-pointer (lambda (mask lx ly) (glass-term:tabterm-on-mouse tt mask lx ly))))))
 
-(defun run-wm (specs &key (port 5900) (width 1000) (height 720))
+(defun wm-default-menu (port)
+  "The default workspace root menu: launchers for our own surface windows."
+  (list (cons "Terminal"        (lambda () (wm-add-terminal port) (composite-all port)))
+        (cons "Terminal (tabs)" (lambda () (wm-add-tabterm  port) (composite-all port)))
+        (cons "Refresh"         (lambda () (composite-all port)))))
+
+(defun run-wm (specs &key (port 5900) (width 1000) (height 720) menu)
   "Run a mini OPEN LOOK desktop over VNC.  Each spec is a decorated window:
    (FRAME-CLASS &key WIDTH HEIGHT) for a McCLIM app, or (:terminal &key COLS ROWS
-   PPEM) for a shell terminal.  Serves on PORT; point any VNC client there."
+   PPEM) for a shell terminal.  Right-click the workspace for a root menu; pass
+   MENU (a list of (LABEL . THUNK)) to override its items.  Serves on PORT."
   (let ((p (find-glass-port :port port)))
     (setf (glass-port-wm-p p) t
           (glass-port-screen-w p) width (glass-port-screen-h p) height
-          (glass-port-fb p) (glass:make-framebuffer width height +wm-teal+))
+          (glass-port-fb p) (glass:make-framebuffer width height +wm-teal+)
+          (glass-port-menu-items p) (or menu (wm-default-menu p)))
     (start-glass-server p)
     (climi::restart-port p)                                   ; event-loop thread
     (let ((fm (find-frame-manager :port p)))
@@ -227,4 +318,8 @@
                 :name (format nil "wm-~a" class)))))
         (sleep 0.7)                                           ; stagger for distinct cascade slots
         (composite-all p)))
-    (loop (sleep 10))))
+    ;; Surface windows (terminals) render asynchronously in their own threads, so
+    ;; tick the compositor to pick up shell output; glass's dirty diff ships only
+    ;; changed tiles, so an idle desktop costs next to nothing.
+    (loop (sleep 1/20)
+          (when (glass-port-surfaces p) (ignore-errors (composite-all p))))))
