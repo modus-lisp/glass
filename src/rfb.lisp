@@ -240,6 +240,52 @@
 (defun snap-matches-p (snap fb)
   (= (length snap) (* (fb-width fb) (fb-height fb))))
 
+;;; ---- mouse cursor (Cursor pseudo-encoding, -239) ----------------------------
+;;; The server sends the cursor SHAPE once; the client renders it at its own
+;;; pointer position (so it tracks the mouse locally, no per-move server work).
+;;; A classic arrow: 'o' = black outline, 'x' = white fill, '.' = transparent —
+;;; visible on any background, hotspot at the tip (0,0).
+
+(defconstant +pseudo-cursor+ #xFFFFFF11)   ; -239 as unsigned u32
+
+(defparameter *cursor-arrow*
+  '("o.........."
+    "oo........."
+    "oxo........"
+    "oxxo......."
+    "oxxxo......"
+    "oxxxxo....."
+    "oxxxxxo...."
+    "oxxxxxxo..."
+    "oxxxxxxxo.."
+    "oxxxxxxxxo."
+    "oxxxxxoooo."
+    "oxxoxxo...."
+    "oxo.oxxo..."
+    "oo..oxxo..."
+    "o....oxxo.."
+    "......oo..."))
+
+(defun send-cursor (s &optional (rows *cursor-arrow*))
+  "Send the cursor shape as a Cursor pseudo-rect (hotspot 0,0)."
+  (let ((w (reduce #'max rows :key #'length)) (h (length rows)))
+    (w-u8 s 0) (w-u8 s 0) (w-u16 s 1)                        ; FramebufferUpdate, 1 rect
+    (w-u16 s 0) (w-u16 s 0) (w-u16 s w) (w-u16 s h) (w-u32 s +pseudo-cursor+)
+    (loop for row in rows do                                 ; pixels: w*h, format order (B,G,R,X)
+      (dotimes (x w)
+        (let ((c (if (< x (length row)) (char row x) #\.)))
+          (multiple-value-bind (px) (case c (#\o 0) (#\x #xffffff) (t 0))
+            (w-u8 s (logand px #xff)) (w-u8 s (logand (ash px -8) #xff))
+            (w-u8 s (logand (ash px -16) #xff)) (w-u8 s 0)))))
+    (loop for row in rows do                                 ; 1-bpp mask, MSB first, row-padded
+      (let ((acc 0) (nb 0))
+        (dotimes (x w)
+          (let ((opaque (and (< x (length row)) (member (char row x) '(#\o #\x)))))
+            (setf acc (logior (ash acc 1) (if opaque 1 0)) nb (1+ nb))
+            (when (= nb 8) (w-u8 s acc) (setf acc 0 nb 0))))
+        (when (plusp nb) (w-u8 s (ash acc (- 8 nb))))))
+    (force-output s)))
+
 ;;; ---- client message loop ----------------------------------------------------
 
 (defun handle-update-request (fb s snap-box enc zs dss last-size inc x y w h)
@@ -287,6 +333,7 @@
   ;; state across rectangles, so it must persist here, not per update.
   (let ((snap-box (list nil)) (enc +enc-raw+) (zs (cram:make-zstream))
         (dss nil)                                          ; client understands DesktopSize?
+        (cursor nil) (cursor-sent nil)                     ; client understands Cursor pseudo-enc?
         (last-size (cons (fb-width fb) (fb-height fb))))    ; size we last told this client
     (loop
       (let ((msg (read-byte s nil :eof)))
@@ -297,8 +344,11 @@
                (dotimes (i n) (push (r-u32 s) encs))
                (setf enc (choose-encoding encs)
                      dss (or (member +pseudo-desktop-size+ encs)
-                             (member +pseudo-extended-desktop-size+ encs)))))
-          (3 (let ((inc (r-u8 s)) (x (r-u16 s)) (y (r-u16 s)) (w (r-u16 s)) (h (r-u16 s)))
+                             (member +pseudo-extended-desktop-size+ encs))
+                     cursor (and (member +pseudo-cursor+ encs) t))))
+          (3 (when (and cursor (not cursor-sent))           ; send the cursor shape once
+               (send-cursor s) (setf cursor-sent t))
+             (let ((inc (r-u8 s)) (x (r-u16 s)) (y (r-u16 s)) (w (r-u16 s)) (h (r-u16 s)))
                (handle-update-request fb s snap-box enc zs dss last-size inc x y w h)))
           (4 (let ((down (r-u8 s)))                        ; KeyEvent
                (skip s 2)
