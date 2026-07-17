@@ -70,8 +70,8 @@
   (saved-cx 0) (saved-cy 0)
   (pstate :ground) (params nil) (pcur nil) (ppriv nil)   ; ANSI parser state
   pty proc                              ; the shell
-  fb font ppem cell-w cell-h ascent     ; rendering
-  (glyphs (make-hash-table))            ; char-code -> (cov w h left top)
+  fb font emoji-font ppem cell-w cell-h ascent   ; rendering (+ optional colour-emoji font)
+  (glyphs (make-hash-table))            ; char-code -> rendered glyph (:mono/:color ...)
   (ctrl nil)                            ; keyboard: control held?
   (u8-need 0) (u8-cp 0)                 ; UTF-8 decoder state (bytes remaining, accumulator)
   (dcs nil)                             ; DCS payload buffer (sixel), while collecting
@@ -382,21 +382,60 @@
 (defun over (dst8 fg8 a ia)
   (scribe:linear->srgb (+ (* ia (scribe:srgb->linear dst8)) (* a (scribe:srgb->linear fg8)))))
 
-(defun cell-font (tm code)
-  "The primary mono font if it covers CODE, else a bundled fallback (CJK, emoji,
-   other scripts) via scribe, else the primary (renders .notdef)."
-  (if (scribe:font-covers-p (terminal-font tm) code)
-      (terminal-font tm)
-      (or (ignore-errors (scribe:fallback-font-for-codepoint code)) (terminal-font tm))))
+(defun blit-mono (fb cov gw gh ox oy fg)
+  "Blend monochrome coverage COV (gw x gh) in colour FG at (OX,OY), gamma-correct."
+  (let ((dpx (glass:fb-pixels fb)) (fw (glass:fb-width fb)) (fh (glass:fb-height fb))
+        (fr (ldb (byte 8 16) fg)) (fgc (ldb (byte 8 8) fg)) (fbc (ldb (byte 8 0) fg)))
+    (dotimes (yy gh)
+      (let ((yv (+ oy yy)))
+        (when (< -1 yv fh)
+          (let ((row (* yv fw)))
+            (dotimes (xx gw)
+              (let ((cvv (aref cov (+ (* yy gw) xx))) (xv (+ ox xx)))
+                (when (and (> cvv 0d0) (< -1 xv fw))
+                  (let* ((i (+ row xv)) (d (aref dpx i)) (a (min 1d0 cvv)) (ia (- 1d0 a)))
+                    (setf (aref dpx i)
+                          (logior (ash (over (ldb (byte 8 16) d) fr a ia) 16)
+                                  (ash (over (ldb (byte 8 8) d) fgc a ia) 8)
+                                  (over (ldb (byte 8 0) d) fbc a ia)))))))))))))
+
+(defun blit-color (fb rgb alpha gw gh ox oy)
+  "Composite a premultiplied-RGB + ALPHA colour glyph (gw x gh) at (OX,OY): the
+   straight-over of premultiplied colour on the existing pixel."
+  (let ((dpx (glass:fb-pixels fb)) (fw (glass:fb-width fb)) (fh (glass:fb-height fb)))
+    (dotimes (yy gh)
+      (let ((yv (+ oy yy)))
+        (when (< -1 yv fh)
+          (let ((row (* yv fw)))
+            (dotimes (xx gw)
+              (let* ((i (+ (* yy gw) xx)) (a (aref alpha i)) (xv (+ ox xx)))
+                (when (and (plusp a) (< -1 xv fw))
+                  (let* ((di (+ row xv)) (d (aref dpx di)) (ia (- 255 a)))
+                    (flet ((ch (pm dc) (min 255 (+ pm (floor (* dc ia) 255)))))
+                      (setf (aref dpx di)
+                            (logior (ash (ch (aref rgb (* 3 i))       (ldb (byte 8 16) d)) 16)
+                                    (ash (ch (aref rgb (+ (* 3 i) 1)) (ldb (byte 8 8) d)) 8)
+                                    (ch (aref rgb (+ (* 3 i) 2))      (ldb (byte 8 0) d)))))))))))))))
+
+(defun render-glyph (tm code)
+  "Render CODE: colour (COLR emoji) -> (:color rgb alpha w h left top adv), else
+   monochrome coverage -> (:mono cov w h left top adv), picking the primary mono
+   font, a colour-emoji font, or a scribe script fallback as appropriate."
+  (let ((primary (terminal-font tm)) (ppem (terminal-ppem tm)) (ef (terminal-emoji-font tm)))
+    (cond
+      ((scribe:font-covers-p primary code)
+       (list* :mono (multiple-value-list
+                     (scribe:rasterize-glyph primary (scribe:font-glyph-index primary code) ppem))))
+      ((and ef (let ((g (scribe:font-glyph-index ef code))) (and g (plusp g) (scribe:color-glyph-p ef g))))
+       (list* :color (multiple-value-list
+                      (scribe:rasterize-color-glyph ef (scribe:font-glyph-index ef code) ppem))))
+      (t (let ((f (or (ignore-errors (scribe:fallback-font-for-codepoint code)) primary)))
+           (list* :mono (multiple-value-list
+                         (scribe:rasterize-glyph f (scribe:font-glyph-index f code) ppem))))))))
 
 (defun glyph (tm code)
-  "Cached (cov w h left top) for CODE at the terminal's ppem, using the right
-   font (primary or a fallback face for CJK / emoji / other scripts)."
   (or (gethash code (terminal-glyphs tm))
-      (setf (gethash code (terminal-glyphs tm))
-            (let ((font (cell-font tm code)))
-              (multiple-value-list
-               (scribe:rasterize-glyph font (scribe:font-glyph-index font code) (terminal-ppem tm)))))))
+      (setf (gethash code (terminal-glyphs tm)) (render-glyph tm code))))
 
 (defun draw-cell (tm x y)
   (let ((c (cell tm x y)))
@@ -409,26 +448,16 @@
          (fg (pal (if cursor (cell-bg c) (cell-fg c))))
          (bg (pal (if cursor (cell-fg c) (cell-bg c)))))   ; cursor = inverse block
     (glass:fb-rect fb px0 py0 (* cw span) ch bg)
-    (let (( code (cell-char c)))
+    (let ((code (cell-char c)))
       (when (> code 32)
-        (destructuring-bind (cov gw gh left top &rest ignore) (glyph tm code)
-          (declare (ignore ignore))
-          (when cov
-            (let* ((ox (+ px0 left)) (oy (+ py0 (terminal-ascent tm) top))
-                   (fr (ldb (byte 8 16) fg)) (fgc (ldb (byte 8 8) fg)) (fbc (ldb (byte 8 0) fg))
-                   (dpx (glass:fb-pixels fb)) (fw (glass:fb-width fb)) (fh (glass:fb-height fb)))
-              (dotimes (yy gh)
-                (let ((yv (+ oy yy)))
-                  (when (< -1 yv fh)
-                    (let ((row (* yv fw)))
-                      (dotimes (xx gw)
-                        (let ((cvv (aref cov (+ (* yy gw) xx))) (xv (+ ox xx)))
-                          (when (and (> cvv 0d0) (< -1 xv fw))
-                            (let* ((i (+ row xv)) (d (aref dpx i)) (a (min 1d0 cvv)) (ia (- 1d0 a)))
-                              (setf (aref dpx i)
-                                    (logior (ash (over (ldb (byte 8 16) d) fr a ia) 16)
-                                            (ash (over (ldb (byte 8 8) d) fgc a ia) 8)
-                                            (over (ldb (byte 8 0) d) fbc a ia)))))))))))))))))))
+        (let ((g (glyph tm code)) (asc (terminal-ascent tm)))
+          (ecase (car g)
+            (:mono (destructuring-bind (cov gw gh left top &rest ign) (cdr g)
+                     (declare (ignore ign))
+                     (when cov (blit-mono fb cov gw gh (+ px0 left) (+ py0 asc top) fg))))
+            (:color (destructuring-bind (rgb alpha gw gh left top &rest ign) (cdr g)
+                      (declare (ignore ign))
+                      (when rgb (blit-color fb rgb alpha gw gh (+ px0 left) (+ py0 asc top))))))))))))
 
 (defun blit-image (src ox oy dst)
   "Composite glass fb SRC into DST at (OX,OY)."
@@ -488,7 +517,16 @@
                   (* (sb-alien:array sb-alien:unsigned-short 4))))
       (sb-sys:fd-stream-fd stream) #x5414 (sb-alien:addr ws)))))
 
-(defun make-terminal (&key (cols 80) (rows 24) (ppem 16) (shell "/bin/bash"))
+(defparameter *emoji-font-paths*
+  '("/opt/open-webui/backend/open_webui/static/fonts/Twemoji.ttf")
+  "Candidate COLR (colour) emoji fonts; the first that exists is used.  NotoColorEmoji
+   is CBDT (bitmap) so scribe can't render it — a COLR font like Twemoji is needed.")
+
+(defun load-emoji-font (&optional path)
+  (let ((p (or path (find-if #'probe-file *emoji-font-paths*))))
+    (and p (ignore-errors (glass:load-font p)))))
+
+(defun make-terminal (&key (cols 80) (rows 24) (ppem 16) (shell "/bin/bash") emoji-font)
   (let* ((font (glass:load-font (asdf:system-relative-pathname :scribe "fonts/LiberationMono-Regular.ttf")))
          (upem (scribe:font-units-per-em font))
          (cell-w (max 1 (ceiling (nth-value 5 (scribe:rasterize-glyph font (scribe:font-glyph-index font (char-code #\M)) ppem)))))
@@ -504,6 +542,7 @@
          (pty (sb-ext:process-pty proc))
          (tm (%make-terminal :cols cols :rows rows :cells (make-grid cols rows)
                             :bot (1- rows) :pty pty :proc proc :font font :ppem ppem
+                            :emoji-font (load-emoji-font emoji-font)
                             :cell-w cell-w :cell-h cell-h :ascent asc
                             :fb (glass:make-framebuffer (* cols cell-w) (* rows cell-h) glass:+black+))))
     (set-winsize pty rows cols)
@@ -521,10 +560,11 @@
       (when got (render tm))
       (sleep 1/60))))
 
-(defun run (&key (port 5900) (cols 80) (rows 24) (ppem 16) (shell "/bin/bash"))
+(defun run (&key (port 5900) (cols 80) (rows 24) (ppem 16) (shell "/bin/bash") emoji-font)
   "Open SHELL in a pseudo-terminal and serve it as a terminal over VNC on PORT.
-   Point any VNC client at localhost:PORT.  Blocks until the shell exits."
-  (let ((tm (make-terminal :cols cols :rows rows :ppem ppem :shell shell)))
+   Point any VNC client at localhost:PORT.  Blocks until the shell exits.
+   EMOJI-FONT is an optional COLR colour-emoji font path (else a bundled one is tried)."
+  (let ((tm (make-terminal :cols cols :rows rows :ppem ppem :shell shell :emoji-font emoji-font)))
     (render tm)
     (sb-thread:make-thread
      (lambda () (ignore-errors
