@@ -1,5 +1,20 @@
 ;;;; glass.asd — a framebuffer + VNC (RFB) server in pure Common Lisp.
 
+(asdf:defsystem :glass/fb
+  :description "The pure display core: an in-memory framebuffer with clipped
+drawing primitives.  Portable Common Lisp — no FFI, no sockets; the only platform
+touch is an sb-thread lock that guards resize, feature-gated to a no-op where
+sb-thread is absent.  This is the piece that drops onto modus on bare metal;
+:glass adds the VNC/RFB transport on top, :glass/text adds scribe text."
+  :version "0.0.1"
+  :author "ynniv"
+  :license "MIT"
+  :depends-on ()
+  :serial t
+  :components ((:module "src" :serial t
+                :components ((:file "packages")
+                             (:file "framebuffer")))))
+
 (asdf:defsystem :glass
   :description "A from-scratch VNC/RFB server in pure Common Lisp: an in-memory
 framebuffer you draw into, exported over the RFB protocol so any VNC client can
@@ -9,22 +24,20 @@ give modus a remote display, developed and tested on SBCL first."
   :version "0.0.1"
   :author "ynniv"
   :license "MIT"
-  :depends-on ("sb-bsd-sockets" "cram")
+  :depends-on ("glass/fb" "sb-bsd-sockets" "cram")
   :serial t
   :components
   ((:module "src"
     :serial t
     :components
-    ((:file "packages")
-     (:file "framebuffer")
-     (:file "rfb")
+    ((:file "rfb")
      (:file "zrle")))))
 
 (asdf:defsystem :glass/text
   :description "First-class text on a glass framebuffer, via scribe (fb-text) —
 a real, anti-aliased, gamma-correct text primitive with no McCLIM dependency.
 Kept separate so the core framebuffer + RFB server stay dependency-light."
-  :depends-on ("glass" "scribe")
+  :depends-on ("glass/fb" "scribe")
   :serial t
   :components ((:module "src" :serial t :components ((:file "text")))))
 

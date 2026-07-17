@@ -18,6 +18,14 @@
 (defconstant +green+ #x00ff00)
 (defconstant +blue+  #x0000ff)
 
+;;; The framebuffer's ONE platform seam: a lock guarding the RESIZE array-swap
+;;; against a concurrent reader (the RFB server thread).  Real on SBCL; a no-op
+;;; where sb-thread is absent (e.g. modus, which will supply its own concurrency
+;;; model).  Everything else in this file — and in the text primitive — is pure
+;;; Common Lisp with no FFI, so the drawing path drops onto any CL.
+#+sb-thread (defun %fb-make-lock () (sb-thread:make-mutex :name "framebuffer"))
+#-sb-thread (defun %fb-make-lock () nil)
+
 (defstruct (framebuffer (:conc-name fb-) (:constructor %make-framebuffer))
   (width  0 :type fixnum)
   (height 0 :type fixnum)
@@ -25,10 +33,12 @@
   ;; Guards the (width height pixels) triple against a RESIZE racing a reader.
   ;; Per-pixel content races are benign (a stale read is re-sent next update);
   ;; only the array swap needs protecting, so readers grab this only to snapshot.
-  (lock (sb-thread:make-mutex :name "framebuffer") :type sb-thread:mutex))
+  (lock (%fb-make-lock)))
 
-(defmacro with-fb-locked ((fb) &body body)
-  `(sb-thread:with-mutex ((fb-lock ,fb)) ,@body))
+#+sb-thread (defmacro with-fb-locked ((fb) &body body)
+              `(sb-thread:with-mutex ((fb-lock ,fb)) ,@body))
+#-sb-thread (defmacro with-fb-locked ((fb) &body body)
+              (declare (ignore fb)) `(progn ,@body))
 
 (defun make-framebuffer (width height &optional (fill +black+))
   "A WIDTH x HEIGHT framebuffer, cleared to FILL."
