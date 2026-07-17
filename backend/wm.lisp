@@ -285,6 +285,44 @@
                        :on-key (lambda (down k) (glass-term:tabterm-on-key tt down k))
                        :on-pointer (lambda (mask lx ly) (glass-term:tabterm-on-mouse tt mask lx ly))))))
 
+(defun %loom-fn (pkg name)
+  "The bound function named NAME in package PKG, or NIL — used to reach loom/glass
+   by name so glass need not depend on it."
+  (let ((p (find-package pkg)))
+    (and p (let ((s (find-symbol name p))) (and s (fboundp s) s)))))
+
+(defun wm-add-browser (port url &key (width 900) (height 620))
+  "Open URL as a loom browser surface window: loom/glass renders weft into a glass
+   framebuffer, the WM decorates it, and RFB input routes to the live page (links
+   navigate in place).  loom/glass is an OPTIONAL runtime dependency, resolved by
+   name (no .asd dep — glass must not depend on loom, which depends on glass)."
+  (let ((load-url  (%loom-fn '#:loom "LOAD-URL"))
+        (load-file (%loom-fn '#:loom "LOAD-FILE"))
+        (render    (%loom-fn '#:loom "RENDER-PAGE"))
+        (title-of  (%loom-fn '#:loom "PAGE-TITLE"))
+        (attach    (%loom-fn '#:loom.glass "ATTACH"))
+        (onk       (%loom-fn '#:loom.glass "ON-KEY"))
+        (onp       (%loom-fn '#:loom.glass "ON-POINTER"))
+        (pump      (%loom-fn '#:loom.glass "PUMP-LOOP")))
+    (unless (and attach onk onp pump (or load-url load-file))
+      (error "loom/glass not loaded — (ql:quickload :loom/glass)"))
+    (let* ((u (string-downcase url))
+           (httpp (or (and (>= (length u) 5) (string= u "http:"  :end1 5))
+                      (and (>= (length u) 6) (string= u "https:" :end1 6))))
+           (page (if httpp (funcall load-url url :width width :viewport-height height)
+                     (funcall load-file url :width width :viewport-height height)))
+           (fb (glass:make-framebuffer width height (glass:rgb 255 255 255)))
+           (c (glass-port-cascade port)))
+      (when render (funcall render page))
+      (let ((app (funcall attach page fb)))
+        (prog1
+            (wm-add-surface* port
+              (make-wm-surface :fb fb :x (+ 40 c) :y (+ 40 c +wm-titleh+)
+                               :title (or (and title-of (funcall title-of page)) "browser")
+                               :on-key (lambda (down k) (funcall onk app down k))
+                               :on-pointer (lambda (mask lx ly) (funcall onp app mask lx ly))))
+          (sb-thread:make-thread (lambda () (funcall pump app)) :name "wm-browse-pump"))))))
+
 (defun wm-run-frame (port frame &optional (name "frame"))
   "Host a McCLIM application FRAME in its own thread on PORT (realize-mirror
    decorates it as a managed window)."
@@ -328,6 +366,29 @@
              (eval form))))
        :name "wm-debug"))))
 
+(defun wm-run-app (port name-string invoker)
+  "Host a self-contained CLIM application launched by INVOKER — a thunk that, run
+   with our frame-manager as the default, opens the app's frame in THIS thread
+   (the clouseau/climacs 'inspect'/':new-process nil' pattern).  Used for apps
+   that own their frame rather than exposing a class to make-application-frame."
+  (let ((fm (find-frame-manager :port port)))
+    (sb-thread:make-thread
+     (lambda ()
+       (handler-case
+           (let ((climi::*default-frame-manager* fm))   ; land on OUR glass port
+             (funcall invoker))
+         (error (e) (format *trace-output* "~&[wm] ~a: ~a~%" name-string e))))
+     :name (format nil "wm-~a" name-string))))
+
+(defun wm-edit (port &optional file)
+  "Open Climacs — the McCLIM Emacs-family editor (Zmacs' lineage) — optionally on
+   FILE.  Climacs is an OPTIONAL runtime dependency, resolved by name."
+  (let ((fn (and (find-package '#:climacs) (find-symbol "CLIMACS" '#:climacs))))
+    (unless (and fn (fboundp fn)) (error "climacs not loaded — (ql:quickload :climacs)"))
+    (wm-run-app port "climacs"
+                (lambda () (if file (funcall fn :new-process nil :buffers (list file))
+                               (funcall fn :new-process nil))))))
+
 ;;; A window spec is the shared launch vocabulary — used both for run-wm's
 ;;; initial windows AND for the root-menu items, so a menu is just a list of
 ;;; labelled specs:
@@ -335,6 +396,8 @@
 ;;;   (:tabterm  &key cols rows ppem)   a tabbed terminal
 ;;;   (:inspect FORM)                   Clouseau inspecting the value of FORM
 ;;;   (:debug FORM)                     evaluate FORM under the CLIM debugger
+;;;   (:edit &optional FILE)            Climacs, the McCLIM editor
+;;;   (:browse URL &key width height)   a loom/weft browser window
 ;;;   (FRAME-CLASS &key width height)   any McCLIM application frame
 (defun wm-spawn-spec (port spec)
   (case (car spec)
@@ -342,6 +405,8 @@
     (:tabterm  (apply #'wm-add-tabterm  port (cdr spec)))
     (:inspect  (wm-inspect port (cadr spec)))
     (:debug    (wm-debug   port (cadr spec)))
+    (:edit     (apply #'wm-edit port (cdr spec)))
+    (:browse   (apply #'wm-add-browser port (cdr spec)))
     (t (destructuring-bind (class &key (width 480) (height 320)) spec
          (wm-run-frame port (make-application-frame class :frame-manager (find-frame-manager :port port)
                                                     :width width :height height)
