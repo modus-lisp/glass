@@ -16,8 +16,10 @@
 
 ;;; ---- workspace root menu (OPEN LOOK) ---------------------------------------
 ;;; Right-click the bare workspace to pop up a small grey menu of things to run
-;;; (Terminal, Tabbed Terminal, ...).  It follows the pointer with a hover
-;;; highlight; a left-click on an item runs its thunk, a click off it dismisses.
+;;; (Browse, Inspect, Debug, Terminal, Apps...).  It follows the pointer with a
+;;; hover highlight; a left-click on an item runs it, a click off it dismisses.
+;;; An item whose action is (:submenu ITEM...) opens a child menu to its right
+;;; on hover — arbitrarily deep via the CHILD slot chain.
 
 (defparameter +menu-bg+ (glass:rgb 208 208 208) "Menu background grey.")
 (defparameter +menu-title-bg+ (glass:rgb 188 188 188) "Menu title strip.")
@@ -26,7 +28,11 @@
 (defconstant +menu-titleh+ 20 "Height of the menu title strip (px).")
 
 (defstruct wm-menu
-  (x 0) (y 0) (hover -1) (title "Workspace") items fb)
+  (x 0) (y 0) (hover -1) (title "Workspace") items fb (child nil))
+
+(defun wm-submenu-p (action) (and (consp action) (eq (car action) :submenu)))
+(defun wm-item-action (item) (cdr item))
+(defun wm-menu-chain (root) (loop for m = root then (wm-menu-child m) while m collect m))
 
 ;;; ---- decoration rendering (via mcclim-render, cached per window) ------------
 
@@ -128,8 +134,9 @@
     (if (glass-mirror-managed mirror) (wm-draw-window mirror fb) (blit-mirror mirror fb)))
   (dolist (surf (reverse (glass-port-surfaces port)))         ; surface windows, on top
     (wm-draw-surface surf fb))
-  (when-let ((menu (glass-port-menu port)))                   ; root menu above everything
-    (blit-fb (wm-menu-fb menu) (wm-menu-x menu) (wm-menu-y menu) fb)))
+  (when-let ((menu (glass-port-menu port)))                   ; root menu (+ submenu chain) on top
+    (dolist (m (wm-menu-chain menu))
+      (blit-fb (wm-menu-fb m) (wm-menu-x m) (wm-menu-y m) fb))))
 
 ;;; ---- pointer routing --------------------------------------------------------
 
@@ -166,8 +173,13 @@
 
 (defun wm-menu-width (menu)
   (let ((w (+ 24 (glass:text-width (wm-menu-title menu) :size 12 :font (glass:default-font t)))))
-    (dolist (it (wm-menu-items menu) (max 96 w))
-      (setf w (max w (+ 28 (glass:text-width (car it) :size 12 :font (glass:default-font t))))))))
+    (dolist (it (wm-menu-items menu) (max 108 w))
+      (let ((pad (if (wm-submenu-p (wm-item-action it)) 46 28)))     ; room for the ▸ arrow
+        (setf w (max w (+ pad (glass:text-width (car it) :size 12 :font (glass:default-font t)))))))))
+
+(defun wm-submenu-arrow (fb x y color)
+  "A small right-pointing triangle (▸) marking a submenu item, top-left at (X,Y)."
+  (dotimes (k 5) (glass:fb-vline fb (+ x k) (+ y k) (max 1 (- 9 (* 2 k))) color)))
 
 (defun wm-menu-render (menu)
   "(Re)build the menu's framebuffer, drawing the current hover highlight."
@@ -182,9 +194,11 @@
     (loop for it in (wm-menu-items menu) for i from 0
           for yy = (+ +menu-titleh+ (* i +menu-itemh+))
           for hot = (= i (wm-menu-hover menu))
+          for ink = (if hot glass:+white+ glass:+black+)
           do (when hot (glass:fb-rect fb 1 yy (- w 2) +menu-itemh+ +menu-hi+))
-             (glass:fb-text fb 14 (+ yy 3) (car it) :size 12
-                            :color (if hot glass:+white+ glass:+black+) :font font))
+             (glass:fb-text fb 14 (+ yy 3) (car it) :size 12 :color ink :font font)
+             (when (wm-submenu-p (wm-item-action it))
+               (wm-submenu-arrow fb (- w 13) (+ yy 6) ink)))
     (glass:fb-frame fb 0 0 w h glass:+black+ 1)
     (setf (wm-menu-fb menu) fb)))
 
@@ -198,31 +212,59 @@
                 (if (< i (length (wm-menu-items menu))) i :title))))
         :outside)))
 
+(defun wm-place-menu (menu port x y)
+  "Render MENU and position it on-screen, top-left near (X,Y) but kept in bounds."
+  (wm-menu-render menu)
+  (setf (wm-menu-x menu) (max 0 (min x (- (glass-port-screen-w port) (glass:fb-width (wm-menu-fb menu)))))
+        (wm-menu-y menu) (max 0 (min y (- (glass-port-screen-h port) (glass:fb-height (wm-menu-fb menu))))))
+  menu)
+
 (defun wm-open-menu (port x y)
   (let ((menu (make-wm-menu :x x :y y :hover -1 :items (glass-port-menu-items port))))
-    (wm-menu-render menu)
-    (setf (wm-menu-x menu) (max 0 (min x (- (glass-port-screen-w port) (glass:fb-width (wm-menu-fb menu)))))
-          (wm-menu-y menu) (max 0 (min y (- (glass-port-screen-h port) (glass:fb-height (wm-menu-fb menu)))))
-          (glass-port-menu port) menu)))
+    (setf (glass-port-menu port) (wm-place-menu menu port x y))))
 
-(defun wm-menu-pointer (port menu mask x y)
-  "Route a pointer event to the open MENU.  Returns having handled it."
-  (let ((left (logtest mask 1))
-        (idx (wm-menu-index menu x y)))
+(defun wm-open-submenu (parent idx action port)
+  "Open ACTION's submenu as PARENT's child, to the right of PARENT's item IDX."
+  (let ((sub (make-wm-menu :hover -1 :title (car (nth idx (wm-menu-items parent)))
+                           :items (cdr action))))                ; (:submenu ITEM...) -> ITEMs
+    (wm-menu-render sub)
+    (setf (wm-menu-child parent)
+          (wm-place-menu sub port
+                         (+ (wm-menu-x parent) (glass:fb-width (wm-menu-fb parent)) -2)
+                         (+ (wm-menu-y parent) +menu-titleh+ (* idx +menu-itemh+) -1)))))
+
+(defun wm-menu-pointer (port root mask x y)
+  "Route a pointer event to the open menu tree ROOT (a menu + its submenu chain).
+   Hover opens/closes submenus; a left-press on a leaf runs it and dismisses all;
+   a click off every menu dismisses."
+  (let* ((left (logtest mask 1))
+         (chain (wm-menu-chain root))
+         (menu (find-if (lambda (m) (not (eq :outside (wm-menu-index m x y)))) (reverse chain))))
     (cond
-      ((eq idx :outside)
-       (when (logtest mask 5)                                  ; any click off the menu dismisses
-         (setf (glass-port-menu port) nil) (composite-all port)))
-      ((integerp idx)
-       (unless (eql idx (wm-menu-hover menu))                  ; hover follows the pointer
-         (setf (wm-menu-hover menu) idx) (wm-menu-render menu) (composite-all port))
-       (when left                                              ; left-press selects the item
-         (let ((action (cdr (nth idx (wm-menu-items menu)))))
-           (setf (glass-port-menu port) nil) (composite-all port)
-           (when action (wm-menu-run port action)))))
-      (t                                                       ; over the title strip
-       (unless (eql (wm-menu-hover menu) -1)
-         (setf (wm-menu-hover menu) -1) (wm-menu-render menu) (composite-all port))))))
+      ((null menu)                                              ; off every menu
+       (when (logtest mask 5) (setf (glass-port-menu port) nil) (composite-all port)))
+      (t
+       (let ((idx (wm-menu-index menu x y)))
+         (cond
+           ((integerp idx)
+            (let ((action (wm-item-action (nth idx (wm-menu-items menu)))))
+              (unless (eql idx (wm-menu-hover menu))            ; hover moved within this menu
+                (setf (wm-menu-hover menu) idx
+                      (wm-menu-child menu) nil)                 ; drop any sibling's submenu
+                (when (wm-submenu-p action) (wm-open-submenu menu idx action port))
+                (wm-menu-render menu)
+                (composite-all port))
+              (when left
+                (cond
+                  ((wm-submenu-p action)                        ; keep it open, don't dismiss
+                   (unless (wm-menu-child menu)
+                     (wm-open-submenu menu idx action port) (composite-all port)))
+                  (t                                            ; leaf: run + dismiss the whole tree
+                   (setf (glass-port-menu port) nil) (composite-all port)
+                   (when action (wm-menu-run port action)))))))
+           (t                                                   ; over the title strip
+            (unless (eql (wm-menu-hover menu) -1)
+              (setf (wm-menu-hover menu) -1) (wm-menu-render menu) (composite-all port)))))))))
 
 (defun wm-on-pointer (port mask x y)
   (when-let ((menu (glass-port-menu port)))                    ; an open menu grabs the pointer
@@ -291,11 +333,19 @@
   (let ((p (find-package pkg)))
     (and p (let ((s (find-symbol name p))) (and s (fboundp s) s)))))
 
-(defun wm-add-browser (port url &key (width 900) (height 620))
-  "Open URL as a loom browser surface window: loom/glass renders weft into a glass
-   framebuffer, the WM decorates it, and RFB input routes to the live page (links
-   navigate in place).  loom/glass is an OPTIONAL runtime dependency, resolved by
-   name (no .asd dep — glass must not depend on loom, which depends on glass)."
+(defun wm-browse-default-url ()
+  "A generic start page for (:browse) with no URL: loom's bundled home page if
+   loom is loadable, else a well-known site."
+  (let ((dir (ignore-errors (asdf:system-source-directory '#:loom))))
+    (if dir (namestring (merge-pathnames "assets/home.html" dir)) "https://example.com")))
+
+(defun wm-add-browser (port &optional url &key (width 900) (height 620))
+  "Open URL (default: a generic start page) as a loom browser surface window:
+   loom/glass renders weft into a glass framebuffer, the WM decorates it, and RFB
+   input routes to the live page (links navigate in place).  loom/glass is an
+   OPTIONAL runtime dependency, resolved by name (no .asd dep — glass must not
+   depend on loom, which depends on glass)."
+  (unless url (setf url (wm-browse-default-url)))
   (let ((load-url  (%loom-fn '#:loom "LOAD-URL"))
         (load-file (%loom-fn '#:loom "LOAD-FILE"))
         (render    (%loom-fn '#:loom "RENDER-PAGE"))
@@ -419,10 +469,29 @@
       (funcall action)
       (progn (wm-spawn-spec port action) (composite-all port))))
 
+(defun wm-app-item (label pkg class-name &rest args)
+  "A menu item launching McCLIM frame CLASS-NAME in PKG, or NIL if that package/
+   class isn't loaded (so the Apps menu only offers what's actually available)."
+  (let ((sym (and (find-package pkg) (find-symbol class-name pkg))))
+    (and sym (find-class sym nil) (list* label sym args))))
+
 (defun wm-default-menu ()
-  "The default workspace root menu: labelled window specs (LABEL . SPEC)."
-  '(("Terminal"        :terminal)
-    ("Terminal (tabs)" :tabterm)))
+  "The default workspace root menu: generic Browse / Inspect / Debug / Terminal,
+   plus an Apps submenu of whatever McCLIM apps are loaded.  Built at call time so
+   app class symbols only appear when their packages exist."
+  (list*
+   '("Browse"   :browse)                                  ; generic start page
+   '("Inspect"  :inspect (list-all-packages))             ; generic: the environment
+   '("Debug"    :debug (break "Workspace debugger"))      ; generic: enter the debugger
+   '("Terminal" :terminal)
+   (list
+    (list* "Apps" :submenu
+           (remove nil
+                   (list '("Tabbed Terminal" :tabterm)
+                         (wm-app-item "Gadget Demo" '#:clim-demo "GADGET-TEST" :width 380 :height 320)
+                         (wm-app-item "Listener" '#:clim-listener "LISTENER" :width 720 :height 480)
+                         '("Editor (Climacs)" :edit)
+                         '("Browse example.com" :browse "https://example.com")))))))
 
 (defun run-wm (specs &key (port 5900) (width 1000) (height 720) menu)
   "Run a mini OPEN LOOK desktop over VNC.  Each spec is a decorated window:
