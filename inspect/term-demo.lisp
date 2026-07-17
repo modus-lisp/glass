@@ -92,7 +92,9 @@
       ;; Unicode via printf \xNN (all typed as ASCII): CJK, box-drawing, accents, emoji
       (typ s "printf 'cjk: \\xe6\\x97\\xa5\\xe6\\x9c\\xac\\xe8\\xaa\\x9e  box: \\xe2\\x94\\x8c\\xe2\\x94\\x80\\xe2\\x94\\x90  accent: caf\\xc3\\xa9\\n'") (enter s)
       (typ s "printf 'emoji: \\xf0\\x9f\\x98\\x80 \\xf0\\x9f\\x8e\\x89 \\xf0\\x9f\\x9a\\x80 \\xf0\\x9f\\x91\\x8d  greek: \\xce\\xbb\\xcf\\x86\\n'") (enter s)
-      (sleep 0.6)
+      ;; sixel graphics: ImageMagick pipes a bitmap to the pty, our decoder renders it
+      (typ s "echo sixel:; convert -size 200x90 gradient:navy-gold sixel:-") (enter s)
+      (sleep 2.0)
       (let ((dstate (chipz:make-dstate 'chipz:zlib)))
         (save-png (read-frame s w h dstate) w h "/tmp/glass-term.png")
         (format t "saved /tmp/glass-term.png~%"))

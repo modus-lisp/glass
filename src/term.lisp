@@ -63,7 +63,9 @@
   fb font ppem cell-w cell-h ascent     ; rendering
   (glyphs (make-hash-table))            ; char-code -> (cov w h left top)
   (ctrl nil)                            ; keyboard: control held?
-  (u8-need 0) (u8-cp 0))                ; UTF-8 decoder state (bytes remaining, accumulator)
+  (u8-need 0) (u8-cp 0)                 ; UTF-8 decoder state (bytes remaining, accumulator)
+  (dcs nil)                             ; DCS payload buffer (sixel), while collecting
+  (graphics nil))                       ; placed sixel images: list of (px py . framebuffer)
 
 (defun cell (tm x y) (aref (terminal-cells tm) (+ (* y (terminal-cols tm)) x)))
 (defun (setf cell) (v tm x y) (setf (aref (terminal-cells tm) (+ (* y (terminal-cols tm)) x)) v))
@@ -96,7 +98,11 @@
   (let ((cols (terminal-cols tm)) (cells (terminal-cells tm)))
     (loop for y from (terminal-top tm) below (terminal-bot tm) do
       (replace cells cells :start1 (* y cols) :end1 (* (1+ y) cols) :start2 (* (1+ y) cols)))
-    (fill cells (blank-cell) :start (* (terminal-bot tm) cols) :end (* (1+ (terminal-bot tm)) cols))))
+    (fill cells (blank-cell) :start (* (terminal-bot tm) cols) :end (* (1+ (terminal-bot tm)) cols)))
+  ;; sixel images scroll with the text
+  (dolist (g (terminal-graphics tm)) (decf (cadr g) (terminal-cell-h tm)))
+  (setf (terminal-graphics tm)
+        (remove-if (lambda (g) (< (+ (cadr g) (glass:fb-height (cddr g))) 0)) (terminal-graphics tm))))
 
 (defun line-feed (tm)
   (if (>= (terminal-cy tm) (terminal-bot tm)) (scroll-up tm) (incf (terminal-cy tm))))
@@ -170,13 +176,20 @@
       (:esc
        (case c
          (#\[ (setf (terminal-pstate tm) :csi (terminal-params tm) nil (terminal-pcur tm) nil (terminal-ppriv tm) nil))
-         ((#\] #\P) (setf (terminal-pstate tm) :osc))  ; OSC / DCS: swallow to ST/BEL
+         (#\] (setf (terminal-pstate tm) :osc))         ; OSC (window title etc.): swallow to ST/BEL
+         (#\P (setf (terminal-pstate tm) :dcs           ; DCS (sixel graphics): collect to ST
+                    (terminal-dcs tm) (make-array 64 :element-type 'character :adjustable t :fill-pointer 0)))
          ((#\( #\)) (setf (terminal-pstate tm) :charset))
          (#\M (if (<= (terminal-cy tm) (terminal-top tm)) nil (decf (terminal-cy tm)))  ; reverse index
               (setf (terminal-pstate tm) :ground))
          (t (setf (terminal-pstate tm) :ground))))
       (:charset (setf (terminal-pstate tm) :ground))
       (:osc (when (or (= code 7) (= code 27)) (setf (terminal-pstate tm) :ground)))
+      (:dcs (if (= code 27) (setf (terminal-pstate tm) :dcs-esc)   ; maybe ST (ESC \)
+                (vector-push-extend c (terminal-dcs tm))))
+      (:dcs-esc (cond ((char= c #\\) (process-dcs tm) (setf (terminal-pstate tm) :ground))
+                      (t (vector-push-extend (code-char 27) (terminal-dcs tm))
+                         (vector-push-extend c (terminal-dcs tm)) (setf (terminal-pstate tm) :dcs))))
       (:csi
        (cond
          ((char= c #\?) (setf (terminal-ppriv tm) t))
@@ -187,6 +200,67 @@
           (when (terminal-pcur tm) (setf (terminal-params tm) (append (terminal-params tm) (list (terminal-pcur tm)))))
           (unless (terminal-ppriv tm) (csi-dispatch tm c))
           (setf (terminal-pstate tm) :ground)))))))
+
+;;; ---- sixel graphics (DCS <params> q <data> ST) -----------------------------
+
+(defun sixel-decode (data start)
+  "Decode sixel DATA from index START (just after the 'q') into a glass fb."
+  (let ((pal (make-array 256 :initial-element (glass:rgb 0 0 0)))
+        (cur 0) (x 0) (band 0) (maxx 0) (maxy 0) (i start) (n (length data))
+        (px (make-hash-table :test 'eql)))          ; y*1e6+x -> colour
+    (labels ((num () (let ((v 0) (any nil))
+                       (loop while (and (< i n) (digit-char-p (char data i)))
+                             do (setf v (+ (* v 10) (digit-char-p (char data i))) any t) (incf i))
+                       (and any v)))
+             (semi () (when (and (< i n) (char= (char data i) #\;)) (incf i)))
+             (plot (bits) (dotimes (b 6)
+                            (when (logbitp b bits)
+                              (let ((yy (+ (* band 6) b)))
+                                (setf (gethash (+ (* yy 1000000) x) px) (aref pal cur)
+                                      maxx (max maxx (1+ x)) maxy (max maxy (1+ yy))))))
+               (incf x)))
+      (loop while (< i n) do
+        (let ((c (char data i)))
+          (cond
+            ((char= c #\#) (incf i)
+             (let ((pc (or (num) 0)))
+               (if (and (< i n) (char= (char data i) #\;))
+                   (progn (semi) (num) (semi)         ; colour-space id ignored (assume RGB)
+                          (let ((r (or (num) 0))) (semi)
+                            (let ((g (or (num) 0))) (semi)
+                              (let ((bl (or (num) 0)))
+                                (setf (aref pal (logand pc 255))
+                                      (glass:rgb (round (* r 255) 100) (round (* g 255) 100) (round (* bl 255) 100)))))))
+                   (setf cur (logand pc 255)))))
+            ((char= c #\!) (incf i)
+             (let ((rep (or (num) 1)))
+               (when (< i n) (let ((sc (char data i))) (incf i)
+                               (when (<= #x3f (char-code sc) #x7e)
+                                 (dotimes (k rep) (plot (- (char-code sc) #x3f))))))))
+            ((char= c #\$) (setf x 0) (incf i))
+            ((char= c #\-) (setf x 0) (incf band) (incf i))
+            ((char= c #\") (incf i) (num) (semi) (num) (semi) (num) (semi) (num))  ; raster attrs
+            ((<= #x3f (char-code c) #x7e) (plot (- (char-code c) #x3f)) (incf i))
+            (t (incf i)))))
+      (when (and (plusp maxx) (plusp maxy))
+        (let ((fb (glass:make-framebuffer maxx maxy glass:+black+)))
+          (maphash (lambda (k v) (glass:fb-put fb (mod k 1000000) (floor k 1000000) v)) px)
+          fb)))))
+
+(defun process-dcs (tm)
+  "The collected DCS: if it is a sixel (has a 'q'), decode it and place the image
+   at the cursor, then move the cursor below it."
+  (let* ((data (terminal-dcs tm)) (q (and data (position #\q data))))
+    (setf (terminal-dcs tm) nil)
+    (when q
+      (let ((img (sixel-decode data (1+ q))))
+        (when img
+          (push (list* (* (terminal-cx tm) (terminal-cell-w tm))
+                       (* (terminal-cy tm) (terminal-cell-h tm)) img)
+                (terminal-graphics tm))
+          (setf (terminal-cx tm) 0)
+          (dotimes (k (ceiling (glass:fb-height img) (terminal-cell-h tm)))
+            (line-feed tm)))))))
 
 (defun feed-cp (tm cp)
   (when (and (plusp cp) (<= cp #x10FFFF)) (feed-char tm (code-char cp))))
@@ -258,10 +332,24 @@
                                             (ash (over (ldb (byte 8 8) d) fgc a ia) 8)
                                             (over (ldb (byte 8 0) d) fbc a ia)))))))))))))))))))
 
+(defun blit-image (src ox oy dst)
+  "Composite glass fb SRC into DST at (OX,OY)."
+  (let* ((sw (glass:fb-width src)) (sh (glass:fb-height src)) (sp (glass:fb-pixels src))
+         (dp (glass:fb-pixels dst)) (dw (glass:fb-width dst)) (dh (glass:fb-height dst)))
+    (dotimes (yy sh)
+      (let ((dy (+ oy yy)))
+        (when (< -1 dy dh)
+          (let ((drow (* dy dw)) (srow (* yy sw)))
+            (dotimes (xx sw)
+              (let ((dx (+ ox xx)))
+                (when (< -1 dx dw) (setf (aref dp (+ drow dx)) (aref sp (+ srow xx))))))))))))
+
 (defun render (tm)
   (glass:with-fb-locked ((terminal-fb tm))
     (dotimes (y (terminal-rows tm))
-      (dotimes (x (terminal-cols tm)) (draw-cell tm x y)))))
+      (dotimes (x (terminal-cols tm)) (draw-cell tm x y)))
+    (dolist (g (reverse (terminal-graphics tm)))       ; sixel images on top, oldest first
+      (blit-image (cddr g) (car g) (cadr g) (terminal-fb tm)))))
 
 ;;; ---- keyboard -> PTY --------------------------------------------------------
 
