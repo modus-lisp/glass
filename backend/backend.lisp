@@ -24,7 +24,13 @@
    (buttons  :initform 0   :accessor glass-port-buttons)      ; RFB button mask
    (px       :initform 0   :accessor glass-port-px)           ; last pointer x
    (py       :initform 0   :accessor glass-port-py)
-   (clock    :initform 0   :accessor glass-port-clock))       ; monotonic timestamps
+   (clock    :initform 0   :accessor glass-port-clock)        ; monotonic timestamps
+   ;; --- window-manager mode (OPEN LOOK) ---
+   (wm-p     :initform nil :accessor glass-port-wm-p)         ; decorate + manage windows?
+   (screen-w :initform 1000 :accessor glass-port-screen-w)
+   (screen-h :initform 720  :accessor glass-port-screen-h)
+   (drag     :initform nil :accessor glass-port-drag)         ; (mirror off-x off-y) while moving a window
+   (cascade  :initform 0   :accessor glass-port-cascade))     ; next window placement offset
   (:default-initargs :pointer (make-instance 'climi::standard-pointer)))
 
 (defun parse-glass-server-path (path) path)     ; plist tail becomes initargs
@@ -74,17 +80,35 @@
 ;;; the backend is a tiny compositor over all the top-level mirrors.
 
 (defclass glass-mirror (mcclim-render::image-mirror-mixin)
-  ((x    :initform 0   :accessor glass-mirror-x)             ; screen position (from set-mirror-geometry)
+  ((x    :initform 0   :accessor glass-mirror-x)             ; content screen position
    (y    :initform 0   :accessor glass-mirror-y)
-   (main :initform nil :accessor glass-mirror-main)))        ; owns the fb + the RFB server?
+   (main :initform nil :accessor glass-mirror-main)          ; owns the fb + the RFB server?
+   ;; --- window-manager mode ---
+   (managed :initform nil :accessor glass-mirror-managed)    ; gets a title bar + border?
+   (title   :initform "" :accessor glass-mirror-title)
+   (sheet   :initform nil :accessor glass-mirror-sheet)      ; backref (WM pointer routing)
+   (deco    :initform nil :accessor glass-mirror-deco)       ; cached (image . width) title bar
+   (deco-w  :initform -1 :accessor glass-mirror-deco-w)))
+
+(defconstant +wm-titleh+ 22 "OPEN LOOK title-bar height (px).")
+(defconstant +wm-border+ 1  "Window border thickness (px).")
 
 (defmethod realize-mirror ((port glass-port) (sheet climi::mirrored-sheet-mixin))
   (let ((mirror (make-instance 'glass-mirror)))
-    (setf (sheet-direct-mirror sheet) mirror)
+    (setf (sheet-direct-mirror sheet) mirror
+          (glass-mirror-sheet mirror) sheet)
     (when (typep sheet 'climi::top-level-sheet-mixin)
       (when (null (glass-port-top port))                     ; first top-level = the main frame
         (setf (glass-port-top port) sheet (glass-mirror-main mirror) t))
-      (push mirror (glass-port-mirrors port)))
+      (push mirror (glass-port-mirrors port))
+      ;; window-manager mode: decorate managed frames + give them a cascaded slot
+      (when (and (glass-port-wm-p port)
+                 (not (typep sheet 'climi::unmanaged-sheet-mixin)))
+        (setf (glass-mirror-managed mirror) t
+              (glass-mirror-title mirror) (wm-sheet-title sheet))
+        (let ((c (glass-port-cascade port)))
+          (setf (glass-mirror-x mirror) (+ 40 c) (glass-mirror-y mirror) (+ 40 c +wm-titleh+)
+                (glass-port-cascade port) (mod (+ c 28) 200)))))
     (climi::update-mirror-geometry sheet)          ; creates the render image (via set-mirror-geometry)
     (dispatch-repaint sheet climi::+everywhere+)
     mirror))
@@ -104,24 +128,28 @@
   (let ((a (climi::pattern-array image)))
     (values (array-dimension a 1) (array-dimension a 0))))
 
+(defun start-glass-server (port)
+  "Start the RFB server thread for PORT (serving its framebuffer).  Idempotent."
+  (unless (glass-port-server port)
+    (let ((fb (glass-port-fb port)))
+      (setf (glass-port-server port)
+            (sb-thread:make-thread
+             (lambda ()
+               (glass:serve fb (glass-port-num port)
+                            :on-key     (lambda (down k) (glass-on-key port down k))
+                            :on-pointer (lambda (b x y) (glass-on-pointer port b x y))
+                            :on-resize  (lambda (w h) (glass-on-resize port w h))
+                            :name "glass-mcclim"))
+             :name "glass-server")))))
+
 (defun ensure-fb-and-server (port mirror)
   "The MAIN mirror allocates the framebuffer (sized to its image) and starts the
-   RFB server thread, once its image exists.  Idempotent."
-  (unless (glass-port-fb port)
+   RFB server, once its image exists.  In WM mode RUN-WM owns the screen fb."
+  (when (and (not (glass-port-wm-p port)) (not (glass-port-fb port)))
     (when-let ((image (mcclim-render::image-mirror-image mirror)))
       (multiple-value-bind (w h) (image-wh image)
         (setf (glass-port-fb port) (glass:make-framebuffer w h))
-        (unless (glass-port-server port)
-          (let ((fb (glass-port-fb port)))
-            (setf (glass-port-server port)
-                  (sb-thread:make-thread
-                   (lambda ()
-                     (glass:serve fb (glass-port-num port)
-                                  :on-key     (lambda (down k) (glass-on-key port down k))
-                                  :on-pointer (lambda (b x y) (glass-on-pointer port b x y))
-                                  :on-resize  (lambda (w h) (glass-on-resize port w h))
-                                  :name "glass-mcclim"))
-                   :name "glass-server"))))))))
+        (start-glass-server port)))))
 
 (defun blit-mirror (mirror fb)
   "Composite one mirror's image into FB at the mirror's screen position (opaque)."
@@ -146,16 +174,18 @@
    diff then ships only what actually changed."
   (when-let ((fb (glass-port-fb port)))
     (glass:with-fb-locked (fb)
-      ;; mirrors is newest-first; composite oldest (main) first so newer are on top
-      (dolist (mirror (reverse (glass-port-mirrors port)))
-        (blit-mirror mirror fb)))))
+      (if (glass-port-wm-p port)
+          (wm-composite port fb)
+          ;; mirrors is newest-first; composite oldest (main) first so newer are on top
+          (dolist (mirror (reverse (glass-port-mirrors port)))
+            (blit-mirror mirror fb))))))
 
 (defun sync-fb-size (port mirror)
   "Keep the framebuffer the same size as the MAIN frame's image; on a change the
    RFB client is told the new size via DesktopSize."
   (let ((fb (glass-port-fb port))
         (image (mcclim-render::image-mirror-image mirror)))
-    (when (and fb image (glass-mirror-main mirror))
+    (when (and fb image (glass-mirror-main mirror) (not (glass-port-wm-p port)))
       (multiple-value-bind (w h) (image-wh image)
         (unless (and (= w (glass:fb-width fb)) (= h (glass:fb-height fb)))
           (glass:fb-resize fb w h))))))
@@ -242,37 +272,45 @@
 
 (defun glass-on-pointer (port mask x y)
   (with-reported-errors
-  (let ((sheet (glass-port-top port)))
-    (when sheet
-      (setf (glass-port-px port) x (glass-port-py port) y)
-      ;; wheel (RFB buttons 4/5 = bits 8/16) arrives as a transient press
-      (loop for (bit . delta) in '((8 . -1) (16 . 1))
-            when (logtest mask bit)
-            do (enqueue port (make-instance 'climi::pointer-scroll-event
-                                            :pointer (climi::port-pointer port) :sheet sheet
-                                            :x x :y y :delta-x 0 :delta-y delta
-                                            :modifier-state (glass-port-mods port)
-                                            :timestamp (next-timestamp port))))
-      (let ((real (logand mask 7)))
-        ;; motion
-        (enqueue port (make-instance 'pointer-motion-event
-                                     :pointer (climi::port-pointer port) :sheet sheet
-                                     :x x :y y
-                                     :modifier-state (glass-port-mods port)
-                                     :timestamp (next-timestamp port)))
-        ;; button transitions
-        (let ((changed (logxor real (logand (glass-port-buttons port) 7))))
-          (loop for (rbit . cbtn) in *button-bits*
-                when (logtest changed rbit)
-                do (enqueue port
-                            (make-instance (if (logtest real rbit)
-                                               'pointer-button-press-event
-                                               'pointer-button-release-event)
-                                           :pointer (climi::port-pointer port) :sheet sheet
-                                           :button cbtn :x x :y y
-                                           :modifier-state (glass-port-mods port)
-                                           :timestamp (next-timestamp port)))))
-        (setf (glass-port-buttons port) real))))))
+    (setf (glass-port-px port) x (glass-port-py port) y)
+    (if (glass-port-wm-p port)
+        (wm-on-pointer port mask x y)
+        (glass-on-pointer/single port mask x y))))
+
+(defun glass-on-pointer/single (port mask x y)
+  (when-let ((sheet (glass-port-top port)))
+    (emit-pointer-events port sheet mask x y)))
+
+(defun emit-pointer-events (port sheet mask lx ly)
+  "Turn an RFB pointer state (MASK) at sheet-local (LX,LY) into CLIM motion/
+   button/scroll events for SHEET.  Button transitions are diffed against the
+   port's global button mask (one physical mouse)."
+  ;; wheel (RFB buttons 4/5 = bits 8/16) arrives as a transient press
+  (loop for (bit . delta) in '((8 . -1) (16 . 1))
+        when (logtest mask bit)
+        do (enqueue port (make-instance 'climi::pointer-scroll-event
+                                        :pointer (climi::port-pointer port) :sheet sheet
+                                        :x lx :y ly :delta-x 0 :delta-y delta
+                                        :modifier-state (glass-port-mods port)
+                                        :timestamp (next-timestamp port))))
+  (let ((real (logand mask 7)))
+    (enqueue port (make-instance 'pointer-motion-event
+                                 :pointer (climi::port-pointer port) :sheet sheet
+                                 :x lx :y ly
+                                 :modifier-state (glass-port-mods port)
+                                 :timestamp (next-timestamp port)))
+    (let ((changed (logxor real (logand (glass-port-buttons port) 7))))
+      (loop for (rbit . cbtn) in *button-bits*
+            when (logtest changed rbit)
+            do (enqueue port
+                        (make-instance (if (logtest real rbit)
+                                           'pointer-button-press-event
+                                           'pointer-button-release-event)
+                                       :pointer (climi::port-pointer port) :sheet sheet
+                                       :button cbtn :x lx :y ly
+                                       :modifier-state (glass-port-mods port)
+                                       :timestamp (next-timestamp port)))))
+    (setf (glass-port-buttons port) real)))
 
 (defun glass-on-resize (port w h)
   "Client asked (by resizing its VNC window) for a W x H desktop.  Relayout the
@@ -314,7 +352,8 @@
   ;; (always at a 0,0 origin), so position lives here, size in the image.
   (multiple-value-bind (x1 y1 x2 y2) (bounding-rectangle* region)
     (when-let ((mirror (sheet-direct-mirror sheet)))
-      (when (typep mirror 'glass-mirror)
+      (when (and (typep mirror 'glass-mirror)
+                 (not (glass-mirror-managed mirror)))   ; WM owns managed-window positions
         (setf (glass-mirror-x mirror) (floor x1)
               (glass-mirror-y mirror) (floor y1))))
     (values x1 y1 x2 y2)))

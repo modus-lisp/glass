@@ -6,4 +6,5 @@
   (:import-from #:alexandria #:when-let #:when-let*)
   (:export #:glass-port
            #:find-glass-port
-           #:run-frame))
+           #:run-frame
+           #:run-wm))
