@@ -221,23 +221,59 @@
   (dolist (r rects) (destructuring-bind (x y w h) r (write-rect s fb x y w h enc zs)))
   (force-output s))
 
+;;; ---- desktop resize (RFC 6143 §7.8) -----------------------------------------
+;;; DesktopSize (-223): a pseudo-encoding the client lists in SetEncodings to say
+;;; "tell me when the framebuffer changes size."  We send a single pseudo-rect
+;;; whose width/height ARE the new size.  ExtendedDesktopSize (-308) additionally
+;;; lets the client REQUEST a size (SetDesktopSize, msg 251) — e.g. by resizing
+;;; its window; we forward that to the app via the ON-RESIZE callback.
+
+(defconstant +pseudo-desktop-size+          #xFFFFFF21)   ; -223 as unsigned u32
+(defconstant +pseudo-extended-desktop-size+ #xFFFFFECC)   ; -308
+
+(defun send-desktop-size (s w h)
+  "A FramebufferUpdate carrying just the DesktopSize pseudo-rect (new size W x H)."
+  (w-u8 s 0) (w-u8 s 0) (w-u16 s 1)
+  (w-u16 s 0) (w-u16 s 0) (w-u16 s w) (w-u16 s h) (w-u32 s +pseudo-desktop-size+)
+  (force-output s))
+
+(defun snap-matches-p (snap fb)
+  (= (length snap) (* (fb-width fb) (fb-height fb))))
+
 ;;; ---- client message loop ----------------------------------------------------
 
-(defun handle-update-request (fb s snap-box enc zs inc x y w h)
+(defun handle-update-request (fb s snap-box enc zs dss last-size inc x y w h)
   "Answer a FramebufferUpdateRequest in encoding ENC.  A non-incremental request
    (or the first one) sends the whole requested rect and resets the snapshot; an
    incremental one waits briefly for a change, then sends only the dirty tiles.
-   ZS is the client's persistent ZRLE zlib stream."
+   ZS is the client's persistent ZRLE zlib stream.  If the framebuffer changed
+   size and the client understands DesktopSize (DSS), announce the new size and
+   force a full resend; LAST-SIZE is the (w . h) we last told this client."
+  ;; resize announcement takes priority over pixels
+  (when dss
+    (with-fb-locked (fb)
+      (when (or (/= (fb-width fb) (car last-size)) (/= (fb-height fb) (cdr last-size)))
+        (send-desktop-size s (fb-width fb) (fb-height fb))
+        (setf (car last-size) (fb-width fb) (cdr last-size) (fb-height fb)
+              (car snap-box) nil)                       ; next request resends in full
+        (return-from handle-update-request))))
   (if (or (zerop inc) (null (car snap-box)))
-      (let ((r (clip-rect fb x y w h)))
-        (send-rects s fb (list r) enc zs)
-        (setf (car snap-box) (copy-pixels fb)))
+      (with-fb-locked (fb)
+        (let ((r (clip-rect fb x y w h)))
+          (send-rects s fb (list r) enc zs)
+          (setf (car snap-box) (copy-pixels fb))))
       (let ((snap (car snap-box)) (rects nil) (tries 0))
-        (loop (setf rects (dirty-rects fb snap))
-              (when (or rects (>= tries 300)) (return))   ; ~5s cap, then send nothing
-              (sleep 1/60) (incf tries))
-        (send-rects s fb rects enc zs)
-        (update-snapshot fb snap rects))))
+        (loop
+          (with-fb-locked (fb)
+            (if (snap-matches-p snap fb)
+                (setf rects (dirty-rects fb snap))
+                (return-from handle-update-request)))    ; resized mid-wait; next request resyncs
+          (when (or rects (>= tries 300)) (return))      ; ~5s cap, then send nothing
+          (sleep 1/60) (incf tries))
+        (with-fb-locked (fb)
+          (when (snap-matches-p snap fb)
+            (send-rects s fb rects enc zs)
+            (update-snapshot fb snap rects))))))
 
 (defun choose-encoding (encs)
   "Pick the best encoding we implement from the client's advertised list.  ZRLE
@@ -246,10 +282,12 @@
         ((member +enc-hextile+ encs) +enc-hextile+)
         (t +enc-raw+)))
 
-(defun client-loop (fb s on-key on-pointer)
+(defun client-loop (fb s on-key on-pointer on-resize)
   ;; ZS is one zlib stream for the whole connection: ZRLE retains compression
   ;; state across rectangles, so it must persist here, not per update.
-  (let ((snap-box (list nil)) (enc +enc-raw+) (zs (cram:make-zstream)))
+  (let ((snap-box (list nil)) (enc +enc-raw+) (zs (cram:make-zstream))
+        (dss nil)                                          ; client understands DesktopSize?
+        (last-size (cons (fb-width fb) (fb-height fb))))    ; size we last told this client
     (loop
       (let ((msg (read-byte s nil :eof)))
         (case msg
@@ -257,22 +295,30 @@
           (2 (skip s 1)                                    ; SetEncodings
              (let ((n (r-u16 s)) (encs '()))
                (dotimes (i n) (push (r-u32 s) encs))
-               (setf enc (choose-encoding encs))))
+               (setf enc (choose-encoding encs)
+                     dss (or (member +pseudo-desktop-size+ encs)
+                             (member +pseudo-extended-desktop-size+ encs)))))
           (3 (let ((inc (r-u8 s)) (x (r-u16 s)) (y (r-u16 s)) (w (r-u16 s)) (h (r-u16 s)))
-               (handle-update-request fb s snap-box enc zs inc x y w h)))
+               (handle-update-request fb s snap-box enc zs dss last-size inc x y w h)))
           (4 (let ((down (r-u8 s)))                        ; KeyEvent
                (skip s 2)
                (let ((key (r-u32 s))) (when on-key (funcall on-key (plusp down) key)))))
           (5 (let ((buttons (r-u8 s)) (x (r-u16 s)) (y (r-u16 s)))    ; PointerEvent
                (when on-pointer (funcall on-pointer buttons x y))))
           (6 (skip s 3) (let ((n (r-u32 s))) (r-bytes s n)))          ; ClientCutText
+          (251 (skip s 1)                                  ; SetDesktopSize (client wants a size)
+               (let ((rw (r-u16 s)) (rh (r-u16 s)) (nscreens (r-u8 s)))
+                 (skip s 1)
+                 (dotimes (i nscreens) (r-bytes s 16))     ; per-screen layout (ignored)
+                 (when on-resize (funcall on-resize rw rh))))
           (t (return)))))))                                ; :eof or unknown -> done
 
 ;;; ---- server -----------------------------------------------------------------
 
-(defun serve (fb port &key on-key on-pointer (name *desktop-name*) once)
-  "Serve framebuffer FB over RFB on PORT.  ON-KEY (down-p keysym) and ON-POINTER
-   (button-mask x y) are optional input callbacks.  With :ONCE, handle a single
+(defun serve (fb port &key on-key on-pointer on-resize (name *desktop-name*) once)
+  "Serve framebuffer FB over RFB on PORT.  ON-KEY (down-p keysym), ON-POINTER
+   (button-mask x y) and ON-RESIZE (requested-w requested-h, from the client
+   resizing its window) are optional callbacks.  With :ONCE, handle a single
    client and return; otherwise loop, each client in its own thread."
   (let ((listen (tcp-listen port)))
     (format *error-output* "~&glass: RFB server listening on port ~d (~dx~d)~%"
@@ -281,7 +327,7 @@
     (flet ((run (stream)
              (unwind-protect
                   (progn (handshake fb stream name)
-                         (client-loop fb stream on-key on-pointer))
+                         (client-loop fb stream on-key on-pointer on-resize))
                (ignore-errors (close stream)))))
       (unwind-protect
            (loop

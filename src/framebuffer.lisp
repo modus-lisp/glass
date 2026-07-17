@@ -21,13 +21,31 @@
 (defstruct (framebuffer (:conc-name fb-) (:constructor %make-framebuffer))
   (width  0 :type fixnum)
   (height 0 :type fixnum)
-  (pixels #() :type (simple-array (unsigned-byte 32) (*))))
+  (pixels #() :type (simple-array (unsigned-byte 32) (*)))
+  ;; Guards the (width height pixels) triple against a RESIZE racing a reader.
+  ;; Per-pixel content races are benign (a stale read is re-sent next update);
+  ;; only the array swap needs protecting, so readers grab this only to snapshot.
+  (lock (sb-thread:make-mutex :name "framebuffer") :type sb-thread:mutex))
+
+(defmacro with-fb-locked ((fb) &body body)
+  `(sb-thread:with-mutex ((fb-lock ,fb)) ,@body))
 
 (defun make-framebuffer (width height &optional (fill +black+))
   "A WIDTH x HEIGHT framebuffer, cleared to FILL."
   (let ((px (make-array (* width height) :element-type '(unsigned-byte 32)
                                          :initial-element (logand fill #xffffff))))
     (%make-framebuffer :width width :height height :pixels px)))
+
+(defun fb-resize (fb width height &optional (fill +black+))
+  "Resize FB in place to WIDTH x HEIGHT (contents reset to FILL).  Atomic against
+   readers that snapshot under WITH-FB-LOCKED.  No-op if the size is unchanged."
+  (with-fb-locked (fb)
+    (unless (and (= width (fb-width fb)) (= height (fb-height fb)))
+      (setf (fb-pixels fb) (make-array (* width height) :element-type '(unsigned-byte 32)
+                                                        :initial-element (logand fill #xffffff))
+            (fb-width fb) width
+            (fb-height fb) height)))
+  fb)
 
 (declaim (inline %in-bounds fb-put fb-get))
 (defun %in-bounds (fb x y)

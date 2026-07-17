@@ -111,6 +111,7 @@
                      (glass:serve fb (glass-port-num port)
                                   :on-key     (lambda (down k) (glass-on-key port down k))
                                   :on-pointer (lambda (b x y) (glass-on-pointer port b x y))
+                                  :on-resize  (lambda (w h) (glass-on-resize port w h))
                                   :name "glass-mcclim"))
                    :name "glass-server"))))))))
 
@@ -136,8 +137,21 @@
                       (loop for x from x1 below x2 do
                         (setf (aref dpx (+ row x)) (logand (aref arr y x) #x00ffffff))))))))))))))
 
+(defun sync-fb-size (mirror)
+  "Keep the glass fb the same size as the (possibly just-relaid-out) render image.
+   On a change, resize the fb and mark the whole image dirty so the next blit
+   repaints all of it; the RFB client learns the new size via DesktopSize."
+  (let ((fb (glass-mirror-fb mirror))
+        (image (mcclim-render::image-mirror-image mirror)))
+    (when (and fb image)
+      (multiple-value-bind (w h) (image-wh image)
+        (unless (and (= w (glass:fb-width fb)) (= h (glass:fb-height fb)))
+          (glass:fb-resize fb w h)
+          (setf (mcclim-render::image-dirty-region mirror) (make-rectangle* 0 0 w h)))))))
+
 (defun %mirror-force-output (port mirror)
   (ensure-fb-and-server port mirror)
+  (sync-fb-size mirror)
   (blit-dirty port mirror))
 
 (defmethod port-force-output ((port glass-port))
@@ -248,6 +262,20 @@
                                            :timestamp (next-timestamp port)))))
         (setf (glass-port-buttons port) real))))))
 
+(defun glass-on-resize (port w h)
+  "Client asked (by resizing its VNC window) for a W x H desktop.  Relayout the
+   frame to that size on the event thread; sync-fb-size then resizes the fb and
+   the client is told the actual new size via DesktopSize."
+  (with-reported-errors
+    (when-let ((sheet (glass-port-top port)))
+      (when (and (plusp w) (plusp h))
+        ;; the same path the X backend uses for a user-driven window resize: a
+        ;; window-configuration-event resizes the sheet (and, via render's
+        ;; distribute-event :before, the image) and relays out the frame.
+        (enqueue port (make-instance 'window-configuration-event
+                                     :sheet sheet
+                                     :region (make-bounding-rectangle 0 0 w h)))))))
+
 ;;; ---- event loop ------------------------------------------------------------
 
 (defmethod process-next-event ((port glass-port) &key wait-function timeout)
@@ -259,7 +287,9 @@
       (multiple-value-bind (event ok)
           (sb-concurrency:receive-message-no-hang (glass-port-mailbox port))
         (when ok
-          (distribute-event port event)
+          (if (functionp event)             ; a closure marshalled onto the event thread
+              (funcall event)
+              (distribute-event port event))
           (return t)))
       (when (and deadline (>= (get-internal-real-time) deadline))
         (return (values nil :timeout)))
