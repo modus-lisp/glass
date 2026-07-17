@@ -55,15 +55,28 @@ client. See [Build & test](#build--test).
     byte or two), ~**88× smaller than Raw** on a typical 800×600 frame; **Raw** as
     the fallback. All pixel-identical.
   - **`KeyEvent` / `PointerEvent`** dispatched to caller callbacks.
+  - **Desktop resize**, both ways — `DesktopSize` tells the client when the
+    framebuffer changes size, and `SetDesktopSize` (client-driven, via
+    `ExtendedDesktopSize`) forwards a window-resize request to an `on-resize`
+    callback.
 
   Each client runs in its own thread; `:once` serves a single client (for tests).
+
+## Running McCLIM apps over VNC (no X)
+
+[`backend/`](backend/) is an optional **McCLIM backend** (`mcclim-glass`) that
+renders CLIM applications into a glass framebuffer and serves them over VNC —
+`(clim-glass:run-frame 'my-frame :port 5900)`, then point any VNC client at
+`localhost:5900`. Pure Lisp end to end: McCLIM's software renderer draws into an
+image, glass ships it, RFB input comes back as CLIM events. Stock apps
+(`clim-demo::gadget-test`, …) render and interact. See [backend/README](backend/README.md).
 
 ## Not yet
 
 ZRLE's run-length subencodings (plain/palette RLE) and the Tight encoding; a
 client's format request (`SetPixelFormat`) is read but not honored (we always
-serve X8R8G8B8); no VNC authentication; no `CopyRect`-based scroll optimization;
-no text/font drawing yet; no resize. Contributions welcome.
+serve X8R8G8B8); no VNC authentication; no `CopyRect`-based scroll optimization.
+Contributions welcome.
 
 ## Build & test
 
