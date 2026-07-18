@@ -86,9 +86,11 @@
     (list x0 y0 (max 0 (- x1 x0)) (max 0 (- y1 y0)))))
 
 (defun tile-changed-p (fb snap x0 y0 x1 y1)
+  (declare (optimize (speed 3) (safety 0)) (fixnum x0 y0 x1 y1))
   (let ((px (fb-pixels fb)) (fw (fb-width fb)))
-    (loop for y from y0 below y1 for row = (* y fw) do
-      (loop for x from x0 below x1 for i = (+ row x) do
+    (declare (type (simple-array (unsigned-byte 32) (*)) px snap) (fixnum fw))
+    (loop for y fixnum from y0 below y1 for row fixnum = (* y fw) do
+      (loop for x fixnum from x0 below x1 for i fixnum = (+ row x) do
         (unless (= (aref px i) (aref snap i)) (return-from tile-changed-p t))))
     nil))
 
@@ -107,12 +109,14 @@
 
 (defun update-snapshot (fb snap rects)
   "Copy the pixels of RECTS from FB into SNAP (they're now what the client has)."
+  (declare (optimize (speed 3) (safety 0)))
   (let ((px (fb-pixels fb)) (fw (fb-width fb)))
+    (declare (type (simple-array (unsigned-byte 32) (*)) px snap) (fixnum fw))
     (dolist (r rects)
       (destructuring-bind (x y w h) r
-        (loop for yy from y below (+ y h) for row = (* yy fw) do
-          (loop for xx from x below (+ x w) for i = (+ row xx) do
-            (setf (aref snap i) (aref px i))))))))
+        (declare (fixnum x y w h))
+        (loop for yy fixnum from y below (+ y h) for row fixnum = (* yy fw) do
+          (replace snap px :start1 (+ row x) :end1 (+ row x w) :start2 (+ row x)))))))
 
 ;;; ---- encodings --------------------------------------------------------------
 
@@ -288,38 +292,61 @@
 
 ;;; ---- client message loop ----------------------------------------------------
 
-(defun handle-update-request (fb s snap-box enc zs dss last-size inc x y w h)
-  "Answer a FramebufferUpdateRequest in encoding ENC.  A non-incremental request
-   (or the first one) sends the whole requested rect and resets the snapshot; an
-   incremental one waits briefly for a change, then sends only the dirty tiles.
-   ZS is the client's persistent ZRLE zlib stream.  If the framebuffer changed
-   size and the client understands DesktopSize (DSS), announce the new size and
-   force a full resend; LAST-SIZE is the (w . h) we last told this client."
-  ;; resize announcement takes priority over pixels
-  (when dss
-    (with-fb-locked (fb)
-      (when (or (/= (fb-width fb) (car last-size)) (/= (fb-height fb) (cdr last-size)))
-        (send-desktop-size s (fb-width fb) (fb-height fb))
-        (setf (car last-size) (fb-width fb) (cdr last-size) (fb-height fb)
-              (car snap-box) nil)                       ; next request resends in full
-        (return-from handle-update-request))))
-  (if (or (zerop inc) (null (car snap-box)))
-      (with-fb-locked (fb)
-        (let ((r (clip-rect fb x y w h)))
-          (send-rects s fb (list r) enc zs)
-          (setf (car snap-box) (copy-pixels fb))))
-      (let ((snap (car snap-box)) (rects nil) (tries 0))
-        (loop
-          (with-fb-locked (fb)
-            (if (snap-matches-p snap fb)
-                (setf rects (dirty-rects fb snap))
-                (return-from handle-update-request)))    ; resized mid-wait; next request resyncs
-          (when (or rects (>= tries 300)) (return))      ; ~5s cap, then send nothing
-          (sleep 1/60) (incf tries))
+;;; A per-client sender runs in its OWN thread so that reading input (key/pointer)
+;;; never blocks on producing a framebuffer update — the single-threaded design
+;;; used to park in the update wait for up to ~5s, stalling input AND frames to
+;;; that cadence.  The reader thread only stashes the latest FramebufferUpdate-
+;;; Request in WANT; the sender fulfils it the moment the fb has something to show
+;;; (polling ~60 Hz).  ONLY the sender writes pixels to the socket.
+(defstruct (rfb-client (:conc-name rc-))
+  (enc +enc-raw+) dss cursor cursor-sent
+  (snap-box (list nil)) (zs (cram:make-zstream))
+  last-size                     ; (cons w h) — fb size last announced to this client
+  (want nil)                    ; latest pending request (inc x y w h), or NIL
+  (running t)
+  (lock (sb-thread:make-mutex :name "rfb-client")))
+
+(defun send-update (client fb s req)
+  "Fulfil one FramebufferUpdateRequest REQ = (inc x y w h).  Returns T if bytes
+   were written (pixels or a resize), NIL if there was nothing to send (incremental
+   with no dirty tiles) — the caller then keeps REQ pending and polls again."
+  (destructuring-bind (inc x y w h) req
+    (when (and (rc-cursor client) (not (rc-cursor-sent client)))     ; cursor shape, once
+      (send-cursor s) (setf (rc-cursor-sent client) t))
+    (let ((ls (rc-last-size client)))                                ; resize takes priority
+      (when (rc-dss client)
         (with-fb-locked (fb)
-          (when (snap-matches-p snap fb)
-            (send-rects s fb rects enc zs)
-            (update-snapshot fb snap rects))))))
+          (when (or (/= (fb-width fb) (car ls)) (/= (fb-height fb) (cdr ls)))
+            (send-desktop-size s (fb-width fb) (fb-height fb))
+            (setf (car ls) (fb-width fb) (cdr ls) (fb-height fb) (car (rc-snap-box client)) nil)
+            (return-from send-update t)))))
+    (let ((snap-box (rc-snap-box client)) (enc (rc-enc client)) (zs (rc-zs client)))
+      (if (or (zerop inc) (null (car snap-box)))                     ; full / first frame
+          (with-fb-locked (fb)
+            (send-rects s fb (list (clip-rect fb x y w h)) enc zs)
+            (setf (car snap-box) (copy-pixels fb))
+            t)
+          (with-fb-locked (fb)                                       ; incremental: dirty tiles
+            (let ((snap (car snap-box)))
+              (cond
+                ((not (snap-matches-p snap fb)) (setf (car snap-box) nil) nil)  ; resized; resync
+                (t (let ((rects (dirty-rects fb snap)))
+                     (when rects (send-rects s fb rects enc zs) (update-snapshot fb snap rects))
+                     (and rects t))))))))))
+
+(defun rfb-sender-loop (client fb s)
+  "Fulfil the client's pending request as soon as the fb has something to show;
+   poll at ~60 Hz.  Runs in its own thread; exits when the client stops running."
+  (loop while (rc-running client) do
+    (let ((req (sb-thread:with-mutex ((rc-lock client)) (rc-want client))))
+      (if (null req)
+          (sleep 1/60)
+          (let ((sent (handler-case (send-update client fb s req)
+                        (error () (setf (rc-running client) nil) nil))))
+            (if sent
+                (sb-thread:with-mutex ((rc-lock client))
+                  (when (eq (rc-want client) req) (setf (rc-want client) nil)))
+                (sleep 1/60)))))))          ; nothing dirty yet — keep REQ, poll again
 
 (defun choose-encoding (encs)
   "Pick the best encoding we implement from the client's advertised list.  ZRLE
@@ -329,39 +356,42 @@
         (t +enc-raw+)))
 
 (defun client-loop (fb s on-key on-pointer on-resize)
-  ;; ZS is one zlib stream for the whole connection: ZRLE retains compression
-  ;; state across rectangles, so it must persist here, not per update.
-  (let ((snap-box (list nil)) (enc +enc-raw+) (zs (cram:make-zstream))
-        (dss nil)                                          ; client understands DesktopSize?
-        (cursor nil) (cursor-sent nil)                     ; client understands Cursor pseudo-enc?
-        (last-size (cons (fb-width fb) (fb-height fb))))    ; size we last told this client
-    (loop
-      (let ((msg (read-byte s nil :eof)))
-        (case msg
-          (0 (skip s 3) (r-bytes s 16))                    ; SetPixelFormat (we keep ours)
-          (2 (skip s 1)                                    ; SetEncodings
-             (let ((n (r-u16 s)) (encs '()))
-               (dotimes (i n) (push (r-u32 s) encs))
-               (setf enc (choose-encoding encs)
-                     dss (or (member +pseudo-desktop-size+ encs)
-                             (member +pseudo-extended-desktop-size+ encs))
-                     cursor (and (member +pseudo-cursor+ encs) t))))
-          (3 (when (and cursor (not cursor-sent))           ; send the cursor shape once
-               (send-cursor s) (setf cursor-sent t))
-             (let ((inc (r-u8 s)) (x (r-u16 s)) (y (r-u16 s)) (w (r-u16 s)) (h (r-u16 s)))
-               (handle-update-request fb s snap-box enc zs dss last-size inc x y w h)))
-          (4 (let ((down (r-u8 s)))                        ; KeyEvent
-               (skip s 2)
-               (let ((key (r-u32 s))) (when on-key (funcall on-key (plusp down) key)))))
-          (5 (let ((buttons (r-u8 s)) (x (r-u16 s)) (y (r-u16 s)))    ; PointerEvent
-               (when on-pointer (funcall on-pointer buttons x y))))
-          (6 (skip s 3) (let ((n (r-u32 s))) (r-bytes s n)))          ; ClientCutText
-          (251 (skip s 1)                                  ; SetDesktopSize (client wants a size)
-               (let ((rw (r-u16 s)) (rh (r-u16 s)) (nscreens (r-u8 s)))
-                 (skip s 1)
-                 (dotimes (i nscreens) (r-bytes s 16))     ; per-screen layout (ignored)
-                 (when on-resize (funcall on-resize rw rh))))
-          (t (return)))))))                                ; :eof or unknown -> done
+  "Read RFB client messages, handling input (key/pointer) IMMEDIATELY; framebuffer
+   updates are produced by a companion sender thread, so input is never blocked on
+   a frame.  Only the sender writes pixels; this thread never writes to S."
+  (let* ((client (make-rfb-client :last-size (cons (fb-width fb) (fb-height fb))))
+         (sender (sb-thread:make-thread (lambda () (rfb-sender-loop client fb s))
+                                        :name "glass-sender")))
+    (unwind-protect
+         (loop
+           (let ((msg (read-byte s nil :eof)))
+             (case msg
+               (0 (skip s 3) (r-bytes s 16))               ; SetPixelFormat (we keep ours)
+               (2 (skip s 1)                               ; SetEncodings
+                  (let ((n (r-u16 s)) (encs '()))
+                    (dotimes (i n) (push (r-u32 s) encs))
+                    (sb-thread:with-mutex ((rc-lock client))
+                      (setf (rc-enc client) (choose-encoding encs)
+                            (rc-dss client) (or (member +pseudo-desktop-size+ encs)
+                                                (member +pseudo-extended-desktop-size+ encs))
+                            (rc-cursor client) (and (member +pseudo-cursor+ encs) t)))))
+               (3 (let ((inc (r-u8 s)) (x (r-u16 s)) (y (r-u16 s)) (w (r-u16 s)) (h (r-u16 s)))
+                    (sb-thread:with-mutex ((rc-lock client))   ; park the latest request
+                      (setf (rc-want client) (list inc x y w h)))))
+               (4 (let ((down (r-u8 s)))                   ; KeyEvent
+                    (skip s 2)
+                    (let ((key (r-u32 s))) (when on-key (funcall on-key (plusp down) key)))))
+               (5 (let ((buttons (r-u8 s)) (x (r-u16 s)) (y (r-u16 s)))   ; PointerEvent
+                    (when on-pointer (funcall on-pointer buttons x y))))
+               (6 (skip s 3) (let ((n (r-u32 s))) (r-bytes s n)))         ; ClientCutText
+               (251 (skip s 1)                             ; SetDesktopSize (client wants a size)
+                    (let ((rw (r-u16 s)) (rh (r-u16 s)) (nscreens (r-u8 s)))
+                      (skip s 1)
+                      (dotimes (i nscreens) (r-bytes s 16))   ; per-screen layout (ignored)
+                      (when on-resize (funcall on-resize rw rh))))
+               (t (return)))))                             ; :eof or unknown -> done
+      (setf (rc-running client) nil)
+      (ignore-errors (sb-thread:join-thread sender)))))
 
 ;;; ---- server -----------------------------------------------------------------
 

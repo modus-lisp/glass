@@ -71,18 +71,25 @@
 ;;; ---- compositing ------------------------------------------------------------
 
 (defun blit-fb (src ox oy dst)
-  "Copy glass framebuffer SRC into DST with its top-left at (OX,OY)."
+  "Copy glass framebuffer SRC into DST with its top-left at (OX,OY).  Each visible
+   row is copied in one REPLACE (memcpy) — so a full-screen wallpaper blit is fast."
+  (declare (optimize (speed 3) (safety 0)))
   (let* ((sw (glass:fb-width src)) (sh (glass:fb-height src))
          (spx (glass:fb-pixels src)) (dpx (glass:fb-pixels dst))
          (dw (glass:fb-width dst)) (dh (glass:fb-height dst)))
+    (declare (type (simple-array (unsigned-byte 32) (*)) spx dpx)
+             (fixnum sw sh dw dh ox oy))
     (dotimes (sy sh)
+      (declare (fixnum sy))
       (let ((dy (+ oy sy)))
+        (declare (fixnum dy))
         (when (< -1 dy dh)
-          (let ((drow (* dy dw)) (srow (* sy sw)))
-            (dotimes (sx sw)
-              (let ((dx (+ ox sx)))
-                (when (< -1 dx dw)
-                  (setf (aref dpx (+ drow dx)) (aref spx (+ srow sx))))))))))))
+          (let* ((drow (* dy dw)) (srow (* sy sw))
+                 (dx0 (max 0 ox)) (dx1 (min dw (+ ox sw))))
+            (declare (fixnum drow srow dx0 dx1))
+            (when (< dx0 dx1)
+              (replace dpx spx :start1 (+ drow dx0) :end1 (+ drow dx1)
+                               :start2 (+ srow (- dx0 ox))))))))))
 
 (defun wm-corners (fb x y w h)
   "OPEN LOOK L-shaped resize corner marks."
