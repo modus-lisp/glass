@@ -109,7 +109,8 @@
   (deco nil) (deco-w -1) on-key on-pointer
   (dirty-p nil)                         ; ()->bool: did the content fb change? (nil = always redraw)
   (resize-fn nil)                       ; (px-w px-h)->() : resize the content, or nil = not resizable
-  (close-fn nil))                       ; ()->() : tear down the content on window close
+  (close-fn nil)                        ; ()->() : tear down the content on window close
+  (saved-geom nil))                     ; (x y w h) saved by Full Size, for Restore Size
 
 (defun wm-surface-deco* (surf cw)
   (when (or (null (wm-surface-deco surf)) (/= cw (wm-surface-deco-w surf)))
@@ -195,14 +196,14 @@
 
 (defun wm-hit (port x y)
   "Topmost window (surfaces are above mirrors) whose decoration or content contains
-   (X,Y): (values obj REGION cx cy cw ch), REGION one of :close (title-bar menu
+   (X,Y): (values obj REGION cx cy cw ch), REGION one of :winmenu (title-bar menu
    button) / :resize (bottom-right corner grab) / :title / :content; NIL over the
    workspace."
   (flet ((test (cx cy cw ch obj)
            (let ((ty (- cy +wm-titleh+)) (rz 16))
              (cond
-               ((and (<= (+ cx 4) x (+ cx 18)) (<= (+ ty 4) y (+ ty 18)))           ; menu button = close
-                (list obj :close cx cy cw ch))
+               ((and (<= (+ cx 4) x (+ cx 18)) (<= (+ ty 4) y (+ ty 18)))           ; wedge = Window Menu
+                (list obj :winmenu cx cy cw ch))
                ((and (<= (- (+ cx cw) rz) x (+ cx cw 1)) (<= (- (+ cy ch) rz) y (+ cy ch 1)))  ; resize corner
                 (list obj :resize cx cy cw ch))
                ((and (<= cx x (+ cx cw)) (<= cy y (+ cy ch))) (list obj :content cx cy cw ch))
@@ -243,6 +244,53 @@
   (declare (ignore port))
   (when (and (wm-surface-p obj) (wm-surface-resize-fn obj))
     (ignore-errors (funcall (wm-surface-resize-fn obj) (max 32 px-w) (max 32 px-h)))))
+
+;;; ---- OPEN LOOK window menu (the title-bar wedge) ----------------------------
+;;; The wedge button was never a close box — it opened the Window Menu.  olwm's
+;;; base-window menu was: Close (iconify) / Full Size / Move / Resize (keyboard) /
+;;; Back / Refresh / Quit (kill).  We honour the names we can act on; iconify and
+;;; the mouseless Move/Resize are out of scope (no icon strip; we drag/corner).
+
+(defun wm-lower (port obj)
+  "Back: send OBJ behind all other windows in its stack."
+  (if (wm-surface-p obj)
+      (setf (glass-port-surfaces port) (append (remove obj (glass-port-surfaces port)) (list obj)))
+      (setf (glass-port-mirrors port) (append (remove obj (glass-port-mirrors port)) (list obj))))
+  (composite-all port))
+
+(defun wm-fullsize (port obj)
+  "Toggle Full Size / Restore Size for a resizable surface (fills the workspace,
+   below the title bar; a second time restores the saved geometry)."
+  (when (and (wm-surface-p obj) (wm-surface-resize-fn obj))
+    (if (wm-surface-saved-geom obj)
+        (destructuring-bind (x y w h) (wm-surface-saved-geom obj)          ; Restore Size
+          (setf (wm-surface-x obj) x (wm-surface-y obj) y (wm-surface-saved-geom obj) nil)
+          (funcall (wm-surface-resize-fn obj) w h))
+        (progn                                                             ; Full Size
+          (setf (wm-surface-saved-geom obj)
+                (list (wm-surface-x obj) (wm-surface-y obj)
+                      (glass:fb-width (wm-surface-fb obj)) (glass:fb-height (wm-surface-fb obj)))
+                (wm-surface-x obj) +wm-border+
+                (wm-surface-y obj) (+ +wm-titleh+ +wm-border+))
+          (funcall (wm-surface-resize-fn obj)
+                   (- (glass-port-screen-w port) (* 2 +wm-border+))
+                   (- (glass-port-screen-h port) +wm-titleh+ (* 2 +wm-border+)))))
+    (composite-all port)))
+
+(defun wm-window-menu-items (port obj)
+  "The Window Menu items (LABEL . THUNK) for OBJ."
+  (append
+   (when (and (wm-surface-p obj) (wm-surface-resize-fn obj))
+     (list (cons (if (wm-surface-saved-geom obj) "Restore Size" "Full Size")
+                 (lambda () (wm-fullsize port obj)))))
+   (list (cons "Back"    (lambda () (wm-lower port obj)))
+         (cons "Refresh" (lambda () (composite-all port)))
+         (cons "Quit"    (lambda () (wm-close port obj))))))
+
+(defun wm-open-window-menu (port obj cx cy)
+  "Pop the Window Menu just below OBJ's title bar (at content top-left CX,CY)."
+  (let ((menu (make-wm-menu :hover -1 :title "Window" :items (wm-window-menu-items port obj))))
+    (setf (glass-port-menu port) (wm-place-menu menu port cx cy))))
 
 ;;; ---- workspace root menu ----------------------------------------------------
 
@@ -361,8 +409,11 @@
            ((and (null obj) (logtest mask 4))                 ; right-press on workspace: root menu
             (wm-open-menu port x y) (composite-all port))
            ((null obj))                                       ; workspace: ignore
-           ((eq region :close)                                ; title-bar menu button: close
-            (when down (wm-raise port obj) (wm-close port obj)))
+           ((eq region :winmenu)                              ; title-bar wedge: the Window Menu
+            (when down
+              (wm-raise port obj)
+              (when (wm-surface-p obj) (setf (glass-port-focus-surface port) obj))
+              (wm-open-window-menu port obj cx cy) (composite-all port)))
            ((eq region :resize)                               ; bottom-right corner: start a resize
             (when down
               (wm-raise port obj)
