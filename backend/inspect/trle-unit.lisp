@@ -16,8 +16,8 @@
 
 (defun dec-tiles (dec rx ry rw rh w cli)
   (let ((pos 0))
-    (loop for ty from 0 below rh by 64 for th = (min 64 (- rh ty)) do
-      (loop for tx from 0 below rw by 64 for tw = (min 64 (- rw tx)) do
+    (loop for ty from 0 below rh by 16 for th = (min 16 (- rh ty)) do   ; RFC 6143 TRLE = 16-px tiles
+      (loop for tx from 0 below rw by 16 for tw = (min 16 (- rw tx)) do
         (let ((sub (aref dec pos)))
           (incf pos)
           (flet ((put (lx ly c) (setf (aref cli (+ (* (+ ry ty ly) w) (+ rx tx lx))) c)))
@@ -48,7 +48,7 @@
   (let* ((fb (make-framebuffer w h)) (px (fb-pixels fb))
          (cli (make-array (* w h) :element-type '(unsigned-byte 32) :initial-element 0)))
     (dotimes (y h) (dotimes (x w) (setf (aref px (+ (* y w) x)) (funcall fill x y))))
-    (multiple-value-bind (buf len) (pack-rect fb rx ry rw rh)
+    (multiple-value-bind (buf len) (pack-rect fb rx ry rw rh nil *trle-tile*)
       (let ((bytes (subseq buf 0 len)))
         (let ((consumed (dec-tiles bytes rx ry rw rh w cli)))
           (let ((mism 0))

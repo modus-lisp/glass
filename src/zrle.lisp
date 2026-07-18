@@ -77,21 +77,28 @@
                (setf (aref buf i) (logand (ash acc (- 8 nbits)) #xff)) (incf i)))))))
     i))
 
-(defun zrle-rect-cap (w h)
-  "A byte capacity that safely holds W x H packed as ZRLE tiles (raw worst case)."
-  (+ (* w h 3) (* (ceiling w *zrle-tile*) (ceiling h *zrle-tile*) 49) 16))
+(defparameter *trle-tile* 16
+  "TRLE tile size (pixels).  RFC 6143 §7.7.5 fixes TRLE at 16 — NOT ZRLE's 64.
+   The tile PACKING is identical (solid/palette/raw subencodings); only the tile
+   grid and the transport (TRLE = raw self-delimiting tiles, ZRLE = one zlib
+   stream) differ.  A compliant client desyncs if TRLE tiles aren't 16.")
 
-(defun pack-rect (fb x y w h &optional buf)
-  "Pack the ZRLE tile bytes for rect (X,Y,W,H) into BUF (allocated if NIL); return
-   (values BUF LEN).  Pure — no shared state, so calls on disjoint rects/rows run
-   in parallel."
+(defun zrle-rect-cap (w h &optional (tile *zrle-tile*))
+  "A byte capacity that safely holds W x H packed as TILE-sized tiles (raw worst
+   case): all pixels raw (3 bytes) + per-tile overhead (subenc byte + <=16 palette)."
+  (+ (* w h 3) (* (ceiling w tile) (ceiling h tile) 49) 16))
+
+(defun pack-rect (fb x y w h &optional buf (tile *zrle-tile*))
+  "Pack the tile bytes for rect (X,Y,W,H) into BUF (allocated if NIL) on a TILE-px
+   grid (64 for ZRLE, 16 for TRLE); return (values BUF LEN).  Pure — no shared
+   state, so calls on disjoint rects/rows run in parallel."
   (let* ((px (fb-pixels fb)) (fw (fb-width fb))
-         (buf (or buf (make-array (zrle-rect-cap w h) :element-type '(unsigned-byte 8))))
+         (buf (or buf (make-array (zrle-rect-cap w h tile) :element-type '(unsigned-byte 8))))
          (i 0) (index (make-hash-table :size 32))
          (palette (make-array 16 :element-type '(unsigned-byte 32))))
-    (declare (type (simple-array (unsigned-byte 8) (*)) buf) (fixnum i))
-    (loop for ty from 0 below h by *zrle-tile* for th = (min *zrle-tile* (- h ty)) do
-      (loop for tx from 0 below w by *zrle-tile* for tw = (min *zrle-tile* (- w tx)) do
+    (declare (type (simple-array (unsigned-byte 8) (*)) buf) (fixnum i tile))
+    (loop for ty from 0 below h by tile for th = (min tile (- h ty)) do
+      (loop for tx from 0 below w by tile for tw = (min tile (- w tx)) do
         (setf i (zrle-tile buf i px fw (+ x tx) (+ y ty) tw th index palette))))
     (values buf i)))
 
@@ -112,5 +119,5 @@
    delimiting).  No serial deflate, so encoding a big/incompressible rect is
    ~200x cheaper; the client reads tiles until the rect is filled."
   (w-u16 s x) (w-u16 s y) (w-u16 s w) (w-u16 s h) (w-u32 s +enc-trle+)
-  (multiple-value-bind (buf len) (pack-rect fb x y w h)
+  (multiple-value-bind (buf len) (pack-rect fb x y w h nil *trle-tile*)   ; 16-px tiles per RFC
     (write-sequence buf s :end len)))

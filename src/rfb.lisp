@@ -469,7 +469,10 @@
                                                 (member +pseudo-extended-desktop-size+ encs))
                             (rc-cursor client) (and (member +pseudo-cursor+ encs) t)
                             (rc-copyrect client) (and (member +enc-copyrect+ encs) t)
-                            (rc-trle client) (and (member +enc-trle+ encs) t)))))
+                            (rc-trle client) (and (member +enc-trle+ encs) t)))
+                    (format *trace-output* "~&glass: client encodings — chosen=~a TRLE=~:[no~;YES~] CopyRect=~:[no~;YES~] (~d offered)~%"
+                            (rc-enc client) (rc-trle client) (rc-copyrect client) n)
+                    (force-output *trace-output*)))
                (3 (let ((inc (r-u8 s)) (x (r-u16 s)) (y (r-u16 s)) (w (r-u16 s)) (h (r-u16 s)))
                     (sb-thread:with-mutex ((rc-lock client))   ; park the latest request
                       (setf (rc-want client) (list inc x y w h)))
