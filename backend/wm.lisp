@@ -373,6 +373,35 @@
                                :on-pointer (lambda (mask lx ly) (funcall onp app mask lx ly))))
           (sb-thread:make-thread (lambda () (funcall pump app)) :name "wm-browse-pump"))))))
 
+(defun wm-add-image (port path &key (max-w 960) (max-h 660))
+  "Open the image file at PATH as a WM surface window — decoded by opticl into a
+   glass framebuffer (RGB/RGBA/grey, 8/16-bit), scaled down to fit MAX-W x MAX-H.
+   opticl is an OPTIONAL runtime dependency, resolved by name."
+  (let ((read-fn (%loom-fn '#:opticl "READ-IMAGE-FILE")))
+    (unless read-fn (error "opticl not loaded — (ql:quickload :opticl)"))
+    (let* ((img (funcall read-fn path))
+           (dims (array-dimensions img))
+           (ih (first dims)) (iw (second dims))
+           (ch (if (cddr dims) (third dims) 1))
+           (p16 (equal (array-element-type img) '(unsigned-byte 16)))
+           (scale (min 1 (/ max-w iw) (/ max-h ih)))
+           (ow (max 1 (floor (* iw scale)))) (oh (max 1 (floor (* ih scale))))
+           (fb (glass:make-framebuffer ow oh (glass:rgb 24 24 24)))
+           (px (glass:fb-pixels fb)))
+      (flet ((chan (sy sx k) (let ((v (if (= ch 1) (aref img sy sx) (aref img sy sx k))))
+                               (if p16 (ash v -8) v))))
+        (dotimes (oy oh)                                   ; nearest-neighbour scale
+          (let ((sy (min (1- ih) (floor (* oy ih) oh))) (row (* oy ow)))
+            (dotimes (ox ow)
+              (let ((sx (min (1- iw) (floor (* ox iw) ow))))
+                (setf (aref px (+ row ox))
+                      (if (= ch 1) (let ((v (chan sy sx 0))) (glass:rgb v v v))
+                          (glass:rgb (chan sy sx 0) (chan sy sx 1) (chan sy sx 2)))))))))
+      (let ((c (glass-port-cascade port)))
+        (wm-add-surface* port
+          (make-wm-surface :fb fb :x (+ 40 c) :y (+ 40 c +wm-titleh+)
+                           :title (file-namestring path)))))))
+
 (defun wm-run-frame (port frame &optional (name "frame"))
   "Host a McCLIM application FRAME in its own thread on PORT (realize-mirror
    decorates it as a managed window)."
@@ -448,6 +477,7 @@
 ;;;   (:debug FORM)                     evaluate FORM under the CLIM debugger
 ;;;   (:edit &optional FILE)            Climacs, the McCLIM editor
 ;;;   (:browse URL &key width height)   a loom/weft browser window
+;;;   (:image PATH &key max-w max-h)    an image file, decoded by opticl
 ;;;   (FRAME-CLASS &key width height)   any McCLIM application frame
 (defun wm-spawn-spec (port spec)
   (case (car spec)
@@ -457,6 +487,7 @@
     (:debug    (wm-debug   port (cadr spec)))
     (:edit     (apply #'wm-edit port (cdr spec)))
     (:browse   (apply #'wm-add-browser port (cdr spec)))
+    (:image    (apply #'wm-add-image port (cdr spec)))
     (t (destructuring-bind (class &key (width 480) (height 320)) spec
          (wm-run-frame port (make-application-frame class :frame-manager (find-frame-manager :port port)
                                                     :width width :height height)
@@ -475,6 +506,11 @@
   (let ((sym (and (find-package pkg) (find-symbol class-name pkg))))
     (and sym (find-class sym nil) (list* label sym args))))
 
+(defun wm-sample-image ()
+  "The path of glass's bundled sample image, if present."
+  (let ((dir (ignore-errors (asdf:system-source-directory '#:mcclim-glass))))
+    (and dir (let ((p (merge-pathnames "assets/sample.png" dir))) (and (probe-file p) (namestring p))))))
+
 (defun wm-default-menu ()
   "The default workspace root menu: generic Browse / Inspect / Debug / Terminal,
    plus an Apps submenu of whatever McCLIM apps are loaded.  Built at call time so
@@ -492,6 +528,7 @@
                          (wm-app-item "Gadget Demo" '#:clim-demo "GADGET-TEST" :width 380 :height 320)
                          (wm-app-item "Listener" '#:clim-listener "LISTENER" :width 720 :height 480)
                          '("Editor (Climacs)" :edit)
+                         (let ((img (wm-sample-image))) (and img (list "Image Viewer" :image img)))
                          '("Browse example.com" :browse "https://example.com")))))))
 
 (defun run-wm (specs &key (port 5900) (width 1000) (height 720) menu)
