@@ -106,7 +106,10 @@
 ;;; composites, drags, raises and focuses it just like a McCLIM window.
 (defstruct wm-surface
   fb (x 60) (y 60) (title "window")
-  (deco nil) (deco-w -1) on-key on-pointer)
+  (deco nil) (deco-w -1) on-key on-pointer
+  (dirty-p nil)                         ; ()->bool: did the content fb change? (nil = always redraw)
+  (resize-fn nil)                       ; (px-w px-h)->() : resize the content, or nil = not resizable
+  (close-fn nil))                       ; ()->() : tear down the content on window close
 
 (defun wm-surface-deco* (surf cw)
   (when (or (null (wm-surface-deco surf)) (/= cw (wm-surface-deco-w surf)))
@@ -191,11 +194,19 @@
       (setf (glass-mirror-x obj) x (glass-mirror-y obj) y)))
 
 (defun wm-hit (port x y)
-  "Topmost window (surfaces are above mirrors) whose title bar or content contains
-   (X,Y): (values obj :title|:content cx cy cw ch), or NIL over the workspace."
+  "Topmost window (surfaces are above mirrors) whose decoration or content contains
+   (X,Y): (values obj REGION cx cy cw ch), REGION one of :close (title-bar menu
+   button) / :resize (bottom-right corner grab) / :title / :content; NIL over the
+   workspace."
   (flet ((test (cx cy cw ch obj)
-           (cond ((and (<= cx x (+ cx cw)) (<= cy y (+ cy ch))) (list obj :content cx cy cw ch))
-                 ((and (<= cx x (+ cx cw)) (<= (- cy +wm-titleh+) y cy)) (list obj :title cx cy cw ch)))))
+           (let ((ty (- cy +wm-titleh+)) (rz 16))
+             (cond
+               ((and (<= (+ cx 4) x (+ cx 18)) (<= (+ ty 4) y (+ ty 18)))           ; menu button = close
+                (list obj :close cx cy cw ch))
+               ((and (<= (- (+ cx cw) rz) x (+ cx cw 1)) (<= (- (+ cy ch) rz) y (+ cy ch 1)))  ; resize corner
+                (list obj :resize cx cy cw ch))
+               ((and (<= cx x (+ cx cw)) (<= cy y (+ cy ch))) (list obj :content cx cy cw ch))
+               ((and (<= cx x (+ cx cw)) (<= ty y cy)) (list obj :title cx cy cw ch))))))
     (dolist (surf (glass-port-surfaces port))
       (let ((hit (test (wm-surface-x surf) (wm-surface-y surf)
                        (glass:fb-width (wm-surface-fb surf)) (glass:fb-height (wm-surface-fb surf)) surf)))
@@ -212,6 +223,26 @@
   (if (wm-surface-p obj)
       (setf (glass-port-surfaces port) (cons obj (remove obj (glass-port-surfaces port))))
       (setf (glass-port-mirrors port) (cons obj (remove obj (glass-port-mirrors port))))))
+
+(defun wm-close (port obj)
+  "Close window OBJ: tear down a surface's content (kill its shell) and drop it, or
+   drop a McCLIM window's mirror (the window vanishes; its frame thread lingers,
+   idle).  Recomposites."
+  (cond
+    ((wm-surface-p obj)
+     (when (wm-surface-close-fn obj) (ignore-errors (funcall (wm-surface-close-fn obj))))
+     (setf (glass-port-surfaces port) (remove obj (glass-port-surfaces port)))
+     (when (eq (glass-port-focus-surface port) obj) (setf (glass-port-focus-surface port) nil)))
+    (t
+     (setf (glass-port-mirrors port) (remove obj (glass-port-mirrors port)))))
+  (composite-all port))
+
+(defun wm-resize (port obj px-w px-h)
+  "Resize window OBJ's content to PX-W x PX-H pixels — surfaces with a resize-fn
+   (e.g. a terminal re-grids); others (incl. McCLIM windows) don't resize yet."
+  (declare (ignore port))
+  (when (and (wm-surface-p obj) (wm-surface-resize-fn obj))
+    (ignore-errors (funcall (wm-surface-resize-fn obj) (max 32 px-w) (max 32 px-h)))))
 
 ;;; ---- workspace root menu ----------------------------------------------------
 
@@ -316,22 +347,33 @@
     (return-from wm-on-pointer))
   (let ((down (logtest mask 1)))
     (cond
-      ((glass-port-drag port)                                 ; dragging a title bar
-       (destructuring-bind (obj dx dy) (glass-port-drag port)
-         (wm-move obj (- x dx) (- y dy))
-         (composite-all port)
+      ((glass-port-drag port)                                 ; a move or resize in progress
+       (destructuring-bind (obj mode . rest) (glass-port-drag port)
+         (ecase mode
+           (:move   (destructuring-bind (dx dy) rest
+                      (wm-move obj (- x dx) (- y dy)) (composite-all port)))
+           (:resize (destructuring-bind (x0 y0 cw0 ch0) rest
+                      (wm-resize port obj (+ cw0 (- x x0)) (+ ch0 (- y y0))) (composite-all port))))
          (unless down (setf (glass-port-drag port) nil))))
       (t
-       (multiple-value-bind (obj region cx cy) (wm-hit port x y)
+       (multiple-value-bind (obj region cx cy cw ch) (wm-hit port x y)
          (cond
            ((and (null obj) (logtest mask 4))                 ; right-press on workspace: root menu
             (wm-open-menu port x y) (composite-all port))
            ((null obj))                                       ; workspace: ignore
-           ((eq region :title)
+           ((eq region :close)                                ; title-bar menu button: close
+            (when down (wm-raise port obj) (wm-close port obj)))
+           ((eq region :resize)                               ; bottom-right corner: start a resize
             (when down
               (wm-raise port obj)
               (when (wm-surface-p obj) (setf (glass-port-focus-surface port) obj))
-              (setf (glass-port-drag port) (list obj (- x (wm-pos-x obj)) (- y (wm-pos-y obj))))
+              (setf (glass-port-drag port) (list obj :resize x y cw ch))
+              (composite-all port)))
+           ((eq region :title)                                ; title bar: start a move
+            (when down
+              (wm-raise port obj)
+              (when (wm-surface-p obj) (setf (glass-port-focus-surface port) obj))
+              (setf (glass-port-drag port) (list obj :move (- x (wm-pos-x obj)) (- y (wm-pos-y obj))))
               (composite-all port)))
            ((wm-surface-p obj)                                ; content of a surface window
             (when down (setf (glass-port-focus-surface port) obj) (wm-raise port obj) (composite-all port))
@@ -359,7 +401,10 @@
       (make-wm-surface :fb (glass-term:terminal-fb tm)
                        :x (+ 40 c) :y (+ 40 c +wm-titleh+) :title "terminal"
                        :on-key (lambda (down k) (glass-term:on-key tm down k))
-                       :on-pointer (lambda (mask lx ly) (glass-term:on-mouse tm mask lx ly))))))
+                       :on-pointer (lambda (mask lx ly) (glass-term:on-mouse tm mask lx ly))
+                       :dirty-p (lambda () (glass-term:terminal-take-dirty tm))
+                       :resize-fn (lambda (w h) (glass-term:resize-terminal-px tm w h))
+                       :close-fn (lambda () (glass-term:kill-terminal tm))))))
 
 (defun wm-add-tabterm (port &key (cols 80) (rows 24) (ppem 14))
   "A tabbed terminal (several shells, a tab bar) as a WM surface window."
@@ -472,7 +517,8 @@
       (let ((c (glass-port-cascade port)))
         (wm-add-surface* port
           (make-wm-surface :fb fb :x (+ 40 c) :y (+ 40 c +wm-titleh+)
-                           :title (file-namestring path)))))))
+                           :title (file-namestring path)
+                           :dirty-p (constantly nil)))))))     ; static: never needs recompositing
 
 (defun wm-run-frame (port frame &optional (name "frame"))
   "Host a McCLIM application FRAME in its own thread on PORT (realize-mirror
@@ -625,8 +671,15 @@
       (wm-spawn-spec p spec)
       (sleep 0.7)                                             ; stagger for distinct cascade slots
       (composite-all p))
-    ;; Surface windows (terminals) render asynchronously in their own threads, so
-    ;; tick the compositor to pick up shell output; glass's dirty diff ships only
-    ;; changed tiles, so an idle desktop costs next to nothing.
-    (loop (sleep 1/20)
-          (when (glass-port-surfaces p) (ignore-errors (composite-all p))))))
+    ;; Surface windows (terminals) render asynchronously in their own threads.
+    ;; DAMAGE TRACKING: only recomposite when a surface actually changed (its
+    ;; dirty-p reports so and clears) — an idle desktop does ZERO compositing, so
+    ;; no wasted full-screen redraws.  A NIL dirty-p means "always redraw" (safe
+    ;; default); a static surface (image) reports NIL forever.  WM operations
+    ;; (move/resize/menu/...) recomposite directly, so they're not gated here.
+    (loop (sleep 1/30)
+          (let ((dirty nil))
+            (dolist (s (glass-port-surfaces p))
+              (when (or (null (wm-surface-dirty-p s)) (funcall (wm-surface-dirty-p s)))
+                (setf dirty t)))
+            (when dirty (ignore-errors (composite-all p)))))))

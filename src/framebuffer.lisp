@@ -36,7 +36,9 @@
   (lock (%fb-make-lock)))
 
 #+sb-thread (defmacro with-fb-locked ((fb) &body body)
-              `(sb-thread:with-mutex ((fb-lock ,fb)) ,@body))
+              ;; recursive: fb-resize (which locks) may be called inside a held
+              ;; with-fb-locked (e.g. a terminal re-grids under its render lock).
+              `(sb-thread:with-recursive-lock ((fb-lock ,fb)) ,@body))
 #-sb-thread (defmacro with-fb-locked ((fb) &body body)
               (declare (ignore fb)) `(progn ,@body))
 

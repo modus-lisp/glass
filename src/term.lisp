@@ -10,6 +10,7 @@
 (defpackage #:glass-term
   (:use #:cl)
   (:export #:run #:make-terminal #:terminal #:terminal-fb #:on-key #:on-mouse #:start-pump
+           #:terminal-take-dirty #:kill-terminal #:resize-terminal #:resize-terminal-px
            ;; tabbed terminal (multiple shells, a tab bar)
            #:make-tabbed-terminal #:tabterm-fb #:tabterm-on-key #:tabterm-on-mouse #:tabterm-new))
 (in-package #:glass-term)
@@ -82,7 +83,8 @@
   (alt nil)                             ; saved main screen while on the alternate buffer
   (dec-saved nil)                       ; DECSC cursor+attrs save
   (mouse-mode nil) (mouse-sgr nil)      ; mouse tracking: nil/:normal/:button/:any, SGR (1006)?
-  (mouse-buttons 0) (mouse-col 0) (mouse-row 0))   ; last mouse state (for diffing)
+  (mouse-buttons 0) (mouse-col 0) (mouse-row 0)   ; last mouse state (for diffing)
+  (dirty t))                            ; fb changed since the compositor last consumed it?
 
 (defun cell (tm x y) (aref (terminal-cells tm) (+ (* y (terminal-cols tm)) x)))
 (defun (setf cell) (v tm x y) (setf (aref (terminal-cells tm) (+ (* y (terminal-cols tm)) x)) v))
@@ -486,7 +488,13 @@
     (dotimes (y (terminal-rows tm))
       (dotimes (x (terminal-cols tm)) (draw-cell tm x y)))
     (dolist (g (reverse (terminal-graphics tm)))       ; sixel images on top, oldest first
-      (blit-image (cddr g) (car g) (cadr g) (terminal-fb tm)))))
+      (blit-image (cddr g) (car g) (cadr g) (terminal-fb tm))))
+  (setf (terminal-dirty tm) t))
+
+(defun terminal-take-dirty (tm)
+  "T if the terminal's fb changed since the last call (and clear the flag) — lets
+   a compositor skip re-drawing an idle terminal."
+  (prog1 (terminal-dirty tm) (setf (terminal-dirty tm) nil)))
 
 ;;; ---- keyboard -> PTY --------------------------------------------------------
 
@@ -609,6 +617,32 @@
     (set-winsize pty rows cols)
     (enable-echo pty)                       ; SBCL's pty comes up -echo; the shell needs it on
     tm))
+
+(defun kill-terminal (tm)
+  "Close the terminal: SIGHUP the shell's whole process group (so children die
+   too) and close the pty; the pump thread then sees EOF and exits."
+  (ignore-errors (sb-ext:process-kill (terminal-proc tm) 1 :process-group))   ; SIGHUP the group
+  (ignore-errors (close (terminal-pty tm))))
+
+(defun resize-terminal (tm cols rows)
+  "Resize the terminal to COLS x ROWS cells: fresh grid, resized fb, and a
+   TIOCSWINSZ (which SIGWINCHes the shell so it re-queries the size and redraws)."
+  (setf cols (max 1 cols) rows (max 1 rows))
+  (glass:with-fb-locked ((terminal-fb tm))
+    (setf (terminal-cols tm) cols (terminal-rows tm) rows
+          (terminal-cells tm) (make-grid cols rows)
+          (terminal-cx tm) (min (terminal-cx tm) (1- cols))
+          (terminal-cy tm) (min (terminal-cy tm) (1- rows))
+          (terminal-top tm) 0 (terminal-bot tm) (1- rows))
+    (glass:fb-resize (terminal-fb tm) (* cols (terminal-cell-w tm)) (* rows (terminal-cell-h tm))))
+  (set-winsize (terminal-pty tm) rows cols)
+  (setf (terminal-dirty tm) t))
+
+(defun resize-terminal-px (tm px-w px-h)
+  "Resize to fit PX-W x PX-H pixels (snapped to the cell grid) — the entry a WM
+   uses when the user drags a resize corner."
+  (resize-terminal tm (max 1 (floor px-w (terminal-cell-w tm)))
+                      (max 1 (floor px-h (terminal-cell-h tm)))))
 
 (defun pump (tm)
   "Read shell output, feed the parser, render.  Returns when the shell exits."
