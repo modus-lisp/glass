@@ -130,7 +130,12 @@
 (defconstant +enc-raw+ 0)
 (defconstant +enc-copyrect+ 1)  ; "copy this rect from elsewhere in the fb" — no pixel data
 (defconstant +enc-hextile+ 5)
+(defconstant +enc-trle+ 15)     ; ZRLE's tiles WITHOUT zlib (no serial deflate) — encoder in zrle.lisp
 (defconstant +enc-zrle+ 16)     ; encoder in zrle.lisp (loaded after this file)
+(defparameter *trle-threshold* 16384
+  "Rects with at least this many pixels go out as TRLE (no zlib — ~200x cheaper to
+   encode than ZRLE, only a little larger; the deflate cost isn't worth it on a
+   fast link).  Smaller rects stay ZRLE (compression is ~free at that size).")
 
 (defun write-rect-copy (s dx dy w h sx sy)
   "A CopyRect rect: the client copies its own W x H pixels from (SX,SY) to (DX,DY)."
@@ -247,15 +252,24 @@
 
 (defun write-rect (s fb x y w h enc zs)
   (cond
+    ((= enc +enc-trle+)    (write-rect-trle s fb x y w h))
     ((= enc +enc-zrle+)    (write-rect-zrle s fb x y w h zs))
     ((= enc +enc-hextile+) (write-rect-hextile s fb x y w h))
     (t                     (write-rect-raw s fb x y w h))))
 
-(defun send-rects (s fb rects enc zs)
-  "One FramebufferUpdate carrying RECTS in encoding ENC.  ZS is the client's
-   persistent ZRLE zlib stream (used only when ENC is ZRLE)."
+(defun emit-rect (s fb x y w h enc zs trle)
+  "Write one rect, upgrading ENC to TRLE for a large rect when the client can take
+   it (TRLE): no zlib, ~200x cheaper to encode; small rects keep ENC (ZRLE)."
+  (if (and trle (= enc +enc-zrle+) (>= (* w h) *trle-threshold*))
+      (write-rect-trle s fb x y w h)
+      (write-rect s fb x y w h enc zs)))
+
+(defun send-rects (s fb rects enc zs &optional trle)
+  "One FramebufferUpdate carrying RECTS.  ENC is the client's chosen encoding; ZS
+   its persistent ZRLE zlib stream; TRLE whether it also accepts TRLE (used for
+   big rects).  Encoding is chosen per rect by EMIT-RECT."
   (w-u8 s 0) (w-u8 s 0) (w-u16 s (length rects))             ; msg-type, pad, #rects
-  (dolist (r rects) (destructuring-bind (x y w h) r (write-rect s fb x y w h enc zs)))
+  (dolist (r rects) (destructuring-bind (x y w h) r (emit-rect s fb x y w h enc zs trle)))
   (force-output s))
 
 ;;; ---- desktop resize (RFC 6143 §7.8) -----------------------------------------
@@ -332,7 +346,7 @@
 ;;; Request in WANT; the sender fulfils it the moment the fb has something to show
 ;;; (polling ~60 Hz).  ONLY the sender writes pixels to the socket.
 (defstruct (rfb-client (:conc-name rc-))
-  (enc +enc-raw+) dss cursor cursor-sent copyrect
+  (enc +enc-raw+) dss cursor cursor-sent copyrect trle
   (snap-box (list nil)) (zs (cram:make-zstream))
   last-size                     ; (cons w h) — fb size last announced to this client
   (want nil)                    ; latest pending request (inc x y w h), or NIL
@@ -357,10 +371,11 @@
             (send-desktop-size s (fb-width fb) (fb-height fb))
             (setf (car ls) (fb-width fb) (cdr ls) (fb-height fb) (car (rc-snap-box client)) nil)
             (return-from send-update t)))))
-    (let ((snap-box (rc-snap-box client)) (enc (rc-enc client)) (zs (rc-zs client)))
+    (let ((snap-box (rc-snap-box client)) (enc (rc-enc client)) (zs (rc-zs client))
+          (trle (rc-trle client)))
       (if (or (zerop inc) (null (car snap-box)))                     ; full / first frame
           (with-fb-locked (fb)
-            (send-rects s fb (list (clip-rect fb x y w h)) enc zs)
+            (send-rects s fb (list (clip-rect fb x y w h)) enc zs trle)
             (setf (car snap-box) (copy-pixels fb))
             t)
           (with-fb-locked (fb)                                       ; incremental: dirty tiles
@@ -375,12 +390,12 @@
                    (let ((rects (dirty-rects fb snap (and (consp region) region))))
                      (w-u8 s 0) (w-u8 s 0) (w-u16 s (1+ (length rects)))    ; #rects = CopyRect + exposed
                      (write-rect-copy s dx dy w h sx sy)
-                     (dolist (r rects) (destructuring-bind (rx ry rw rh) r (write-rect s fb rx ry rw rh enc zs)))
+                     (dolist (r rects) (destructuring-bind (rx ry rw rh) r (emit-rect s fb rx ry rw rh enc zs trle)))
                      (force-output s)
                      (update-snapshot fb snap rects)
                      t)))
                 (t (let ((rects (dirty-rects fb snap (and (consp region) region))))
-                     (when rects (send-rects s fb rects enc zs) (update-snapshot fb snap rects))
+                     (when rects (send-rects s fb rects enc zs trle) (update-snapshot fb snap rects))
                      (and rects t))))))))))
 
 ;;; A WAKE lets the compositor and the reader thread nudge a parked sender the
@@ -453,7 +468,8 @@
                             (rc-dss client) (or (member +pseudo-desktop-size+ encs)
                                                 (member +pseudo-extended-desktop-size+ encs))
                             (rc-cursor client) (and (member +pseudo-cursor+ encs) t)
-                            (rc-copyrect client) (and (member +enc-copyrect+ encs) t)))))
+                            (rc-copyrect client) (and (member +enc-copyrect+ encs) t)
+                            (rc-trle client) (and (member +enc-trle+ encs) t)))))
                (3 (let ((inc (r-u8 s)) (x (r-u16 s)) (y (r-u16 s)) (w (r-u16 s)) (h (r-u16 s)))
                     (sb-thread:with-mutex ((rc-lock client))   ; park the latest request
                       (setf (rc-want client) (list inc x y w h)))
