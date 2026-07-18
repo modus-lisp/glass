@@ -35,7 +35,8 @@
    (focus-surface :initform nil :accessor glass-port-focus-surface)  ; surface grabbing the keyboard
    (menu     :initform nil :accessor glass-port-menu)         ; open workspace root menu, or nil
    (menu-items :initform '() :accessor glass-port-menu-items)  ; (label . thunk) list for the root menu
-   (bg       :initform nil :accessor glass-port-bg))          ; desktop background framebuffer, or nil (flat teal)
+   (bg       :initform nil :accessor glass-port-bg)           ; desktop background framebuffer, or nil (flat teal)
+   (wake     :initform (glass:make-wake) :accessor glass-port-wake))  ; nudges RFB senders after compositing
   (:default-initargs :pointer (make-instance 'climi::standard-pointer)))
 
 (defun parse-glass-server-path (path) path)     ; plist tail becomes initargs
@@ -144,6 +145,7 @@
                             :on-key     (lambda (down k) (glass-on-key port down k))
                             :on-pointer (lambda (b x y) (glass-on-pointer port b x y))
                             :on-resize  (lambda (w h) (glass-on-resize port w h))
+                            :wake       (glass-port-wake port)
                             :name "glass-mcclim"))
              :name "glass-server")))))
 
@@ -173,18 +175,25 @@
                     (when (< -1 fx fw)
                       (setf (aref dpx (+ frow fx)) (logand (aref arr iy ix) #x00ffffff)))))))))))))
 
-(defun composite-all (port)
-  "Redraw the whole screen: the main frame at the bottom, then every secondary
-   top-level sheet (menus/dialogs) on top in creation order.  glass's own dirty
-   diff then ships only what actually changed."
+(defun composite-all (port &optional damage)
+  "Redraw the desktop.  DAMAGE = (x y w h) confines the redraw (and the RFB
+   sender's diff) to that rectangle — the compositor already knows what changed,
+   so an idle move/blink doesn't rebuild + re-diff the whole 1280x800.  NIL means
+   the whole screen (menus, resize, McCLIM updates, first paint)."
   (when-let ((fb (glass-port-fb port)))
     (glass:with-fb-locked (fb)
-      (if (glass-port-wm-p port)
-          (wm-composite port fb)
-          ;; mirrors is newest-first; composite oldest (main) first so newer are on top
-          (dolist (mirror (reverse (glass-port-mirrors port)))
-            (blit-mirror mirror fb)))
-      (glass:fb-touch fb))))              ; content changed -> the sender should re-scan
+      (flet ((paint ()
+               (if (glass-port-wm-p port)
+                   (wm-composite port fb)
+                   ;; mirrors is newest-first; composite oldest (main) first so newer are on top
+                   (dolist (mirror (reverse (glass-port-mirrors port))) (blit-mirror mirror fb)))))
+        (if (and damage (glass-port-wm-p port))
+            (destructuring-bind (dx dy dw dh) damage
+              (glass:with-fb-clip (fb dx dy dw dh) (paint))
+              (glass:fb-mark-frame fb (list dx dy (+ dx dw) (+ dy dh))))
+            (progn (paint) (glass:fb-mark-frame fb :full))))
+      (glass:fb-touch fb))                ; content changed -> the sender should re-scan
+    (glass:wake-signal (glass-port-wake port))))   ; …and wake it now, don't wait for its poll
 
 (defun sync-fb-size (port mirror)
   "Keep the framebuffer the same size as the MAIN frame's image; on a change the

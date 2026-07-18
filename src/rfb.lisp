@@ -94,17 +94,24 @@
         (unless (= (aref px i) (aref snap i)) (return-from tile-changed-p t))))
     nil))
 
-(defun dirty-rects (fb snap)
+(defun dirty-rects (fb snap &optional region)
   "Coalesced (x y w h) rectangles where FB differs from SNAP: changed tiles on a
-   *TILE* grid, merged into horizontal runs per tile-row."
-  (let ((fw (fb-width fb)) (fh (fb-height fb)) (ts *tile*) (rects '()))
-    (loop for ty from 0 below fh by ts for y1 = (min fh (+ ty ts)) do
-      (let ((run -1))
-        (loop for tx from 0 below fw by ts do
-          (if (tile-changed-p fb snap tx ty (min fw (+ tx ts)) y1)
+   *TILE* grid, merged into horizontal runs per tile-row.  REGION ((x0 y0 x1 y1))
+   confines the scan to tiles overlapping that box — so when the compositor tells
+   us what it changed, we don't re-scan the whole screen."
+  (let* ((fw (fb-width fb)) (fh (fb-height fb)) (ts *tile*) (rects '())
+         (rx0 (if region (max 0 (min fw (first region)))  0))
+         (ry0 (if region (max 0 (min fh (second region))) 0))
+         (rx1 (if region (max 0 (min fw (third region)))  fw))
+         (ry1 (if region (max 0 (min fh (fourth region))) fh)))
+    (loop for ty from (* ts (floor ry0 ts)) below ry1 by ts for y1 = (min fh (+ ty ts)) do
+      (let ((run -1) (lastx1 0))
+        (loop for tx from (* ts (floor rx0 ts)) below rx1 by ts for x1 = (min fw (+ tx ts)) do
+          (setf lastx1 x1)
+          (if (tile-changed-p fb snap tx ty x1 y1)
               (when (< run 0) (setf run tx))
               (when (>= run 0) (push (list run ty (- tx run) (- y1 ty)) rects) (setf run -1))))
-        (when (>= run 0) (push (list run ty (- fw run) (- y1 ty)) rects))))
+        (when (>= run 0) (push (list run ty (- lastx1 run) (- y1 ty)) rects))))
     (nreverse rects)))
 
 (defun update-snapshot (fb snap rects)
@@ -304,13 +311,14 @@
   last-size                     ; (cons w h) — fb size last announced to this client
   (want nil)                    ; latest pending request (inc x y w h), or NIL
   (last-gen -1)                 ; fb generation this client has already caught up to
+  (last-frame -1)               ; fb composite-frame this client has already caught up to
   (running t)
   (lock (sb-thread:make-mutex :name "rfb-client")))
 
-(defun send-update (client fb s req)
-  "Fulfil one FramebufferUpdateRequest REQ = (inc x y w h).  Returns T if bytes
-   were written (pixels or a resize), NIL if there was nothing to send (incremental
-   with no dirty tiles) — the caller then keeps REQ pending and polls again."
+(defun send-update (client fb s req region)
+  "Fulfil one FramebufferUpdateRequest REQ = (inc x y w h).  REGION ((x0 y0 x1 y1)
+   or :FULL) confines an incremental diff to what the compositor just changed.
+   Returns T if bytes were written, NIL if there was nothing to send."
   (destructuring-bind (inc x y w h) req
     (when (and (rc-cursor client) (not (rc-cursor-sent client)))     ; cursor shape, once
       (send-cursor s) (setf (rc-cursor-sent client) t))
@@ -331,30 +339,53 @@
             (let ((snap (car snap-box)))
               (cond
                 ((not (snap-matches-p snap fb)) (setf (car snap-box) nil) nil)  ; resized; resync
-                (t (let ((rects (dirty-rects fb snap)))
+                (t (let ((rects (dirty-rects fb snap (and (consp region) region))))
                      (when rects (send-rects s fb rects enc zs) (update-snapshot fb snap rects))
                      (and rects t))))))))))
 
-(defun rfb-sender-loop (client fb s)
-  "Fulfil the client's pending request as soon as the fb has something to show;
-   poll at ~60 Hz.  Runs in its own thread; exits when the client stops running."
+;;; A WAKE lets the compositor and the reader thread nudge a parked sender the
+;;; instant there's something to send, instead of it polling every ~16ms — the
+;;; single biggest interactive-latency win.  It's a plain condvar; the 1/60
+;;; timeout is only a safety net against a missed signal (so worst case = the old
+;;; poll, best case = immediate).
+(defstruct (wake (:constructor make-wake ()))
+  (cv (sb-thread:make-waitqueue :name "glass-wake"))
+  (lock (sb-thread:make-mutex :name "glass-wake")))
+
+(defun wake-signal (w)
+  (when w (sb-thread:with-mutex ((wake-lock w)) (sb-thread:condition-broadcast (wake-cv w)))))
+
+(defun wake-wait (w timeout)
+  (if w (sb-thread:with-mutex ((wake-lock w)) (sb-thread:condition-wait (wake-cv w) (wake-lock w) :timeout timeout))
+      (sleep timeout)))
+
+(defun rfb-sender-loop (client fb s wake)
+  "Fulfil the client's pending request the moment the fb changes (parked on WAKE,
+   ~60 Hz safety timeout).  Runs in its own thread; exits when the client stops."
   (loop while (rc-running client) do
     (let ((req (sb-thread:with-mutex ((rc-lock client)) (rc-want client))))
       (cond
-        ((null req) (sleep 1/60))
+        ((null req) (wake-wait wake 1/60))
         ;; incremental request, but the fb hasn't changed since we last caught up:
-        ;; nothing to do — skip the (whole-frame) diff entirely and just poll.
+        ;; nothing to do — skip the (whole-frame) diff entirely and park.
         ((and (plusp (first req)) (= (fb-generation fb) (rc-last-gen client)))
-         (sleep 1/60))
+         (wake-wait wake 1/60))
         (t
-         (let* ((gen (fb-generation fb))
-                (sent (handler-case (send-update client fb s req)
+         (let* ((gen (fb-generation fb)) (frame (fb-frameno fb))
+                ;; if we saw the immediately-previous composite and it recorded a
+                ;; damage box, diff ONLY that box — the compositor already knows
+                ;; what changed, so don't re-scan the whole screen.  Otherwise full.
+                (region (if (and (plusp (first req))
+                                 (eql (rc-last-frame client) (1- frame))
+                                 (consp (fb-damage fb)))
+                            (fb-damage fb) :full))
+                (sent (handler-case (send-update client fb s req region)
                         (error () (setf (rc-running client) nil) nil))))
-           (setf (rc-last-gen client) gen)      ; caught up to GEN whether or not anything shipped
+           (setf (rc-last-gen client) gen (rc-last-frame client) frame)
            (if sent
                (sb-thread:with-mutex ((rc-lock client))
                  (when (eq (rc-want client) req) (setf (rc-want client) nil)))
-               (sleep 1/60))))))))          ; nothing dirty (gen bumped, pixels same) — keep REQ, poll
+               (wake-wait wake 1/60))))))))     ; nothing dirty (gen bumped, pixels same) — park
 
 (defun choose-encoding (encs)
   "Pick the best encoding we implement from the client's advertised list.  ZRLE
@@ -363,12 +394,12 @@
         ((member +enc-hextile+ encs) +enc-hextile+)
         (t +enc-raw+)))
 
-(defun client-loop (fb s on-key on-pointer on-resize)
+(defun client-loop (fb s on-key on-pointer on-resize wake)
   "Read RFB client messages, handling input (key/pointer) IMMEDIATELY; framebuffer
    updates are produced by a companion sender thread, so input is never blocked on
    a frame.  Only the sender writes pixels; this thread never writes to S."
   (let* ((client (make-rfb-client :last-size (cons (fb-width fb) (fb-height fb))))
-         (sender (sb-thread:make-thread (lambda () (rfb-sender-loop client fb s))
+         (sender (sb-thread:make-thread (lambda () (rfb-sender-loop client fb s wake))
                                         :name "glass-sender")))
     (unwind-protect
          (loop
@@ -385,7 +416,8 @@
                             (rc-cursor client) (and (member +pseudo-cursor+ encs) t)))))
                (3 (let ((inc (r-u8 s)) (x (r-u16 s)) (y (r-u16 s)) (w (r-u16 s)) (h (r-u16 s)))
                     (sb-thread:with-mutex ((rc-lock client))   ; park the latest request
-                      (setf (rc-want client) (list inc x y w h)))))
+                      (setf (rc-want client) (list inc x y w h)))
+                    (wake-signal wake)))                       ; nudge the sender to fulfil it now
                (4 (let ((down (r-u8 s)))                   ; KeyEvent
                     (skip s 2)
                     (let ((key (r-u32 s))) (when on-key (funcall on-key (plusp down) key)))))
@@ -403,11 +435,13 @@
 
 ;;; ---- server -----------------------------------------------------------------
 
-(defun serve (fb port &key on-key on-pointer on-resize (name *desktop-name*) once)
+(defun serve (fb port &key on-key on-pointer on-resize (name *desktop-name*) once wake)
   "Serve framebuffer FB over RFB on PORT.  ON-KEY (down-p keysym), ON-POINTER
    (button-mask x y) and ON-RESIZE (requested-w requested-h, from the client
    resizing its window) are optional callbacks.  With :ONCE, handle a single
-   client and return; otherwise loop, each client in its own thread."
+   client and return; otherwise loop, each client in its own thread.  WAKE (a
+   glass:make-wake) lets the caller nudge parked senders the instant it has
+   drawn — call glass:wake-signal after compositing; NIL falls back to polling."
   (let ((listen (tcp-listen port)))
     (format *error-output* "~&glass: RFB server listening on port ~d (~dx~d)~%"
             port (fb-width fb) (fb-height fb))
@@ -415,7 +449,7 @@
     (flet ((run (stream)
              (unwind-protect
                   (progn (handshake fb stream name)
-                         (client-loop fb stream on-key on-pointer on-resize))
+                         (client-loop fb stream on-key on-pointer on-resize wake))
                (ignore-errors (close stream)))))
       (unwind-protect
            (loop

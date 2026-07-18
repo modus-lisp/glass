@@ -36,12 +36,42 @@
   (lock (%fb-make-lock))
   ;; Content version: a writer bumps it via FB-TOUCH so a reader (the RFB sender)
   ;; can cheaply tell "nothing changed since I last looked" and skip a full diff.
-  (generation 0))
+  (generation 0)
+  ;; Clip rectangle (x0 y0 x1 y1, exclusive) confining drawing to a region, or NIL
+  ;; for none — lets the compositor redraw only a damaged rectangle (WITH-FB-CLIP).
+  (clip nil)
+  ;; Frame counter + last damage box: bumped once per COMPOSITE (FB-MARK-FRAME),
+  ;; so the RFB sender can diff only the region that just changed, not the whole
+  ;; screen — the "we're the compositor, we already know what changed" shortcut.
+  ;; (Named FRAMENO, not FRAME: FB-FRAME is already the rectangle-outline drawer.)
+  (frameno 0)
+  (damage nil))                         ; (x0 y0 x1 y1) of the last frame, or :FULL
 
 (defun fb-touch (fb)
   "Mark FB's contents as changed (bumps its generation).  Writers call this after
    drawing so the RFB sender knows to re-scan; an untouched fb is diff-free."
   (setf (fb-generation fb) (logand (1+ (fb-generation fb)) most-positive-fixnum)))
+
+(defun fb-mark-frame (fb damage)
+  "Record that a composite just changed region DAMAGE ((x0 y0 x1 y1) or :FULL) and
+   advance the frame counter, so a sender one frame behind can diff only DAMAGE."
+  (setf (fb-damage fb) damage
+        (fb-frameno fb) (logand (1+ (fb-frameno fb)) most-positive-fixnum)))
+
+(defun %clip-intersect (clip x0 y0 x1 y1)
+  "Intersect the (possibly NIL) CLIP box with (x0 y0 x1 y1)."
+  (if clip
+      (list (max (first clip) x0) (max (second clip) y0)
+            (min (third clip) x1) (min (fourth clip) y1))
+      (list x0 y0 x1 y1)))
+
+(defmacro with-fb-clip ((fb x y w h) &body body)
+  "Confine drawing in BODY to the rectangle (X,Y,W,H) intersected with any current
+   clip.  fb-fill/fb-rect/blit-fb honour it; used for damage-limited compositing."
+  (let ((g (gensym)) (old (gensym)))
+    `(let* ((,g ,fb) (,old (fb-clip ,g)))
+       (setf (fb-clip ,g) (%clip-intersect ,old ,x ,y (+ ,x ,w) (+ ,y ,h)))
+       (unwind-protect (progn ,@body) (setf (fb-clip ,g) ,old)))))
 
 #+sb-thread (defmacro with-fb-locked ((fb) &body body)
               ;; recursive: fb-resize (which locks) may be called inside a held
@@ -84,16 +114,18 @@
   (if (%in-bounds fb x y) (aref (fb-pixels fb) (+ (* y (fb-width fb)) x)) 0))
 
 (defun fb-fill (fb color)
-  "Clear the whole framebuffer to COLOR."
-  (fill (fb-pixels fb) (logand color #xffffff))
-  (fb-touch fb)
+  "Clear the framebuffer to COLOR (only the clip region, if a clip is set)."
+  (let ((clip (fb-clip fb)))
+    (if clip
+        (fb-rect fb (first clip) (second clip) (- (third clip) (first clip)) (- (fourth clip) (second clip)) color)
+        (progn (fill (fb-pixels fb) (logand color #xffffff)) (fb-touch fb))))
   color)
 
 (defun fb-rect (fb x y w h color)
-  "Filled rectangle at (X,Y), W x H, in COLOR (clipped)."
-  (let* ((fw (fb-width fb)) (fh (fb-height fb))
-         (x0 (max 0 x)) (y0 (max 0 y))
-         (x1 (min fw (+ x w))) (y1 (min fh (+ y h)))
+  "Filled rectangle at (X,Y), W x H, in COLOR (clipped to the fb and any clip box)."
+  (let* ((fw (fb-width fb)) (fh (fb-height fb)) (clip (fb-clip fb))
+         (x0 (max 0 x (if clip (first clip) 0)))  (y0 (max 0 y (if clip (second clip) 0)))
+         (x1 (min fw (+ x w) (if clip (third clip) fw))) (y1 (min fh (+ y h) (if clip (fourth clip) fh)))
          (px (fb-pixels fb)) (c (logand color #xffffff)))
     (loop for yy from y0 below y1
           for row = (* yy fw)

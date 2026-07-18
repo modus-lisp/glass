@@ -76,16 +76,19 @@
   (declare (optimize (speed 3) (safety 0)))
   (let* ((sw (glass:fb-width src)) (sh (glass:fb-height src))
          (spx (glass:fb-pixels src)) (dpx (glass:fb-pixels dst))
-         (dw (glass:fb-width dst)) (dh (glass:fb-height dst)))
+         (dw (glass:fb-width dst)) (dh (glass:fb-height dst))
+         (clip (glass:fb-clip dst))
+         (cx0 (if clip (the fixnum (first clip)) 0)) (cy0 (if clip (the fixnum (second clip)) 0))
+         (cx1 (if clip (the fixnum (third clip)) dw)) (cy1 (if clip (the fixnum (fourth clip)) dh)))
     (declare (type (simple-array (unsigned-byte 32) (*)) spx dpx)
-             (fixnum sw sh dw dh ox oy))
+             (fixnum sw sh dw dh ox oy cx0 cy0 cx1 cy1))
     (dotimes (sy sh)
       (declare (fixnum sy))
       (let ((dy (+ oy sy)))
         (declare (fixnum dy))
-        (when (< -1 dy dh)
+        (when (and (< -1 dy dh) (<= cy0 dy) (< dy cy1))     ; row within fb and clip
           (let* ((drow (* dy dw)) (srow (* sy sw))
-                 (dx0 (max 0 ox)) (dx1 (min dw (+ ox sw))))
+                 (dx0 (max 0 ox cx0)) (dx1 (min dw (+ ox sw) cx1)))
             (declare (fixnum drow srow dx0 dx1))
             (when (< dx0 dx1)
               (replace dpx spx :start1 (+ drow dx0) :end1 (+ drow dx1)
@@ -187,6 +190,29 @@
       (blit-fb (wm-menu-fb m) (wm-menu-x m) (wm-menu-y m) fb))))
 
 ;;; ---- pointer routing --------------------------------------------------------
+
+(defun wm-window-box (obj)
+  "(x y w h) of OBJ's whole decorated window — title bar + border + content — for
+   damage accounting."
+  (multiple-value-bind (cx cy cw ch)
+      (if (wm-surface-p obj)
+          (values (wm-surface-x obj) (wm-surface-y obj)
+                  (glass:fb-width (wm-surface-fb obj)) (glass:fb-height (wm-surface-fb obj)))
+          (when-let ((img (mcclim-render::image-mirror-image obj)))
+            (multiple-value-bind (w h) (image-wh img)
+              (values (glass-mirror-x obj) (glass-mirror-y obj) w h))))
+    (when cx
+      (list (- cx +wm-border+) (- cy +wm-titleh+ +wm-border+)
+            (+ cw (* 2 +wm-border+)) (+ +wm-titleh+ ch (* 2 +wm-border+))))))
+
+(defun wm-box-union (boxes)
+  "Bounding (x y w h) of BOXES, or NIL if empty."
+  (let ((x0 nil) (y0 nil) (x1 nil) (y1 nil))
+    (dolist (b (remove nil boxes))
+      (destructuring-bind (x y w h) b
+        (setf x0 (if x0 (min x0 x) x) y0 (if y0 (min y0 y) y)
+              x1 (if x1 (max x1 (+ x w)) (+ x w)) y1 (if y1 (max y1 (+ y h)) (+ y h)))))
+    (when x0 (list x0 y0 (- x1 x0) (- y1 y0)))))
 
 (defun wm-pos-x (obj) (if (wm-surface-p obj) (wm-surface-x obj) (glass-mirror-x obj)))
 (defun wm-pos-y (obj) (if (wm-surface-p obj) (wm-surface-y obj) (glass-mirror-y obj)))
@@ -399,7 +425,9 @@
        (destructuring-bind (obj mode . rest) (glass-port-drag port)
          (ecase mode
            (:move   (destructuring-bind (dx dy) rest
-                      (wm-move obj (- x dx) (- y dy)) (composite-all port)))
+                      (let ((old (wm-window-box obj)))     ; damage = old + new position
+                        (wm-move obj (- x dx) (- y dy))
+                        (composite-all port (wm-box-union (list old (wm-window-box obj)))))))
            (:resize (destructuring-bind (x0 y0 cw0 ch0) rest
                       (wm-resize port obj (+ cw0 (- x x0)) (+ ch0 (- y y0))) (composite-all port))))
          (unless down (setf (glass-port-drag port) nil))))
@@ -734,8 +762,11 @@
     ;; default); a static surface (image) reports NIL forever.  WM operations
     ;; (move/resize/menu/...) recomposite directly, so they're not gated here.
     (loop (sleep 1/30)
-          (let ((dirty nil))
+          (let ((boxes '()) (full nil))
             (dolist (s (glass-port-surfaces p))
-              (when (or (null (wm-surface-dirty-p s)) (funcall (wm-surface-dirty-p s)))
-                (setf dirty t)))
-            (when dirty (ignore-errors (composite-all p)))))))
+              (cond ((null (wm-surface-dirty-p s)) (setf full t))        ; unknown extent -> whole screen
+                    ((funcall (wm-surface-dirty-p s)) (push (wm-window-box s) boxes))))
+            (when (or full boxes)
+              ;; damage only the changed surface windows (a full-screen surface
+              ;; with no dirty-p forces a whole-screen recomposite)
+              (ignore-errors (composite-all p (unless full (wm-box-union boxes)))))))))
