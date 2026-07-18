@@ -488,6 +488,7 @@
     (list* "Apps" :submenu
            (remove nil
                    (list '("Tabbed Terminal" :tabterm)
+                         (wm-app-item "Calculator" '#:clim-demo.calculator "CALCULATOR-APP" :width 360 :height 320)
                          (wm-app-item "Gadget Demo" '#:clim-demo "GADGET-TEST" :width 380 :height 320)
                          (wm-app-item "Listener" '#:clim-listener "LISTENER" :width 720 :height 480)
                          '("Editor (Climacs)" :edit)
