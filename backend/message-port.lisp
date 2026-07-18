@@ -40,8 +40,10 @@
    a synchronous ask (send :create-window, await the id on our reply mailbox)."
   (or (gethash mirror (mp-win-ids port))
       (multiple-value-bind (w h) (image-wh image)
+        ;; owner = OUR mailbox: the compositor routes this window's input back here
         (sb-concurrency:send-message (mp-compositor port)
-          (list :create-window w h (glass-mirror-title mirror) (mp-reply port)))
+          (list :create-window w h (glass-mirror-title mirror) (mp-reply port)
+                (glass-port-mailbox port)))
         (setf (gethash mirror (mp-win-ids port))
               (sb-concurrency:receive-message (mp-reply port))))))
 

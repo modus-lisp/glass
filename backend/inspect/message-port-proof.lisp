@@ -38,7 +38,7 @@
     (let ((msg (sb-concurrency:receive-message (mockcomp-mbox mc))))
       (case (car msg)
         (:create-window
-         (destructuring-bind (w h title reply) (cdr msg) (declare (ignore w h title))
+         (destructuring-bind (w h title reply owner) (cdr msg) (declare (ignore w h title owner))
            (let ((id (incf (mockcomp-next mc))))
              (setf (gethash id (mockcomp-surfaces mc)) t)
              (sb-concurrency:send-message reply id))))

@@ -12,4 +12,5 @@
   :components ((:file "package")
                (:file "backend")
                (:file "message-port")
-               (:file "wm")))
+               (:file "wm")
+               (:file "compositor")))
