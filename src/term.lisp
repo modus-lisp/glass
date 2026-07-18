@@ -626,16 +626,22 @@
   (ignore-errors (close (terminal-pty tm))))
 
 (defun resize-terminal (tm cols rows)
-  "Resize the terminal to COLS x ROWS cells: fresh grid, resized fb, and a
-   TIOCSWINSZ (which SIGWINCHes the shell so it re-queries the size and redraws)."
+  "Resize the terminal to COLS x ROWS cells, PRESERVING the visible content
+   (top-left aligned, clipped to the smaller size); resize the fb and TIOCSWINSZ
+   (which SIGWINCHes the shell so it re-queries the size and redraws its line)."
   (setf cols (max 1 cols) rows (max 1 rows))
   (glass:with-fb-locked ((terminal-fb tm))
-    (setf (terminal-cols tm) cols (terminal-rows tm) rows
-          (terminal-cells tm) (make-grid cols rows)
-          (terminal-cx tm) (min (terminal-cx tm) (1- cols))
-          (terminal-cy tm) (min (terminal-cy tm) (1- rows))
-          (terminal-top tm) 0 (terminal-bot tm) (1- rows))
+    (let ((old (terminal-cells tm)) (ocols (terminal-cols tm)) (orows (terminal-rows tm))
+          (new (make-grid cols rows)))
+      (dotimes (y (min rows orows))                          ; carry over existing cells
+        (dotimes (x (min cols ocols))
+          (setf (aref new (+ (* y cols) x)) (aref old (+ (* y ocols) x)))))
+      (setf (terminal-cells tm) new (terminal-cols tm) cols (terminal-rows tm) rows
+            (terminal-cx tm) (min (terminal-cx tm) (1- cols))
+            (terminal-cy tm) (min (terminal-cy tm) (1- rows))
+            (terminal-top tm) 0 (terminal-bot tm) (1- rows)))
     (glass:fb-resize (terminal-fb tm) (* cols (terminal-cell-w tm)) (* rows (terminal-cell-h tm))))
+  (render tm)                                                ; show the preserved content now
   (set-winsize (terminal-pty tm) rows cols)
   (setf (terminal-dirty tm) t))
 
