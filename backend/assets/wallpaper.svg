@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="720" viewBox="0 0 1040 720">
+  <defs>
+    <radialGradient id="sky" cx="70%" cy="22%" r="100%">
+      <stop offset="0%" stop-color="#356b7d"/>
+      <stop offset="45%" stop-color="#20495c"/>
+      <stop offset="100%" stop-color="#0c1a26"/>
+    </radialGradient>
+  </defs>
+  <rect width="1040" height="720" fill="url(#sky)"/>
+  <!-- moon -->
+  <circle cx="815" cy="150" r="60" fill="#f4ecd2"/>
+  <circle cx="792" cy="134" r="60" fill="#20495c"/>
+  <!-- stars (opaque) -->
+  <circle cx="120" cy="90"  r="2.2" fill="#dfeaf0"/>
+  <circle cx="240" cy="150" r="1.6" fill="#cfe0e8"/>
+  <circle cx="360" cy="70"  r="2.0" fill="#eaf2f6"/>
+  <circle cx="520" cy="120" r="1.5" fill="#cfe0e8"/>
+  <circle cx="620" cy="60"  r="2.2" fill="#dfeaf0"/>
+  <circle cx="960" cy="90"  r="1.8" fill="#eaf2f6"/>
+  <circle cx="180" cy="230" r="1.5" fill="#cfe0e8"/>
+  <circle cx="440" cy="200" r="1.7" fill="#dfeaf0"/>
+  <!-- layered mountain ridges, far -> near, lighter -> darker -->
+  <polygon points="0,720 0,470 300,540 560,410 820,510 1040,395 1040,720" fill="#173d50"/>
+  <polygon points="0,720 0,575 340,635 700,525 1040,615 1040,720" fill="#0f2937"/>
+  <polygon points="0,720 0,655 400,700 780,620 1040,685 1040,720" fill="#081521"/>
+</svg>

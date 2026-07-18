@@ -128,8 +128,45 @@
     (wm-frame fb (wm-surface-x surf) (wm-surface-y surf) cw ch (wm-surface-deco* surf cw)
               (lambda () (blit-fb sfb (wm-surface-x surf) (wm-surface-y surf) fb)))))
 
+(defun wm-render-background (port path &key (mode :cover))
+  "Rasterise the image at PATH (any format weft decodes — PNG/JPEG/GIF/WebP/SVG)
+   into a screen-sized framebuffer for use as the desktop background.  MODE places
+   it: :cover (fill, centre-crop — default), :fit (whole image, teal letterbox),
+   :stretch (distort to fill), :center (1:1), or :tile.  For a crisp SVG, author
+   it at the screen size (it rasterises at its intrinsic size, then scales)."
+  (multiple-value-bind (iw ih samp) (%decode-image path)
+    (let* ((sw (glass-port-screen-w port)) (sh (glass-port-screen-h port))
+           (fb (glass:make-framebuffer sw sh +wm-teal+))
+           (px (glass:fb-pixels fb)))
+      (flet ((put (dx dy sx sy)
+               (multiple-value-bind (r g b a) (funcall samp (min (1- ih) (max 0 sy)) (min (1- iw) (max 0 sx)))
+                 (setf (aref px (+ (* dy sw) dx))
+                       (if (>= a 255) (glass:rgb r g b)
+                           (glass:rgb (round (+ (* r a) (* 61 (- 255 a))) 255)     ; over teal
+                                      (round (+ (* g a) (* 122 (- 255 a))) 255)
+                                      (round (+ (* b a) (* 138 (- 255 a))) 255)))))))
+        (ecase mode
+          (:stretch (dotimes (dy sh) (dotimes (dx sw) (put dx dy (floor (* dx iw) sw) (floor (* dy ih) sh)))))
+          (:tile    (dotimes (dy sh) (dotimes (dx sw) (put dx dy (mod dx iw) (mod dy ih)))))
+          ((:cover :fit :center)
+           (let* ((scale (case mode (:fit (min (/ sw iw) (/ sh ih))) (:center 1) (t (max (/ sw iw) (/ sh ih)))))
+                  (ox (/ (- sw (* iw scale)) 2)) (oy (/ (- sh (* ih scale)) 2)))
+             (dotimes (dy sh) (dotimes (dx sw)
+               (let ((sx (floor (- dx ox) scale)) (sy (floor (- dy oy) scale)))
+                 (when (and (<= 0 sx) (< sx iw) (<= 0 sy) (< sy ih)) (put dx dy sx sy)))))))))
+      fb)))
+
+(defun wm-set-background (port path &key (mode :cover))
+  "Set the desktop background to the image at PATH (NIL clears it -> flat teal)."
+  (setf (glass-port-bg port)
+        (and path (ignore-errors (wm-render-background port path :mode mode))))
+  (when (glass-port-fb port) (composite-all port))
+  (glass-port-bg port))
+
 (defun wm-composite (port fb)
-  (glass:fb-fill fb +wm-teal+)
+  (if (glass-port-bg port)
+      (blit-fb (glass-port-bg port) 0 0 fb)                    ; desktop wallpaper
+      (glass:fb-fill fb +wm-teal+))
   (dolist (mirror (reverse (glass-port-mirrors port)))        ; McCLIM windows (bottom-to-top)
     (if (glass-mirror-managed mirror) (wm-draw-window mirror fb) (blit-mirror mirror fb)))
   (dolist (surf (reverse (glass-port-surfaces port)))         ; surface windows, on top
@@ -559,18 +596,22 @@
                          (let ((img (wm-sample-image))) (and img (list "Image Viewer" :image img)))
                          '("Browse example.com" :browse "https://example.com")))))))
 
-(defun run-wm (specs &key (port 5900) (width 1000) (height 720) menu)
+(defun run-wm (specs &key (port 5900) (width 1000) (height 720) menu
+                          background (background-mode :cover))
   "Run a mini OPEN LOOK desktop over VNC.  Each spec is a decorated window:
    (FRAME-CLASS &key WIDTH HEIGHT) for a McCLIM app, or (:terminal &key COLS ROWS
    PPEM) for a shell terminal.  Right-click the workspace for a root menu; pass
    MENU — a list of (LABEL . SPEC) labelled window specs (same vocabulary as
    SPECS), or (LABEL . THUNK) for an arbitrary action — to override its items.
-   Serves on PORT."
+   BACKGROUND is a desktop-wallpaper image path (any format weft decodes, incl.
+   SVG), placed per BACKGROUND-MODE (:cover/:fit/:stretch/:center/:tile).  Serves
+   on PORT."
   (let ((p (find-glass-port :port port)))
     (setf (glass-port-wm-p p) t
           (glass-port-screen-w p) width (glass-port-screen-h p) height
           (glass-port-fb p) (glass:make-framebuffer width height +wm-teal+)
           (glass-port-menu-items p) (or menu (wm-default-menu)))
+    (when background (wm-set-background p background :mode background-mode))
     (start-glass-server p)
     (climi::restart-port p)                                   ; event-loop thread
     (dolist (spec specs)

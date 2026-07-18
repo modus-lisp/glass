@@ -34,7 +34,8 @@
    (surfaces :initform '() :accessor glass-port-surfaces)     ; non-McCLIM windows (e.g. terminals)
    (focus-surface :initform nil :accessor glass-port-focus-surface)  ; surface grabbing the keyboard
    (menu     :initform nil :accessor glass-port-menu)         ; open workspace root menu, or nil
-   (menu-items :initform '() :accessor glass-port-menu-items))  ; (label . thunk) list for the root menu
+   (menu-items :initform '() :accessor glass-port-menu-items)  ; (label . thunk) list for the root menu
+   (bg       :initform nil :accessor glass-port-bg))          ; desktop background framebuffer, or nil (flat teal)
   (:default-initargs :pointer (make-instance 'climi::standard-pointer)))
 
 (defun parse-glass-server-path (path) path)     ; plist tail becomes initargs
