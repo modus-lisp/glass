@@ -206,11 +206,21 @@
         (unless (and (= w (glass:fb-width fb)) (= h (glass:fb-height fb)))
           (glass:fb-resize fb w h))))))
 
+(defgeneric present-mirror (port mirror)
+  (:documentation
+   "Push MIRROR's freshly rendered image to the display — the ONE seam between
+    rendering (mcclim-render, per app) and the display (glass, shared).  The
+    default composites into the local framebuffer and serves it over RFB; a
+    MESSAGE-PORT overrides this to ship the pixels to a remote compositor over a
+    mailbox, which is the entire actor boundary.")
+  (:method ((port glass-port) mirror)
+    (when (glass-mirror-main mirror)
+      (ensure-fb-and-server port mirror)       ; main mirror creates the fb + starts the server
+      (sync-fb-size port mirror))
+    (composite-all port)))
+
 (defun %mirror-force-output (port mirror)
-  (when (glass-mirror-main mirror)
-    (ensure-fb-and-server port mirror)         ; main mirror creates the fb + starts the server
-    (sync-fb-size port mirror))
-  (composite-all port))
+  (present-mirror port mirror))
 
 (defmethod port-force-output ((port glass-port))
   (when-let* ((sheet (glass-port-top port))     ; drive through the main mirror so the server starts
