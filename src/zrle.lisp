@@ -102,14 +102,17 @@
         (setf i (zrle-tile buf i px fw (+ x tx) (+ y ty) tw th index palette))))
     (values buf i)))
 
-(defun write-rect-zrle (s fb x y w h zs)
+(defun write-rect-zrle (s fb x y w h zs &optional stored)
   "Write one ZRLE rectangle: header, then [u32 length][zlib data] over the
    per-client stream ZS (sync-flushed so the client can decode it immediately
-   while the compression window carries into the next rectangle)."
+   while the compression window carries into the next rectangle).  STORED emits
+   the zlib as stored DEFLATE blocks (no LZ77) — ~5x cheaper to encode a big
+   incompressible rect, at some ratio; still ordinary ZRLE on the wire, so any
+   client (e.g. TigerVNC, which won't negotiate TRLE) decodes it unchanged."
   (w-u16 s x) (w-u16 s y) (w-u16 s w) (w-u16 s h) (w-u32 s +enc-zrle+)
   (multiple-value-bind (buf len) (pack-rect fb x y w h)
     (cram:compress zs buf :end len)
-    (let ((z (cram:sync-flush zs)))
+    (let ((z (if stored (cram:sync-flush-stored zs) (cram:sync-flush zs))))
       (w-u32 s (length z))
       (w-bytes s z))))
 

@@ -136,6 +136,12 @@
   "Rects with at least this many pixels go out as TRLE (no zlib — ~200x cheaper to
    encode than ZRLE, only a little larger; the deflate cost isn't worth it on a
    fast link).  Smaller rects stay ZRLE (compression is ~free at that size).")
+(defparameter *zrle-stored-threshold* 16384
+  "Rects at least this big that go out as ZRLE (a client that DIDN'T negotiate TRLE,
+   e.g. TigerVNC) use STORED deflate blocks instead of a full LZ77 deflate: ~5x
+   cheaper to encode a big frame, at some ratio.  The right trade on a fast link;
+   raise it toward MOST-POSITIVE-FIXNUM to favour bandwidth over CPU on a slow one.
+   Small rects always take the normal (well-compressed, cheap-because-small) path.")
 
 (defun write-rect-copy (s dx dy w h sx sy)
   "A CopyRect rect: the client copies its own W x H pixels from (SX,SY) to (DX,DY)."
@@ -258,11 +264,16 @@
     (t                     (write-rect-raw s fb x y w h))))
 
 (defun emit-rect (s fb x y w h enc zs trle)
-  "Write one rect, upgrading ENC to TRLE for a large rect when the client can take
-   it (TRLE): no zlib, ~200x cheaper to encode; small rects keep ENC (ZRLE)."
-  (if (and trle (= enc +enc-zrle+) (>= (* w h) *trle-threshold*))
-      (write-rect-trle s fb x y w h)
-      (write-rect s fb x y w h enc zs)))
+  "Write one rect, choosing the cheapest encoding a large rect's client can take.
+   For a big ZRLE rect: TRLE if the client negotiated it (no zlib, ~200x cheaper),
+   else STORED-block ZRLE (~5x cheaper than full deflate, still ordinary ZRLE — the
+   path TigerVNC-class clients actually get).  Small rects take normal ENC."
+  (cond
+    ((and (= enc +enc-zrle+) (>= (* w h) *trle-threshold*) trle)
+     (write-rect-trle s fb x y w h))                       ; TRLE-capable client
+    ((and (= enc +enc-zrle+) (>= (* w h) *zrle-stored-threshold*))
+     (write-rect-zrle s fb x y w h zs t))                  ; big ZRLE: stored fast path
+    (t (write-rect s fb x y w h enc zs))))
 
 (defun send-rects (s fb rects enc zs &optional trle)
   "One FramebufferUpdate carrying RECTS.  ENC is the client's chosen encoding; ZS
