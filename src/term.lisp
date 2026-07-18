@@ -12,7 +12,8 @@
   (:export #:run #:make-terminal #:terminal #:terminal-fb #:on-key #:on-mouse #:start-pump
            #:terminal-take-dirty #:kill-terminal #:resize-terminal #:resize-terminal-px
            ;; tabbed terminal (multiple shells, a tab bar)
-           #:make-tabbed-terminal #:tabterm-fb #:tabterm-on-key #:tabterm-on-mouse #:tabterm-new))
+           #:make-tabbed-terminal #:tabterm-fb #:tabterm-on-key #:tabterm-on-mouse #:tabterm-new
+           #:tabterm-take-dirty #:tabterm-kill))
 (in-package #:glass-term)
 
 ;;; ---- palette (Tango 16-colour) ---------------------------------------------
@@ -667,7 +668,8 @@
 ;;; window like any other.  A render thread composites the tab bar and the active
 ;;; terminal's framebuffer; clicking a tab switches, clicking "+" opens a new one.
 
-(defstruct tabterm terminals (active 0) cols rows ppem cell-w cell-h (tab-h 22) fb (last-mask 0))
+(defstruct tabterm terminals (active 0) cols rows ppem cell-w cell-h (tab-h 22) fb (last-mask 0)
+  (alive t) (dirty t) (forced t))       ; render-thread alive?  fb changed for the WM?  force a redraw?
 
 (defun tabterm-active-term (tt) (nth (tabterm-active tt) (tabterm-terminals tt)))
 (defun tabterm-tabw (tt)
@@ -697,6 +699,22 @@
         (glass:fb-text fb (+ x (floor tabw 2) -4) 3 "+" :size 15 :color (glass:rgb 150 220 150)))
       (blit-image (terminal-fb (tabterm-active-term tt)) 0 th fb))))   ; active shell
 
+(defun tabterm-tick (tt)
+  "Re-render the tab window only when its active shell changed (or a switch forced
+   it) — so an idle tabbed terminal costs nothing.  Runs on the render thread."
+  (when (or (tabterm-forced tt) (terminal-take-dirty (tabterm-active-term tt)))
+    (setf (tabterm-forced tt) nil)
+    (tabterm-render tt)
+    (setf (tabterm-dirty tt) t)))
+
+(defun tabterm-take-dirty (tt)
+  (prog1 (tabterm-dirty tt) (setf (tabterm-dirty tt) nil)))
+
+(defun tabterm-kill (tt)
+  "Close the tabbed terminal: stop the render thread and SIGHUP every shell."
+  (setf (tabterm-alive tt) nil)
+  (dolist (tm (tabterm-terminals tt)) (ignore-errors (kill-terminal tm))))
+
 (defun tabterm-on-key (tt down keysym) (on-key (tabterm-active-term tt) down keysym))
 
 (defun tabterm-on-mouse (tt mask lx ly)
@@ -706,8 +724,8 @@
     (if (< ly th)                                            ; on the tab bar
         (when press
           (let ((n (length (tabterm-terminals tt))) (idx (floor lx (tabterm-tabw tt))))
-            (cond ((< idx n) (setf (tabterm-active tt) idx))
-                  ((= idx n) (tabterm-new tt)))))
+            (cond ((< idx n) (setf (tabterm-active tt) idx (tabterm-forced tt) t))
+                  ((= idx n) (tabterm-new tt) (setf (tabterm-forced tt) t)))))
         (on-mouse (tabterm-active-term tt) mask lx (- ly th)))))  ; forward to the active shell
 
 (defun make-tabbed-terminal (&key (cols 80) (rows 24) (ppem 14))
@@ -719,7 +737,8 @@
                            :cell-w cw :cell-h ch :tab-h tab-h
                            :fb (glass:make-framebuffer (* cols cw) (+ tab-h (* rows ch)) glass:+black+))))
     (start-pump term)
-    (sb-thread:make-thread (lambda () (loop (ignore-errors (tabterm-render tt)) (sleep 1/30)))
+    (sb-thread:make-thread (lambda () (loop while (tabterm-alive tt)
+                                            do (ignore-errors (tabterm-tick tt)) (sleep 1/30)))
                            :name "tabterm-render")
     tt))
 

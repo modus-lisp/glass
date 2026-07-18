@@ -414,7 +414,9 @@
       (make-wm-surface :fb (glass-term:tabterm-fb tt)
                        :x (+ 40 c) :y (+ 40 c +wm-titleh+) :title "terminal"
                        :on-key (lambda (down k) (glass-term:tabterm-on-key tt down k))
-                       :on-pointer (lambda (mask lx ly) (glass-term:tabterm-on-mouse tt mask lx ly))))))
+                       :on-pointer (lambda (mask lx ly) (glass-term:tabterm-on-mouse tt mask lx ly))
+                       :dirty-p (lambda () (glass-term:tabterm-take-dirty tt))
+                       :close-fn (lambda () (glass-term:tabterm-kill tt))))))
 
 (defun %loom-fn (pkg name)
   "The bound function named NAME in package PKG, or NIL — used to reach loom/glass
@@ -442,7 +444,8 @@
         (attach    (%loom-fn '#:loom.glass "ATTACH"))
         (onk       (%loom-fn '#:loom.glass "ON-KEY"))
         (onp       (%loom-fn '#:loom.glass "ON-POINTER"))
-        (pump      (%loom-fn '#:loom.glass "PUMP-LOOP")))
+        (pump      (%loom-fn '#:loom.glass "PUMP-LOOP"))
+        (stop      (%loom-fn '#:loom.glass "STOP")))
     (unless (and attach onk onp pump (or load-url load-file))
       (error "loom/glass not loaded — (ql:quickload :loom/glass)"))
     (let* ((u (string-downcase url))
@@ -459,7 +462,9 @@
               (make-wm-surface :fb fb :x (+ 40 c) :y (+ 40 c +wm-titleh+)
                                :title (or (and title-of (funcall title-of page)) "browser")
                                :on-key (lambda (down k) (funcall onk app down k))
-                               :on-pointer (lambda (mask lx ly) (funcall onp app mask lx ly))))
+                               :on-pointer (lambda (mask lx ly) (funcall onp app mask lx ly))
+                               ;; on close, stop weft's render pump (else it re-renders forever)
+                               :close-fn (and stop (lambda () (funcall stop app)))))
           (sb-thread:make-thread (lambda () (funcall pump app)) :name "wm-browse-pump"))))))
 
 (defun %read-file-bytes (path)
