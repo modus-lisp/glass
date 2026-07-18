@@ -303,6 +303,7 @@
   (snap-box (list nil)) (zs (cram:make-zstream))
   last-size                     ; (cons w h) — fb size last announced to this client
   (want nil)                    ; latest pending request (inc x y w h), or NIL
+  (last-gen -1)                 ; fb generation this client has already caught up to
   (running t)
   (lock (sb-thread:make-mutex :name "rfb-client")))
 
@@ -339,14 +340,21 @@
    poll at ~60 Hz.  Runs in its own thread; exits when the client stops running."
   (loop while (rc-running client) do
     (let ((req (sb-thread:with-mutex ((rc-lock client)) (rc-want client))))
-      (if (null req)
-          (sleep 1/60)
-          (let ((sent (handler-case (send-update client fb s req)
+      (cond
+        ((null req) (sleep 1/60))
+        ;; incremental request, but the fb hasn't changed since we last caught up:
+        ;; nothing to do — skip the (whole-frame) diff entirely and just poll.
+        ((and (plusp (first req)) (= (fb-generation fb) (rc-last-gen client)))
+         (sleep 1/60))
+        (t
+         (let* ((gen (fb-generation fb))
+                (sent (handler-case (send-update client fb s req)
                         (error () (setf (rc-running client) nil) nil))))
-            (if sent
-                (sb-thread:with-mutex ((rc-lock client))
-                  (when (eq (rc-want client) req) (setf (rc-want client) nil)))
-                (sleep 1/60)))))))          ; nothing dirty yet — keep REQ, poll again
+           (setf (rc-last-gen client) gen)      ; caught up to GEN whether or not anything shipped
+           (if sent
+               (sb-thread:with-mutex ((rc-lock client))
+                 (when (eq (rc-want client) req) (setf (rc-want client) nil)))
+               (sleep 1/60))))))))          ; nothing dirty (gen bumped, pixels same) — keep REQ, poll
 
 (defun choose-encoding (encs)
   "Pick the best encoding we implement from the client's advertised list.  ZRLE

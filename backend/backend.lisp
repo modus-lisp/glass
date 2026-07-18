@@ -183,7 +183,8 @@
           (wm-composite port fb)
           ;; mirrors is newest-first; composite oldest (main) first so newer are on top
           (dolist (mirror (reverse (glass-port-mirrors port)))
-            (blit-mirror mirror fb))))))
+            (blit-mirror mirror fb)))
+      (glass:fb-touch fb))))              ; content changed -> the sender should re-scan
 
 (defun sync-fb-size (port mirror)
   "Keep the framebuffer the same size as the MAIN frame's image; on a change the

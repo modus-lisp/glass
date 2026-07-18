@@ -33,7 +33,15 @@
   ;; Guards the (width height pixels) triple against a RESIZE racing a reader.
   ;; Per-pixel content races are benign (a stale read is re-sent next update);
   ;; only the array swap needs protecting, so readers grab this only to snapshot.
-  (lock (%fb-make-lock)))
+  (lock (%fb-make-lock))
+  ;; Content version: a writer bumps it via FB-TOUCH so a reader (the RFB sender)
+  ;; can cheaply tell "nothing changed since I last looked" and skip a full diff.
+  (generation 0))
+
+(defun fb-touch (fb)
+  "Mark FB's contents as changed (bumps its generation).  Writers call this after
+   drawing so the RFB sender knows to re-scan; an untouched fb is diff-free."
+  (setf (fb-generation fb) (logand (1+ (fb-generation fb)) most-positive-fixnum)))
 
 #+sb-thread (defmacro with-fb-locked ((fb) &body body)
               ;; recursive: fb-resize (which locks) may be called inside a held
@@ -56,7 +64,8 @@
       (setf (fb-pixels fb) (make-array (* width height) :element-type '(unsigned-byte 32)
                                                         :initial-element (logand fill #xffffff))
             (fb-width fb) width
-            (fb-height fb) height)))
+            (fb-height fb) height)
+      (fb-touch fb)))
   fb)
 
 (declaim (inline %in-bounds fb-put fb-get))
@@ -66,7 +75,8 @@
 (defun fb-put (fb x y color)
   "Set pixel (X,Y) to COLOR (no-op if out of bounds)."
   (when (%in-bounds fb x y)
-    (setf (aref (fb-pixels fb) (+ (* y (fb-width fb)) x)) (logand color #xffffff)))
+    (setf (aref (fb-pixels fb) (+ (* y (fb-width fb)) x)) (logand color #xffffff))
+    (fb-touch fb))
   color)
 
 (defun fb-get (fb x y)
@@ -76,6 +86,7 @@
 (defun fb-fill (fb color)
   "Clear the whole framebuffer to COLOR."
   (fill (fb-pixels fb) (logand color #xffffff))
+  (fb-touch fb)
   color)
 
 (defun fb-rect (fb x y w h color)
@@ -87,6 +98,7 @@
     (loop for yy from y0 below y1
           for row = (* yy fw)
           do (loop for xx from x0 below x1 do (setf (aref px (+ row xx)) c))))
+  (fb-touch fb)
   fb)
 
 (defun fb-hline (fb x y w color) (fb-rect fb x y w 1 color))

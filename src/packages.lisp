@@ -12,7 +12,7 @@
   (:export
    ;; framebuffer
    #:make-framebuffer #:framebuffer #:framebuffer-p
-   #:fb-width #:fb-height #:fb-pixels #:fb-resize #:with-fb-locked
+   #:fb-width #:fb-height #:fb-pixels #:fb-resize #:with-fb-locked #:fb-generation #:fb-touch
    #:fb-put #:fb-get #:fb-fill #:fb-rect #:fb-hline #:fb-vline #:fb-frame #:fb-blit
    #:rgb #:+black+ #:+white+ #:+red+ #:+green+ #:+blue+
    ;; text (the :glass/text system; scribe-backed)
