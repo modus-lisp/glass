@@ -373,30 +373,58 @@
                                :on-pointer (lambda (mask lx ly) (funcall onp app mask lx ly))))
           (sb-thread:make-thread (lambda () (funcall pump app)) :name "wm-browse-pump"))))))
 
+(defun %read-file-bytes (path)
+  (with-open-file (s path :element-type '(unsigned-byte 8))
+    (let ((b (make-array (file-length s) :element-type '(unsigned-byte 8))))
+      (read-sequence b s) b)))
+
+(defun %decode-image (path)
+  "Decode PATH to (values W H SAMPLER), where SAMPLER is (fn Y X) -> (values R G B
+   A).  Prefers weft's pure-CL decoder (part of our own stack — PNG/JPEG/GIF/WebP/
+   SVG), falling back to opticl.  Both are OPTIONAL runtime deps, resolved by name."
+  (let ((wdec (%loom-fn '#:weft.render "DECODE-IMAGE-BYTES")))
+    (cond
+      (wdec                                              ; --- weft (preferred) ---
+       (let ((img (funcall wdec (%read-file-bytes path))))
+         (unless img (error "weft could not decode ~a" path))
+         (let ((w (funcall (%loom-fn '#:weft.render "IMG-W") img))
+               (h (funcall (%loom-fn '#:weft.render "IMG-H") img))
+               (rgba (funcall (%loom-fn '#:weft.render "IMG-RGBA") img)))  ; w*h*4 straight-alpha
+           (values w h (lambda (y x)
+                         (let ((o (* (+ (* y w) x) 4)))
+                           (values (aref rgba o) (aref rgba (+ o 1)) (aref rgba (+ o 2)) (aref rgba (+ o 3)))))))))
+      (t                                                 ; --- opticl (fallback) ---
+       (let ((oread (%loom-fn '#:opticl "READ-IMAGE-FILE")))
+         (unless oread (error "no image decoder — (ql:quickload :weft/render) or :opticl"))
+         (let* ((img (funcall oread path)) (dims (array-dimensions img))
+                (ih (first dims)) (iw (second dims)) (ch (if (cddr dims) (third dims) 1))
+                (p16 (equal (array-element-type img) '(unsigned-byte 16))))
+           (values iw ih
+                   (lambda (y x)
+                     (flet ((c (k) (let ((v (if (= ch 1) (aref img y x) (aref img y x k)))) (if p16 (ash v -8) v))))
+                       (if (= ch 1) (let ((v (c 0))) (values v v v 255))
+                           (values (c 0) (c 1) (c 2) (if (>= ch 4) (c 3) 255))))))))))))
+
 (defun wm-add-image (port path &key (max-w 960) (max-h 660))
-  "Open the image file at PATH as a WM surface window — decoded by opticl into a
-   glass framebuffer (RGB/RGBA/grey, 8/16-bit), scaled down to fit MAX-W x MAX-H.
-   opticl is an OPTIONAL runtime dependency, resolved by name."
-  (let ((read-fn (%loom-fn '#:opticl "READ-IMAGE-FILE")))
-    (unless read-fn (error "opticl not loaded — (ql:quickload :opticl)"))
-    (let* ((img (funcall read-fn path))
-           (dims (array-dimensions img))
-           (ih (first dims)) (iw (second dims))
-           (ch (if (cddr dims) (third dims) 1))
-           (p16 (equal (array-element-type img) '(unsigned-byte 16)))
-           (scale (min 1 (/ max-w iw) (/ max-h ih)))
+  "Open the image file at PATH as a WM surface window — decoded (weft, else opticl)
+   into a glass framebuffer, nearest-neighbour scaled to fit MAX-W x MAX-H, with
+   any alpha composited over the dark window background."
+  (multiple-value-bind (iw ih samp) (%decode-image path)
+    (let* ((scale (min 1 (/ max-w iw) (/ max-h ih)))
            (ow (max 1 (floor (* iw scale)))) (oh (max 1 (floor (* ih scale))))
-           (fb (glass:make-framebuffer ow oh (glass:rgb 24 24 24)))
+           (bg 24)
+           (fb (glass:make-framebuffer ow oh (glass:rgb bg bg bg)))
            (px (glass:fb-pixels fb)))
-      (flet ((chan (sy sx k) (let ((v (if (= ch 1) (aref img sy sx) (aref img sy sx k))))
-                               (if p16 (ash v -8) v))))
-        (dotimes (oy oh)                                   ; nearest-neighbour scale
-          (let ((sy (min (1- ih) (floor (* oy ih) oh))) (row (* oy ow)))
-            (dotimes (ox ow)
-              (let ((sx (min (1- iw) (floor (* ox iw) ow))))
+      (dotimes (oy oh)                                   ; nearest-neighbour scale
+        (let ((sy (min (1- ih) (floor (* oy ih) oh))) (row (* oy ow)))
+          (dotimes (ox ow)
+            (let ((sx (min (1- iw) (floor (* ox iw) ow))))
+              (multiple-value-bind (r g b a) (funcall samp sy sx)
                 (setf (aref px (+ row ox))
-                      (if (= ch 1) (let ((v (chan sy sx 0))) (glass:rgb v v v))
-                          (glass:rgb (chan sy sx 0) (chan sy sx 1) (chan sy sx 2)))))))))
+                      (if (>= a 255) (glass:rgb r g b)
+                          (glass:rgb (round (+ (* r a) (* bg (- 255 a))) 255)
+                                     (round (+ (* g a) (* bg (- 255 a))) 255)
+                                     (round (+ (* b a) (* bg (- 255 a))) 255)))))))))
       (let ((c (glass-port-cascade port)))
         (wm-add-surface* port
           (make-wm-surface :fb fb :x (+ 40 c) :y (+ 40 c +wm-titleh+)
@@ -477,7 +505,7 @@
 ;;;   (:debug FORM)                     evaluate FORM under the CLIM debugger
 ;;;   (:edit &optional FILE)            Climacs, the McCLIM editor
 ;;;   (:browse URL &key width height)   a loom/weft browser window
-;;;   (:image PATH &key max-w max-h)    an image file, decoded by opticl
+;;;   (:image PATH &key max-w max-h)    an image (weft's decoder, else opticl)
 ;;;   (FRAME-CLASS &key width height)   any McCLIM application frame
 (defun wm-spawn-spec (port spec)
   (case (car spec)
