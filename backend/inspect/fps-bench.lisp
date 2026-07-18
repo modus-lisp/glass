@@ -27,7 +27,7 @@
   (rn s 12) (write-sequence (map 'vector #'char-code "RFB 003.008") s) (w8 s 10) (force-output s)
   (let ((n (r8 s))) (rn s n)) (w8 s 1) (force-output s) (r32 s) (w8 s 1) (force-output s)
   (let ((w (r16 s)) (h (r16 s))) (rn s 16) (let ((nl (r32 s))) (rn s nl))
-    (w8 s 2) (w8 s 0) (w16 s 2) (w32 s 16) (w32 s 0) (force-output s) (values w h)))  ; encodings: ZRLE, Raw
+    (w8 s 2) (w8 s 0) (w16 s 3) (w32 s 16) (w32 s 1) (w32 s 0) (force-output s) (values w h)))  ; encodings: ZRLE, Raw
 (defun req (s w h inc) (w8 s 3) (w8 s inc) (w16 s 0) (w16 s 0) (w16 s w) (w16 s h) (force-output s))
 (defun pull (s)                              ; read one FramebufferUpdate; return bytes of rect data
   (let ((mt (r8 s))) (declare (ignore mt)) (r8 s)
@@ -36,6 +36,7 @@
         (let ((x (r16 s)) (y (r16 s)) (w (r16 s)) (h (r16 s)) (enc (r32 s)))
           (declare (ignore x y))
           (cond ((= enc 16) (let ((len (r32 s))) (rn s len) (incf bytes len)))     ; ZRLE: skip by length
+                ((= enc 1)  (r16 s) (r16 s))  ; CopyRect: src-x src-y, no pixel data
                 ((= enc 0)  (rn s (* w h 4)) (incf bytes (* w h 4)))                ; Raw
                 (t (error "unexpected enc ~x" enc)))))
       bytes)))
@@ -62,12 +63,13 @@
              (ty (- (clim-glass::wm-surface-y surf) 11))
              (t0 (secs)) (frames 0) (dir 1) (px tx))
         (ptr s 1 tx ty) (force-output s)       ; grab the title bar
-        (loop while (< (- (secs) t0) 3.0) do
-          (incf px (* dir 6)) (when (or (> px (+ tx 240)) (< px tx)) (setf dir (- dir)))
-          (ptr s 1 px ty)                      ; a drag step -> composite
-          (req s w h 1) (pull s) (incf frames))
-        (ptr s 0 px ty) (force-output s)
-        (format t "DRAG (window move):     ~,1f fps~%" (/ frames (- (secs) t0))))
+        (let ((bytes 0))
+          (loop while (< (- (secs) t0) 3.0) do
+            (incf px (* dir 6)) (when (or (> px (+ tx 240)) (< px tx)) (setf dir (- dir)))
+            (ptr s 1 px ty)                      ; a drag step -> composite
+            (req s w h 1) (incf bytes (pull s)) (incf frames))
+          (ptr s 0 px ty) (force-output s)
+          (format t "DRAG (window move):     ~,1f fps  (~,2f KB/frame)~%" (/ frames (- (secs) t0)) (/ bytes (max 1 frames) 1024.0))))
 
       ;; --- Scenario 2: a flooding terminal (heavy content churn) ---
       (ptr s 0 300 300) (ptr s 1 300 300) (ptr s 0 300 300) (sleep 0.1)   ; focus the terminal

@@ -175,11 +175,12 @@
                     (when (< -1 fx fw)
                       (setf (aref dpx (+ frow fx)) (logand (aref arr iy ix) #x00ffffff)))))))))))))
 
-(defun composite-all (port &optional damage)
+(defun composite-all (port &optional damage copy)
   "Redraw the desktop.  DAMAGE = (x y w h) confines the redraw (and the RFB
    sender's diff) to that rectangle — the compositor already knows what changed,
    so an idle move/blink doesn't rebuild + re-diff the whole 1280x800.  NIL means
-   the whole screen (menus, resize, McCLIM updates, first paint)."
+   the whole screen (menus, resize, McCLIM updates, first paint).  COPY = (sx sy
+   dx dy w h) marks a window MOVE so the sender can CopyRect it (near-free drag)."
   (when-let ((fb (glass-port-fb port)))
     (glass:with-fb-locked (fb)
       (flet ((paint ()
@@ -190,7 +191,7 @@
         (if (and damage (glass-port-wm-p port))
             (destructuring-bind (dx dy dw dh) damage
               (glass:with-fb-clip (fb dx dy dw dh) (paint))
-              (glass:fb-mark-frame fb (list dx dy (+ dx dw) (+ dy dh))))
+              (glass:fb-mark-frame fb (list dx dy (+ dx dw) (+ dy dh)) copy))
             (progn (paint) (glass:fb-mark-frame fb :full))))
       (glass:fb-touch fb))                ; content changed -> the sender should re-scan
     (glass:wake-signal (glass-port-wake port))))   ; …and wake it now, don't wait for its poll

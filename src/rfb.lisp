@@ -128,8 +128,34 @@
 ;;; ---- encodings --------------------------------------------------------------
 
 (defconstant +enc-raw+ 0)
+(defconstant +enc-copyrect+ 1)  ; "copy this rect from elsewhere in the fb" — no pixel data
 (defconstant +enc-hextile+ 5)
 (defconstant +enc-zrle+ 16)     ; encoder in zrle.lisp (loaded after this file)
+
+(defun write-rect-copy (s dx dy w h sx sy)
+  "A CopyRect rect: the client copies its own W x H pixels from (SX,SY) to (DX,DY)."
+  (w-u16 s dx) (w-u16 s dy) (w-u16 s w) (w-u16 s h) (w-u32 s +enc-copyrect+)
+  (w-u16 s sx) (w-u16 s sy))
+
+(defun copy-in-bounds-p (copy fb)
+  "True when both the source and destination of COPY lie fully within FB (so a
+   CopyRect references only pixels the client actually has)."
+  (destructuring-bind (sx sy dx dy w h) copy
+    (let ((fw (fb-width fb)) (fh (fb-height fb)))
+      (and (<= 0 sx) (<= 0 sy) (<= (+ sx w) fw) (<= (+ sy h) fh)
+           (<= 0 dx) (<= 0 dy) (<= (+ dx w) fw) (<= (+ dy h) fh)))))
+
+(defun snapshot-move (snap fbw sx sy dx dy w h)
+  "Apply a window move to the client's snapshot: copy the W x H block at (SX,SY)
+   to (DX,DY) (via a temp, so overlapping src/dst is safe) — so the subsequent
+   diff only re-sends the EXPOSED area, not the moved (CopyRect'd) window."
+  (let ((tmp (make-array (* w h) :element-type '(unsigned-byte 32))))
+    (dotimes (yy h)
+      (let ((src (+ (* (+ sy yy) fbw) sx)))
+        (replace tmp snap :start1 (* yy w) :start2 src :end2 (+ src w))))
+    (dotimes (yy h)
+      (let ((dst (+ (* (+ dy yy) fbw) dx)))
+        (replace snap tmp :start1 dst :end1 (+ dst w) :start2 (* yy w))))))
 
 (defun write-rect-raw (s fb x y w h)
   (w-u16 s x) (w-u16 s y) (w-u16 s w) (w-u16 s h) (w-u32 s +enc-raw+)
@@ -306,7 +332,7 @@
 ;;; Request in WANT; the sender fulfils it the moment the fb has something to show
 ;;; (polling ~60 Hz).  ONLY the sender writes pixels to the socket.
 (defstruct (rfb-client (:conc-name rc-))
-  (enc +enc-raw+) dss cursor cursor-sent
+  (enc +enc-raw+) dss cursor cursor-sent copyrect
   (snap-box (list nil)) (zs (cram:make-zstream))
   last-size                     ; (cons w h) — fb size last announced to this client
   (want nil)                    ; latest pending request (inc x y w h), or NIL
@@ -315,10 +341,12 @@
   (running t)
   (lock (sb-thread:make-mutex :name "rfb-client")))
 
-(defun send-update (client fb s req region)
+(defun send-update (client fb s req region copy)
   "Fulfil one FramebufferUpdateRequest REQ = (inc x y w h).  REGION ((x0 y0 x1 y1)
    or :FULL) confines an incremental diff to what the compositor just changed.
-   Returns T if bytes were written, NIL if there was nothing to send."
+   COPY = (sx sy dx dy w h) means a window moved: emit a CopyRect + only the
+   exposed area, instead of re-encoding the moved pixels.  Returns T if bytes
+   were written, NIL if there was nothing to send."
   (destructuring-bind (inc x y w h) req
     (when (and (rc-cursor client) (not (rc-cursor-sent client)))     ; cursor shape, once
       (send-cursor s) (setf (rc-cursor-sent client) t))
@@ -339,6 +367,18 @@
             (let ((snap (car snap-box)))
               (cond
                 ((not (snap-matches-p snap fb)) (setf (car snap-box) nil) nil)  ; resized; resync
+                ;; a window MOVE and the client can CopyRect: copy the moved block
+                ;; in the snapshot, then diff only leaves the EXPOSED area to send.
+                ((and copy (rc-copyrect client) (copy-in-bounds-p copy fb))
+                 (destructuring-bind (sx sy dx dy w h) copy
+                   (snapshot-move snap (fb-width fb) sx sy dx dy w h)
+                   (let ((rects (dirty-rects fb snap (and (consp region) region))))
+                     (w-u8 s 0) (w-u8 s 0) (w-u16 s (1+ (length rects)))    ; #rects = CopyRect + exposed
+                     (write-rect-copy s dx dy w h sx sy)
+                     (dolist (r rects) (destructuring-bind (rx ry rw rh) r (write-rect s fb rx ry rw rh enc zs)))
+                     (force-output s)
+                     (update-snapshot fb snap rects)
+                     t)))
                 (t (let ((rects (dirty-rects fb snap (and (consp region) region))))
                      (when rects (send-rects s fb rects enc zs) (update-snapshot fb snap rects))
                      (and rects t))))))))))
@@ -372,14 +412,13 @@
          (wake-wait wake 1/60))
         (t
          (let* ((gen (fb-generation fb)) (frame (fb-frameno fb))
-                ;; if we saw the immediately-previous composite and it recorded a
-                ;; damage box, diff ONLY that box — the compositor already knows
-                ;; what changed, so don't re-scan the whole screen.  Otherwise full.
-                (region (if (and (plusp (first req))
-                                 (eql (rc-last-frame client) (1- frame))
-                                 (consp (fb-damage fb)))
-                            (fb-damage fb) :full))
-                (sent (handler-case (send-update client fb s req region)
+                ;; if we saw the immediately-previous composite, trust its recorded
+                ;; DAMAGE box (diff only that) and its COPY hint (a window move ->
+                ;; CopyRect); else full diff, no copy.  The compositor already knows.
+                (caught-up (and (plusp (first req)) (eql (rc-last-frame client) (1- frame))))
+                (region (if (and caught-up (consp (fb-damage fb))) (fb-damage fb) :full))
+                (copy   (and caught-up (fb-copy fb)))
+                (sent (handler-case (send-update client fb s req region copy)
                         (error () (setf (rc-running client) nil) nil))))
            (setf (rc-last-gen client) gen (rc-last-frame client) frame)
            (if sent
@@ -413,7 +452,8 @@
                       (setf (rc-enc client) (choose-encoding encs)
                             (rc-dss client) (or (member +pseudo-desktop-size+ encs)
                                                 (member +pseudo-extended-desktop-size+ encs))
-                            (rc-cursor client) (and (member +pseudo-cursor+ encs) t)))))
+                            (rc-cursor client) (and (member +pseudo-cursor+ encs) t)
+                            (rc-copyrect client) (and (member +enc-copyrect+ encs) t)))))
                (3 (let ((inc (r-u8 s)) (x (r-u16 s)) (y (r-u16 s)) (w (r-u16 s)) (h (r-u16 s)))
                     (sb-thread:with-mutex ((rc-lock client))   ; park the latest request
                       (setf (rc-want client) (list inc x y w h)))

@@ -45,17 +45,21 @@
   ;; screen — the "we're the compositor, we already know what changed" shortcut.
   ;; (Named FRAMENO, not FRAME: FB-FRAME is already the rectangle-outline drawer.)
   (frameno 0)
-  (damage nil))                         ; (x0 y0 x1 y1) of the last frame, or :FULL
+  (damage nil)                          ; (x0 y0 x1 y1) of the last frame, or :FULL
+  (copy nil))                           ; a move: (src-x src-y dst-x dst-y w h) -> RFB CopyRect
 
 (defun fb-touch (fb)
   "Mark FB's contents as changed (bumps its generation).  Writers call this after
    drawing so the RFB sender knows to re-scan; an untouched fb is diff-free."
   (setf (fb-generation fb) (logand (1+ (fb-generation fb)) most-positive-fixnum)))
 
-(defun fb-mark-frame (fb damage)
-  "Record that a composite just changed region DAMAGE ((x0 y0 x1 y1) or :FULL) and
-   advance the frame counter, so a sender one frame behind can diff only DAMAGE."
+(defun fb-mark-frame (fb damage &optional copy)
+  "Record that a composite just changed region DAMAGE ((x0 y0 x1 y1) or :FULL) and,
+   if it was a window MOVE, COPY = (src-x src-y dst-x dst-y w h) so the sender can
+   emit a CopyRect instead of re-encoding the moved pixels.  Advances the frame
+   counter, so a sender one frame behind can diff only DAMAGE (and trust COPY)."
   (setf (fb-damage fb) damage
+        (fb-copy fb) copy
         (fb-frameno fb) (logand (1+ (fb-frameno fb)) most-positive-fixnum)))
 
 (defun %clip-intersect (clip x0 y0 x1 y1)

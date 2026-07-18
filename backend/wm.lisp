@@ -425,9 +425,14 @@
        (destructuring-bind (obj mode . rest) (glass-port-drag port)
          (ecase mode
            (:move   (destructuring-bind (dx dy) rest
-                      (let ((old (wm-window-box obj)))     ; damage = old + new position
+                      (let ((old (wm-window-box obj)))     ; damage = old + new; copy = old -> new
                         (wm-move obj (- x dx) (- y dy))
-                        (composite-all port (wm-box-union (list old (wm-window-box obj)))))))
+                        (let ((new (wm-window-box obj)))
+                          (composite-all
+                           port (wm-box-union (list old new))
+                           (when (and old new)             ; a move: CopyRect the window pixels
+                             (list (first old) (second old) (first new) (second new)
+                                   (third old) (fourth old))))))))
            (:resize (destructuring-bind (x0 y0 cw0 ch0) rest
                       (wm-resize port obj (+ cw0 (- x x0)) (+ ch0 (- y y0))) (composite-all port))))
          (unless down (setf (glass-port-drag port) nil))))
