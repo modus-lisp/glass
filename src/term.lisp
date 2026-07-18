@@ -560,6 +560,25 @@
                   (* (sb-alien:array sb-alien:unsigned-short 4))))
       (sb-sys:fd-stream-fd stream) #x5414 (sb-alien:addr ws)))))
 
+(defun enable-echo (stream)
+  "Turn ECHO on for the pty.  SBCL's :pty t leaves the line discipline in -echo
+   (so a pty *driver* isn't shown its own writes), which means a shell reading in
+   canonical mode never echoes your keystrokes — you type blind, the command runs
+   but the command line never appears.  TCGETS, set the ECHO bit (0x08) in c_lflag
+   (Linux struct termios: c_iflag/oflag/cflag/lflag are 4-byte fields, so c_lflag
+   is at byte 12, little-endian), TCSETS.  Best-effort; Linux-only."
+  (ignore-errors
+   (sb-alien:with-alien ((tio (sb-alien:array sb-alien:unsigned-char 64)))
+     (let ((fd (sb-sys:fd-stream-fd stream)))
+       (flet ((tio (req) (sb-alien:alien-funcall
+                          (sb-alien:extern-alien "ioctl"
+                            (function sb-alien:int sb-alien:int sb-alien:unsigned-long
+                                      (* (sb-alien:array sb-alien:unsigned-char 64))))
+                          fd req (sb-alien:addr tio))))
+         (when (zerop (tio #x5401))                                  ; TCGETS
+           (setf (sb-alien:deref tio 12) (logior (sb-alien:deref tio 12) #x08))   ; c_lflag |= ECHO
+           (tio #x5402)))))))                                        ; TCSETS
+
 ;; Colour emoji come from scribe's bundled COLR fallback (Twemoji) by default;
 ;; :emoji-font is an optional override (a path to another COLR font).
 (defun load-emoji-font (&optional path)
@@ -588,6 +607,7 @@
                             :cell-w cell-w :cell-h cell-h :ascent asc
                             :fb (glass:make-framebuffer (* cols cell-w) (* rows cell-h) glass:+black+))))
     (set-winsize pty rows cols)
+    (enable-echo pty)                       ; SBCL's pty comes up -echo; the shell needs it on
     tm))
 
 (defun pump (tm)
