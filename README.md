@@ -106,9 +106,20 @@ See [backend/README](backend/README.md).
 
 ZRLE's run-length subencodings (plain/palette RLE) and the Tight encoding; a
 client's format request (`SetPixelFormat`) is read but not honored (we always
-serve X8R8G8B8); VNC authentication completes the challenge/response but does not
-*verify* the password (any password is accepted — the same open posture as
-`None`; real enforcement needs a DES verify). Contributions welcome.
+serve X8R8G8B8). Contributions welcome.
+
+### Authentication
+
+By default the server is **open** on its LAN: 3.7+ clients (TigerVNC) get `None`
+(no prompt), and RFB 3.3 clients that insist on a security type — macOS Screen
+Sharing — get VNC authentication with **any password accepted** (macOS refuses
+`None` on 3.3, so this is the minimum that lets it connect). To actually **require
+a password**, set `glass:*vnc-password*` to a string (or, for the desktop, put it
+in `~/.glass-vnc-pass`): every client must then present it, DES-verified (the DES
+lives in [seal](https://github.com/modus-lisp/seal); load the optional
+`:glass/vncauth` system to enable enforcement — a set password with the verifier
+absent fails closed). macOS saves a working password to its Keychain and stops
+prompting.
 
 ## Build & test
 
