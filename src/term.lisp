@@ -74,7 +74,7 @@
   (saved-cx 0) (saved-cy 0)
   (pstate :ground) (params nil) (pcur nil) (ppriv nil)   ; ANSI parser state
   pty proc                              ; the shell
-  fb font emoji-font ppem cell-w cell-h ascent   ; rendering (+ optional colour-emoji font)
+  fb font nerd-font emoji-font ppem cell-w cell-h ascent   ; rendering (mono primary + Nerd symbols + optional colour-emoji)
   (glyphs (make-hash-table))            ; char-code -> rendered glyph (:mono/:color ...)
   (ctrl nil)                            ; keyboard: control held?
   (u8-need 0) (u8-cp 0)                 ; UTF-8 decoder state (bytes remaining, accumulator)
@@ -432,11 +432,14 @@
   "Render CODE: colour (COLR emoji) -> (:color rgb alpha w h left top adv), else
    monochrome coverage -> (:mono cov w h left top adv), picking the primary mono
    font, a colour-emoji font, or a scribe script fallback as appropriate."
-  (let ((primary (terminal-font tm)) (ppem (terminal-ppem tm)) (ef (terminal-emoji-font tm)))
+  (let ((primary (terminal-font tm)) (ppem (terminal-ppem tm))
+        (ef (terminal-emoji-font tm)) (nerd (terminal-nerd-font tm)))
     (cond
       ((scribe:font-covers-p primary code)
        (list* :mono (multiple-value-list
                      (scribe:rasterize-glyph primary (scribe:font-glyph-index primary code) ppem))))
+      ((and nerd (scribe:font-covers-p nerd code))     ; Nerd Font symbols: powerline, dev icons, etc.
+       (nerd-glyph nerd code ppem (terminal-cell-w tm) (terminal-cell-h tm)))
       ((and ef (let ((g (scribe:font-glyph-index ef code))) (and g (plusp g) (scribe:color-glyph-p ef g))))
        (list* :color (multiple-value-list
                       (scribe:rasterize-color-glyph ef (scribe:font-glyph-index ef code) ppem))))
@@ -445,6 +448,18 @@
            (if (and g (plusp g) (scribe:color-glyph-p f g))   ; scribe's emoji fallback is now COLR
                (list* :color (multiple-value-list (scribe:rasterize-color-glyph f g ppem)))
                (list* :mono (multiple-value-list (scribe:rasterize-glyph f g ppem)))))))))
+
+(defun nerd-glyph (nerd code ppem cw ch)
+  "Rasterise a Nerd symbol scaled to FIT the cell and return a :SYM glyph whose
+   offsets CENTRE it — Nerd symbols are icons (powerline, dev/UI glyphs), not
+   baseline text, and their font is sized to a full-em cell that's wider than a
+   narrow mono cell, so drawn at the text ppem they'd overflow and get clipped."
+  (let ((g (scribe:font-glyph-index nerd code)))
+    (multiple-value-bind (cov gw gh) (scribe:rasterize-glyph nerd g (max 6 (min ppem cw)))
+      (when (or (> gw cw) (> gh ch))                    ; ink overhangs the cell -> shrink to fit
+        (let ((np2 (max 4 (floor (* (min ppem cw) (min (/ cw (max 1 gw)) (/ ch (max 1 gh))))))))
+          (multiple-value-setq (cov gw gh) (scribe:rasterize-glyph nerd g np2))))
+      (list :sym cov gw gh (floor (- cw gw) 2) (floor (- ch gh) 2)))))
 
 (defun glyph (tm code)
   (or (gethash code (terminal-glyphs tm))
@@ -468,6 +483,8 @@
             (:mono (destructuring-bind (cov gw gh left top &rest ign) (cdr g)
                      (declare (ignore ign))
                      (when cov (blit-mono fb cov gw gh (+ px0 left) (+ py0 asc top) fg))))
+            (:sym (destructuring-bind (cov gw gh ox oy) (cdr g)   ; Nerd symbol, centred in the cell
+                    (when cov (blit-mono fb cov gw gh (+ px0 ox) (+ py0 oy) fg))))
             (:color (destructuring-bind (rgb alpha gw gh left top &rest ign) (cdr g)
                       (declare (ignore ign))
                       (when rgb (blit-color fb rgb alpha gw gh (+ px0 left) (+ py0 asc top))))))))))))
@@ -593,13 +610,21 @@
 (defun load-emoji-font (&optional path)
   (and path (ignore-errors (glass:load-font path))))
 
+(defun %term-font (name)
+  "Load a bundled terminal font from glass's fonts/ (JetBrains Mono + Symbols Nerd
+   Font — WezTerm's default set; colour emoji comes from scribe's Twemoji fallback)."
+  (glass:load-font (asdf:system-relative-pathname :glass/term (format nil "fonts/~a" name))))
+
 (defun make-terminal (&key (cols 80) (rows 24) (ppem 16) (shell "/bin/bash") emoji-font)
-  (let* ((font (glass:load-font (asdf:system-relative-pathname :scribe "fonts/LiberationMono-Regular.ttf")))
+  (let* ((font (%term-font "JetBrainsMono-Regular.ttf"))
+         (nerd (ignore-errors (%term-font "SymbolsNerdFontMono-Regular.ttf")))
          (upem (scribe:font-units-per-em font))
-         (cell-w (max 1 (ceiling (nth-value 5 (scribe:rasterize-glyph font (scribe:font-glyph-index font (char-code #\M)) ppem)))))
+         ;; ROUND the advance (not CEILING) — ceiling adds up to ~1px of slack per
+         ;; cell, which read as "a little wide"; round tracks the design advance.
+         (cell-w (max 1 (round (nth-value 5 (scribe:rasterize-glyph font (scribe:font-glyph-index font (char-code #\M)) ppem)))))
          (asc (round (* (scribe:font-ascent font) ppem) upem))
          (desc (round (* (- (scribe:font-descent font)) ppem) upem))
-         (cell-h (+ asc desc 2))
+         (cell-h (+ asc desc 1))
          ;; setsid -c makes the pty the controlling terminal: real job control,
          ;; no "cannot set process group" warning, and readline echoes normally.
          (proc (sb-ext:run-program "/usr/bin/setsid" (list "-c" shell "--norc" "-i")
@@ -611,7 +636,7 @@
                                                       (format nil "HOME=~a" (or (sb-ext:posix-getenv "HOME") "/root")))))
          (pty (sb-ext:process-pty proc))
          (tm (%make-terminal :cols cols :rows rows :cells (make-grid cols rows)
-                            :bot (1- rows) :pty pty :proc proc :font font :ppem ppem
+                            :bot (1- rows) :pty pty :proc proc :font font :nerd-font nerd :ppem ppem
                             :emoji-font (load-emoji-font emoji-font)
                             :cell-w cell-w :cell-h cell-h :ascent asc
                             :fb (glass:make-framebuffer (* cols cell-w) (* rows cell-h) glass:+black+))))
