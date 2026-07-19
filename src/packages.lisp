@@ -21,4 +21,4 @@
    ;; server: (serve fb port &key on-key on-pointer on-resize name once wake)
    #:serve #:serve-one #:*desktop-name* #:tcp-listen #:make-wake #:wake-signal
    ;; standing perf counters (read a snapshot over the control socket)
-   #:*perf-on* #:perf-reset #:perf-report #:perf-record-send #:perf-record-composite))
+   #:*perf-on* #:perf-reset #:perf-report #:perf-record-send #:perf-record-composite #:*send-lag*))

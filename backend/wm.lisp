@@ -185,6 +185,10 @@
     (if (glass-mirror-managed mirror) (wm-draw-window mirror fb) (blit-mirror mirror fb)))
   (dolist (surf (reverse (glass-port-surfaces port)))         ; surface windows, on top
     (wm-draw-surface surf fb))
+  (when-let ((b (and (glass-port-drag-wire port) (glass-port-drag-wire-box port))))  ; wireframe outline
+    (destructuring-bind (x y w h) b
+      (glass:fb-frame fb x y w h glass:+white+ 2)             ; white + inner black = visible on any bg
+      (glass:fb-frame fb (1+ x) (1+ y) (max 0 (- w 2)) (max 0 (- h 2)) glass:+black+ 1)))
   (when-let ((menu (glass-port-menu port)))                   ; root menu (+ submenu chain) on top
     (dolist (m (wm-menu-chain menu))
       (blit-fb (wm-menu-fb m) (wm-menu-x m) (wm-menu-y m) fb))))
@@ -204,6 +208,70 @@
     (when cx
       (list (- cx +wm-border+) (- cy +wm-titleh+ +wm-border+)
             (+ cw (* 2 +wm-border+)) (+ +wm-titleh+ ch (* 2 +wm-border+))))))
+
+(defun wm-window-box-at (obj cx cy)
+  "The decorated (x y w h) OBJ WOULD occupy if its content were at (CX,CY) — for the
+   wireframe outline, which shows a hypothetical position without moving the window."
+  (multiple-value-bind (cw ch)
+      (if (wm-surface-p obj)
+          (values (glass:fb-width (wm-surface-fb obj)) (glass:fb-height (wm-surface-fb obj)))
+          (when-let ((img (mcclim-render::image-mirror-image obj)))
+            (image-wh img)))
+    (when cw
+      (list (- cx +wm-border+) (- cy +wm-titleh+ +wm-border+)
+            (+ cw (* 2 +wm-border+)) (+ +wm-titleh+ ch (* 2 +wm-border+))))))
+
+;;; ---- adaptive drag: opaque when the link keeps up, wireframe when it can't -----
+;;; Moving a window OPAQUELY re-encodes it each frame — cheap on a client that can
+;;; CopyRect (TigerVNC) or for small moves, but a big drag on a no-CopyRect client
+;;; (macOS Screen Sharing) re-sends the whole window every frame and lags.  So a
+;;; drag starts opaque (small moves look great) and switches to a WIREFRAME outline
+;;; only once the send backlog (glass:*send-lag*) shows the link falling behind —
+;;; the outline is a few thin rects, near-free to encode; the real window snaps to
+;;; the final spot on release.
+(defparameter *drag-adaptive* t "Auto-switch a laggy opaque drag to wireframe.")
+(defparameter *wireframe-lag-ms* 120.0d0
+  "Send-backlog EWMA (ms) past which an in-progress drag switches to wireframe.")
+
+(defun wm-drag-move-opaque (port obj ncx ncy)
+  "Opaque move step: move the real window to content-position (NCX,NCY) and composite
+   old+new with a CopyRect hint (near-free on a client that can CopyRect)."
+  (let ((old (wm-window-box obj)))
+    (wm-move obj ncx ncy)
+    (let ((new (wm-window-box obj)))
+      (composite-all port (wm-box-union (list old new))
+                     (when (and old new)
+                       (list (first old) (second old) (first new) (second new)
+                             (third old) (fourth old)))))))
+
+(defun wm-drag-move (port obj ncx ncy)
+  "A drag move: opaque, unless the send backlog (glass:*send-lag*) shows the link
+   can't keep up — then switch THIS drag to wireframe (outline starts at the window's
+   current box) and don't move the real window."
+  (if (and *drag-adaptive* (> glass:*send-lag* *wireframe-lag-ms*))
+      (progn
+        (setf (glass-port-drag-wire port) t
+              (glass-port-drag-wire-box port) (wm-window-box obj))
+        (wm-drag-wire-to port obj ncx ncy))
+      (wm-drag-move-opaque port obj ncx ncy)))
+
+(defun wm-drag-wire-to (port obj ncx ncy)
+  "Wireframe drag step: move only the OUTLINE to content-position (NCX,NCY); the real
+   window stays put (its pixels stay on the client), so only the thin outline tiles
+   change — cheap even with no CopyRect."
+  (let ((old (glass-port-drag-wire-box port))
+        (new (wm-window-box-at obj ncx ncy)))
+    (setf (glass-port-drag-wire-box port) new)
+    (composite-all port (wm-box-union (list old new)))))
+
+(defun wm-drag-wire-drop (port obj ncx ncy)
+  "End a wireframe drag: move the real window to (NCX,NCY) and composite the union of
+   the last outline and the window's new box — the one time the moved content is
+   re-sent."
+  (let ((wire (glass-port-drag-wire-box port)))
+    (wm-move obj ncx ncy)
+    (setf (glass-port-drag-wire port) nil (glass-port-drag-wire-box port) nil)
+    (composite-all port (wm-box-union (list wire (wm-window-box obj))))))
 
 (defun wm-box-union (boxes)
   "Bounding (x y w h) of BOXES, or NIL if empty."
@@ -424,15 +492,15 @@
       ((glass-port-drag port)                                 ; a move or resize in progress
        (destructuring-bind (obj mode . rest) (glass-port-drag port)
          (ecase mode
-           (:move   (destructuring-bind (dx dy) rest
-                      (let ((old (wm-window-box obj)))     ; damage = old + new; copy = old -> new
-                        (wm-move obj (- x dx) (- y dy))
-                        (let ((new (wm-window-box obj)))
-                          (composite-all
-                           port (wm-box-union (list old new))
-                           (when (and old new)             ; a move: CopyRect the window pixels
-                             (list (first old) (second old) (first new) (second new)
-                                   (third old) (fourth old))))))))
+           (:move
+            (destructuring-bind (dx dy) rest
+              (let ((ncx (- x dx)) (ncy (- y dy)))
+                (cond
+                  ((glass-port-drag-wire port)               ; already wireframe (no flapping)
+                   (if down (wm-drag-wire-to port obj ncx ncy)
+                       (wm-drag-wire-drop port obj ncx ncy)))  ; release -> land the window
+                  (down (wm-drag-move port obj ncx ncy))     ; opaque; switch to wireframe if laggy
+                  (t (wm-drag-move-opaque port obj ncx ncy)))))) ; release -> final opaque, no switch
            (:resize (destructuring-bind (x0 y0 cw0 ch0) rest
                       (wm-resize port obj (+ cw0 (- x x0)) (+ ch0 (- y y0))) (composite-all port))))
          (unless down (setf (glass-port-drag port) nil))))

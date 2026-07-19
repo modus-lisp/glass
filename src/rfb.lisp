@@ -489,7 +489,8 @@
            ;; fell behind — "CopyRect farther").  An incremental request with a real damage
            ;; box diffs only that and trusts the copy; a :FULL mark (or full request) is a
            ;; whole-screen diff with no copy.
-           (multiple-value-bind (frame damage copy) (fb-take-frame fb)
+           (multiple-value-bind (frame damage copy mark-time) (fb-take-frame fb)
+             (when (and damage (plusp mark-time)) (note-send-lag mark-time))  ; backlog clock
              (let* ((region (if (and incremental (consp damage)) damage :full))
                     (copy   (and incremental (consp damage) copy))
                     (tx (list 0)) (t0 (get-internal-real-time))

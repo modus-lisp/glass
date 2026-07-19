@@ -13,6 +13,19 @@
 
 (defparameter *perf-on* t
   "Whether the per-frame perf counters accumulate (a few incfs on the hot path).")
+
+(defparameter *send-lag* 0.0d0
+  "EWMA (ms) of the SEND BACKLOG: how long the oldest un-sent change waited between
+   being composited and the sender delivering it.  ~0 when the sender keeps up;
+   climbs when it falls behind (a big drag on a client that can't CopyRect).  Read
+   by the WM to switch a laggy drag from opaque to wireframe.")
+(declaim (type double-float *send-lag*))
+
+(defun note-send-lag (mark-time)
+  "Fold one delivered frame's backlog (now - MARK-TIME, ms) into *SEND-LAG*."
+  (let ((ms (/ (* 1000d0 (- (get-internal-real-time) mark-time))
+               (float internal-time-units-per-second 1d0))))
+    (setf *send-lag* (+ (* 0.8d0 *send-lag*) (* 0.2d0 (max 0d0 ms))))))
 (defvar *tx* nil
   "When bound to a (count) cons on the send path, the byte writers add to its car,
    so the sender can total the bytes it actually wrote for one frame.")
@@ -71,7 +84,7 @@
              (f (pf-frames p)) (c (pf-composites p)))
         (with-output-to-string (o)
           (format o "glass perf — ~,1fs window~:[~; (perf OFF)~]~%" el (not *perf-on*))
-          (format o "  SEND       ~d frames, ~,1f fps~%" f (/ f el))
+          (format o "  SEND       ~d frames, ~,1f fps, backlog ~,1f ms (EWMA)~%" f (/ f el) *send-lag*)
           (when (plusp f)
             (format o "    encode     ~,2f ms/frame~%" (%pf-ms (/ (pf-enc p) f)))
             (format o "    bytes      ~,1f KB/frame  (~,0f KB/s)~%"

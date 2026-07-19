@@ -55,6 +55,7 @@
   (frameno 0)
   (damage nil)                          ; accumulated (x0 y0 x1 y1), or :FULL, since last take
   (copy nil)                            ; composed move: (src-x src-y dst-x dst-y w h) -> CopyRect
+  (mark-time 0 :type fixnum)            ; when the oldest unsent change was marked (backlog clock)
   (frame-lock (%fb-make-lock)))         ; guards the (damage copy frameno) triple
 
 (defun fb-touch (fb)
@@ -95,16 +96,19 @@
    behind still gets ONE snapshot->current CopyRect instead of re-encoding.  Advances the
    frame counter."
   (%with-frame-lock (fb)
+    (when (null (fb-damage fb))           ; first change since the sender's last take: start the
+      (setf (fb-mark-time fb) (get-internal-real-time)))  ; backlog clock for this batch
     (setf (fb-damage fb) (%fb-damage-union (fb-damage fb) damage)
           (fb-copy fb)   (%fb-copy-compose (fb-copy fb) copy)
           (fb-frameno fb) (logand (1+ (fb-frameno fb)) most-positive-fixnum))))
 
 (defun fb-take-frame (fb)
-  "Atomically read the accumulated (FRAMENO DAMAGE COPY) and clear DAMAGE/COPY, so the next
-   composite starts a fresh accumulation from where the client now is.  The sender calls this
-   once per update it sends.  Returns (values frameno damage copy)."
+  "Atomically read the accumulated (FRAMENO DAMAGE COPY MARK-TIME) and clear DAMAGE/COPY, so the
+   next composite starts a fresh accumulation from where the client now is.  MARK-TIME is when
+   the oldest change in this batch was marked, so the sender can measure its backlog (now -
+   MARK-TIME = how long the change waited).  The sender calls this once per update it sends."
   (%with-frame-lock (fb)
-    (multiple-value-prog1 (values (fb-frameno fb) (fb-damage fb) (fb-copy fb))
+    (multiple-value-prog1 (values (fb-frameno fb) (fb-damage fb) (fb-copy fb) (fb-mark-time fb))
       (setf (fb-damage fb) nil (fb-copy fb) nil))))
 
 (defun %clip-intersect (clip x0 y0 x1 y1)

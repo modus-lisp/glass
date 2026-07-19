@@ -30,6 +30,8 @@
    (screen-w :initform 1000 :accessor glass-port-screen-w)
    (screen-h :initform 720  :accessor glass-port-screen-h)
    (drag     :initform nil :accessor glass-port-drag)         ; (window off-x off-y) while moving a window
+   (drag-wire :initform nil :accessor glass-port-drag-wire)   ; this drag switched to wireframe (laggy link)?
+   (drag-wire-box :initform nil :accessor glass-port-drag-wire-box)  ; the moving outline's (x y w h)
    (cascade  :initform 0   :accessor glass-port-cascade)      ; next window placement offset
    (surfaces :initform '() :accessor glass-port-surfaces)     ; non-McCLIM windows (e.g. terminals)
    (focus-surface :initform nil :accessor glass-port-focus-surface)  ; surface grabbing the keyboard
