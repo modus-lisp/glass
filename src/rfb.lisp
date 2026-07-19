@@ -68,6 +68,14 @@
   "Parse the RFB minor version from a 12-byte \"RFB 003.00X\" ProtocolVersion, or 8."
   (or (ignore-errors (parse-integer (map 'string #'code-char ver) :start 8 :end 11)) 8))
 
+(defparameter *legacy-vnc-auth* t
+  "For RFB 3.3 clients (macOS Screen Sharing), offer VNC Authentication (security
+   type 2) instead of None: macOS refuses/​spins on a None-auth 3.3 server, and only
+   its VNC-auth path (a password prompt) proceeds.  We complete the challenge/
+   response but DO NOT verify the password — any password is accepted, the same open
+   posture as None, just the form macOS demands.  (Real password enforcement needs a
+   DES verify — a follow-up.)  NIL dictates None for 3.3 instead.")
+
 (defun handshake (fb s name)
   "RFB handshake through ServerInit, honoring the client's protocol version.  We
    advertise 3.8, but macOS Screen Sharing (and other legacy clients) answer 3.3,
@@ -82,8 +90,16 @@
           (w-u8 s 1) (w-u8 s 1) (force-output s)   ; 1 security type: None (1)
           (r-u8 s)                                 ; client's chosen type
           (w-u32 s 0) (force-output s))            ; SecurityResult = OK
-        (progn                                 ; 3.3: server dictates one u32 type, no result
-          (w-u32 s 1) (force-output s))))          ; None (1) -> straight to ClientInit
+        (if *legacy-vnc-auth*                  ; 3.3: server dictates ONE u32 security type
+            (progn                             ; VNC Authentication (macOS) — any password accepted
+              (w-u32 s 2) (force-output s)         ; type 2 = VNC auth
+              (let ((ch (make-array 16 :element-type '(unsigned-byte 8))))
+                (dotimes (i 16) (setf (aref ch i) (random 256)))
+                (w-bytes s ch) (force-output s))   ; 16-byte challenge
+              (r-bytes s 16)                       ; client's DES response — accepted, not verified
+              (w-u32 s 0) (force-output s))         ; SecurityResult = OK
+            (progn                             ; None (1) -> straight to ClientInit, no result
+              (w-u32 s 1) (force-output s)))))
   (r-u8 s)                                     ; ClientInit (shared-flag)
   (w-u16 s (fb-width fb)) (w-u16 s (fb-height fb))
   (write-pixel-format s)

@@ -33,9 +33,15 @@
         (check (search "RFB 003.008" sv) "server offered version ~s" (string-trim '(#\Newline) sv)))
       (wn s (map '(vector (unsigned-byte 8)) #'char-code (format nil "RFB 003.003~a" #\Newline)))
       (force-output s)
-      ;; 3.3: server dictates ONE u32 security type; must be 1 (None), NOT the 3.8 [count][type] list
+      ;; 3.3: server dictates ONE u32 security type.  With *legacy-vnc-auth*, macOS's
+      ;; VNC Authentication (2): read the 16-byte challenge, send any 16-byte response,
+      ;; read SecurityResult (0=OK) — any password accepted.
       (let ((sec (r32 s)))
-        (check (= sec 1) "server sent a single u32 security-type = ~d (expect 1=None, no list/result)" sec))
+        (check (= sec 2) "server sent a single u32 security-type = ~d (expect 2=VNC-auth for 3.3)" sec)
+        (when (= sec 2)
+          (rn s 16)                                                   ; challenge
+          (wn s (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)) (force-output s)
+          (check (= (r32 s) 0) "SecurityResult = OK (any password accepted)")))
       (w8 s 1) (force-output s)                                        ; ClientInit shared-flag
       (let ((w (r16 s)) (h (r16 s)))                                   ; ServerInit
         (rn s 16) (let ((nl (r32 s))) (rn s nl))
