@@ -142,12 +142,15 @@
   "Rects with at least this many pixels go out as TRLE (no zlib — ~200x cheaper to
    encode than ZRLE, only a little larger; the deflate cost isn't worth it on a
    fast link).  Smaller rects stay ZRLE (compression is ~free at that size).")
-(defparameter *zrle-stored-threshold* 16384
-  "Rects at least this big that go out as ZRLE (a client that DIDN'T negotiate TRLE,
-   e.g. TigerVNC) use STORED deflate blocks instead of a full LZ77 deflate: ~5x
-   cheaper to encode a big frame, at some ratio.  The right trade on a fast link;
-   raise it toward MOST-POSITIVE-FIXNUM to favour bandwidth over CPU on a slow one.
-   Small rects always take the normal (well-compressed, cheap-because-small) path.")
+(defparameter *zrle-stored-threshold* 0
+  "ZRLE rects at least this many pixels use STORED deflate blocks (no LZ77) instead
+   of a full deflate.  Default 0 = ALWAYS stored, because deflate's per-byte LZ77 is
+   the encode wall (measured: a calculator repaint = ~10 tile-row strips of ~11.5k px
+   each, all just under the old 16384 threshold, so all on the slow path -> 73 ms/
+   frame; at 0 -> 5.5 ms, a 13x win) and ZRLE's tile packing already compresses UI
+   content (solid/palette tiles) WITHOUT deflate, so on a fast link stored costs a
+   little bandwidth for a lot of CPU.  Raise it (e.g. 16384, or higher) to favour
+   bandwidth over encode CPU on a slow/metered link, where deflating big rects pays.")
 
 (defun write-rect-copy (s dx dy w h sx sy)
   "A CopyRect rect: the client copies its own W x H pixels from (SX,SY) to (DX,DY)."
