@@ -84,10 +84,36 @@
 (defparameter *legacy-vnc-auth* t
   "For RFB 3.3 clients (macOS Screen Sharing), offer VNC Authentication (security
    type 2) instead of None: macOS refuses/​spins on a None-auth 3.3 server, and only
-   its VNC-auth path (a password prompt) proceeds.  We complete the challenge/
-   response but DO NOT verify the password — any password is accepted, the same open
-   posture as None, just the form macOS demands.  (Real password enforcement needs a
-   DES verify — a follow-up.)  NIL dictates None for 3.3 instead.")
+   its VNC-auth path (a password prompt) proceeds.  With *VNC-PASSWORD* NIL the
+   challenge/response completes but the password is NOT verified (any password is
+   accepted — the open posture of None, just the form macOS demands).  NIL here
+   dictates None for 3.3 instead.")
+
+(defvar *vnc-password* nil
+  "If a string, VNC Authentication is REQUIRED for ALL clients and the DES
+   challenge/response is VERIFIED against it — a wrong password is rejected, so this
+   secures a desktop bound to 0.0.0.0 (and macOS saves the password to its Keychain,
+   so it stops prompting).  NIL = the open posture (None for 3.7+, any-password VNC
+   auth for 3.3/macOS).  Set it live: (setf glass:*vnc-password* \"...\").")
+
+(defun vnc-auth-exchange (s)
+  "VNC-auth challenge/response over S.  Returns T to admit the client — verified
+   against *VNC-PASSWORD* when set, else accepted (any password)."
+  (let ((challenge (make-array 16 :element-type '(unsigned-byte 8))))
+    (dotimes (i 16) (setf (aref challenge i) (random 256)))
+    (w-bytes s challenge) (force-output s)
+    (let ((response (r-bytes s 16)))
+      (if *vnc-password* (vnc-auth-verify *vnc-password* challenge response) t))))
+
+(defun vnc-auth-and-result (s minor)
+  "Run VNC auth, send the RFB SecurityResult (0 OK / 1 failed, + a reason string on
+   3.8), and return whether the client is admitted."
+  (let ((ok (vnc-auth-exchange s)))
+    (w-u32 s (if ok 0 1)) (force-output s)
+    (when (and (not ok) (>= minor 8))
+      (let ((reason (string->bytes "Authentication failed")))
+        (w-u32 s (length reason)) (w-bytes s reason) (force-output s)))
+    ok))
 
 (defun handshake (fb s name)
   "RFB handshake through ServerInit, honoring the client's protocol version.  We
@@ -99,20 +125,18 @@
   (w-bytes s (string->bytes "RFB 003.008")) (w-u8 s 10) (force-output s)
   (let ((minor (client-minor-version (r-bytes s 12))))   ; client ProtocolVersion
     (if (>= minor 7)
-        (progn                                 ; 3.7 / 3.8: type list -> client choice -> result
-          (w-u8 s 1) (w-u8 s 1) (force-output s)   ; 1 security type: None (1)
-          (r-u8 s)                                 ; client's chosen type
-          (w-u32 s 0) (force-output s))            ; SecurityResult = OK
-        (if *legacy-vnc-auth*                  ; 3.3: server dictates ONE u32 security type
-            (progn                             ; VNC Authentication (macOS) — any password accepted
-              (w-u32 s 2) (force-output s)         ; type 2 = VNC auth
-              (let ((ch (make-array 16 :element-type '(unsigned-byte 8))))
-                (dotimes (i 16) (setf (aref ch i) (random 256)))
-                (w-bytes s ch) (force-output s))   ; 16-byte challenge
-              (r-bytes s 16)                       ; client's DES response — accepted, not verified
-              (w-u32 s 0) (force-output s))         ; SecurityResult = OK
-            (progn                             ; None (1) -> straight to ClientInit, no result
-              (w-u32 s 1) (force-output s)))))
+        ;; 3.7 / 3.8: a security-type LIST, the client's choice, then the exchange
+        (if *vnc-password*                     ; secured -> require VNC auth (type 2)
+            (progn (w-u8 s 1) (w-u8 s 2) (force-output s)
+                   (r-u8 s)                        ; client's chosen type (2)
+                   (unless (vnc-auth-and-result s minor) (return-from handshake nil)))
+            (progn (w-u8 s 1) (w-u8 s 1) (force-output s)    ; None (1)
+                   (r-u8 s) (w-u32 s 0) (force-output s)))   ; SecurityResult = OK
+        ;; 3.3: the server dictates ONE u32 security type
+        (if (or *vnc-password* *legacy-vnc-auth*)
+            (progn (w-u32 s 2) (force-output s)              ; VNC auth (verified if *vnc-password*)
+                   (unless (vnc-auth-and-result s minor) (return-from handshake nil)))
+            (progn (w-u32 s 1) (force-output s)))))          ; None -> straight to ClientInit
   (r-u8 s)                                     ; ClientInit (shared-flag)
   (w-u16 s (fb-width fb)) (w-u16 s (fb-height fb))
   (write-pixel-format s)
@@ -586,8 +610,8 @@
     (force-output *error-output*)
     (flet ((run (stream)
              (unwind-protect
-                  (progn (handshake fb stream name)
-                         (client-loop fb stream on-key on-pointer on-resize wake))
+                  (when (handshake fb stream name)     ; NIL = auth failed -> drop the client
+                    (client-loop fb stream on-key on-pointer on-resize wake))
                (ignore-errors (close stream)))))
       (unwind-protect
            (loop

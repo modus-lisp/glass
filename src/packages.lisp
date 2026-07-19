@@ -20,6 +20,8 @@
    #:fb-text #:text-width #:load-font #:default-font
    ;; server: (serve fb port &key on-key on-pointer on-resize name once wake)
    #:serve #:serve-one #:*desktop-name* #:tcp-listen #:make-wake #:wake-signal
+   ;; VNC authentication (from-scratch DES); *vnc-password* nil = open, string = required
+   #:*vnc-password* #:*legacy-vnc-auth* #:vnc-auth-response #:vnc-auth-verify
    ;; standing perf counters (read a snapshot over the control socket)
    #:*perf-on* #:perf-reset #:perf-report #:perf-record-send #:perf-record-composite
    #:*send-lag* #:*send-queue*))

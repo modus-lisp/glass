@@ -31,6 +31,7 @@ give modus a remote display, developed and tested on SBCL first."
     :serial t
     :components
     ((:file "perf")
+     (:file "vncauth")
      (:file "rfb")
      (:file "zrle")))))
 

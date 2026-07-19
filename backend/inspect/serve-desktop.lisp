@@ -41,11 +41,22 @@
            (error () nil)))))
    :name "glass-control"))
 
+;; VNC password: if ~/.glass-vnc-pass exists (create it yourself, mode 600 — it is
+;; NOT in the repo), require + verify it (secures the 0.0.0.0 bind, and macOS saves
+;; it to Keychain so it stops prompting).  Absent -> the open any-password posture.
+(let ((pwfile (merge-pathnames ".glass-vnc-pass" (user-homedir-pathname))))
+  (when (probe-file pwfile)
+    (let ((pw (string-trim '(#\Space #\Tab #\Newline #\Return)
+                           (with-open-file (in pwfile) (or (read-line in nil "") "")))))
+      (when (plusp (length pw)) (setf glass:*vnc-password* pw)))))
+
 (let ((wp (namestring (merge-pathnames "assets/wallpaper.svg"
                                        (asdf:system-source-directory :mcclim-glass)))))
   (start-control-socket 4009)
   (format *error-output* "~&@@ glass desktop serving on 0.0.0.0:5901 (~a)~%" wp)
   (format *error-output* "@@ control socket on 127.0.0.1:4009~%")
+  (format *error-output* "@@ VNC auth: ~:[OPEN — any password accepted~;REQUIRED — ~:*~d-char password loaded~]~%"
+          (and glass:*vnc-password* (length glass:*vnc-password*)))
   (finish-output *error-output*)
   (clim-glass:run-wm '((:terminal :cols 80 :rows 24 :ppem 14))
                      :port 5901 :width 1280 :height 800
