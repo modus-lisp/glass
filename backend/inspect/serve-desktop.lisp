@@ -7,7 +7,7 @@
 (handler-bind ((warning #'muffle-warning))
   (let ((*standard-output* (make-broadcast-stream)))
     (ql:quickload '(:glass :glass/vncauth :mcclim :mcclim-render :sb-concurrency
-                    :weft/render :clim-examples :clim-listener))   ; vncauth = DES via seal
+                    :pigment :clim-examples :clim-listener))   ; vncauth = DES via seal
     (ignore-errors (asdf:load-system :loom/glass))            ; the browser (optional)
     (asdf:load-asd "/home/claude/glass/backend/mcclim-glass.asd")
     (asdf:load-system :mcclim-glass)))

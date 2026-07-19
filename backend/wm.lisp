@@ -143,7 +143,7 @@
               (lambda () (blit-fb sfb (wm-surface-x surf) (wm-surface-y surf) fb)))))
 
 (defun wm-render-background (port path &key (mode :cover))
-  "Rasterise the image at PATH (any format weft decodes — PNG/JPEG/GIF/WebP/SVG)
+  "Rasterise the image at PATH (any format pigment decodes — PNG/JPEG/GIF/WebP/SVG)
    into a screen-sized framebuffer for use as the desktop background.  MODE places
    it: :cover (fill, centre-crop — default), :fit (whole image, teal letterbox),
    :stretch (distort to fill), :center (1:1), or :tile.  For a crisp SVG, author
@@ -630,35 +630,40 @@
     (let ((b (make-array (file-length s) :element-type '(unsigned-byte 8))))
       (read-sequence b s) b)))
 
+(defun %decode-rgba (pkg path)
+  "Decode PATH via PKG's decode-image-bytes + img-w/h/rgba (pigment and — for compat
+   — weft.render share this API), to (values W H SAMPLER), or NIL if PKG isn't loaded."
+  (let ((dec (%loom-fn pkg "DECODE-IMAGE-BYTES")))
+    (when dec
+      (let ((img (funcall dec (%read-file-bytes path))))
+        (unless img (error "~a could not decode ~a" pkg path))
+        (let ((w (funcall (%loom-fn pkg "IMG-W") img))
+              (h (funcall (%loom-fn pkg "IMG-H") img))
+              (rgba (funcall (%loom-fn pkg "IMG-RGBA") img)))     ; w*h*4 straight-alpha
+          (values w h (lambda (y x)
+                        (let ((o (* (+ (* y w) x) 4)))
+                          (values (aref rgba o) (aref rgba (+ o 1)) (aref rgba (+ o 2)) (aref rgba (+ o 3)))))))))))
+
 (defun %decode-image (path)
   "Decode PATH to (values W H SAMPLER), where SAMPLER is (fn Y X) -> (values R G B
-   A).  Prefers weft's pure-CL decoder (part of our own stack — PNG/JPEG/GIF/WebP/
-   SVG), falling back to opticl.  Both are OPTIONAL runtime deps, resolved by name."
-  (let ((wdec (%loom-fn '#:weft.render "DECODE-IMAGE-BYTES")))
-    (cond
-      (wdec                                              ; --- weft (preferred) ---
-       (let ((img (funcall wdec (%read-file-bytes path))))
-         (unless img (error "weft could not decode ~a" path))
-         (let ((w (funcall (%loom-fn '#:weft.render "IMG-W") img))
-               (h (funcall (%loom-fn '#:weft.render "IMG-H") img))
-               (rgba (funcall (%loom-fn '#:weft.render "IMG-RGBA") img)))  ; w*h*4 straight-alpha
-           (values w h (lambda (y x)
-                         (let ((o (* (+ (* y w) x) 4)))
-                           (values (aref rgba o) (aref rgba (+ o 1)) (aref rgba (+ o 2)) (aref rgba (+ o 3)))))))))
-      (t                                                 ; --- opticl (fallback) ---
-       (let ((oread (%loom-fn '#:opticl "READ-IMAGE-FILE")))
-         (unless oread (error "no image decoder — (ql:quickload :weft/render) or :opticl"))
-         (let* ((img (funcall oread path)) (dims (array-dimensions img))
-                (ih (first dims)) (iw (second dims)) (ch (if (cddr dims) (third dims) 1))
-                (p16 (equal (array-element-type img) '(unsigned-byte 16))))
-           (values iw ih
-                   (lambda (y x)
-                     (flet ((c (k) (let ((v (if (= ch 1) (aref img y x) (aref img y x k)))) (if p16 (ash v -8) v))))
-                       (if (= ch 1) (let ((v (c 0))) (values v v v 255))
-                           (values (c 0) (c 1) (c 2) (if (>= ch 4) (c 3) 255))))))))))))
+   A).  Prefers pigment (our pure-CL PNG/JPEG/GIF/WebP/SVG codecs, split out of weft),
+   then weft.render (compat), then opticl — all OPTIONAL runtime deps, by name."
+  (cond
+    ((%loom-fn '#:pigment "DECODE-IMAGE-BYTES")     (%decode-rgba '#:pigment path))
+    ((%loom-fn '#:weft.render "DECODE-IMAGE-BYTES") (%decode-rgba '#:weft.render path))
+    ((%loom-fn '#:opticl "READ-IMAGE-FILE")          ; --- opticl (fallback) ---
+     (let* ((img (funcall (%loom-fn '#:opticl "READ-IMAGE-FILE") path)) (dims (array-dimensions img))
+            (ih (first dims)) (iw (second dims)) (ch (if (cddr dims) (third dims) 1))
+            (p16 (equal (array-element-type img) '(unsigned-byte 16))))
+       (values iw ih
+               (lambda (y x)
+                 (flet ((c (k) (let ((v (if (= ch 1) (aref img y x) (aref img y x k)))) (if p16 (ash v -8) v))))
+                   (if (= ch 1) (let ((v (c 0))) (values v v v 255))
+                       (values (c 0) (c 1) (c 2) (if (>= ch 4) (c 3) 255))))))))
+    (t (error "no image decoder — (ql:quickload :pigment) or :opticl"))))
 
 (defun wm-add-image (port path &key (max-w 960) (max-h 660))
-  "Open the image file at PATH as a WM surface window — decoded (weft, else opticl)
+  "Open the image file at PATH as a WM surface window — decoded (pigment, else opticl)
    into a glass framebuffer, nearest-neighbour scaled to fit MAX-W x MAX-H, with
    any alpha composited over the dark window background."
   (multiple-value-bind (iw ih samp) (%decode-image path)
@@ -758,7 +763,7 @@
 ;;;   (:debug FORM)                     evaluate FORM under the CLIM debugger
 ;;;   (:edit &optional FILE)            Climacs, the McCLIM editor
 ;;;   (:browse URL &key width height)   a loom/weft browser window
-;;;   (:image PATH &key max-w max-h)    an image (weft's decoder, else opticl)
+;;;   (:image PATH &key max-w max-h)    an image (pigment's decoder, else opticl)
 ;;;   (FRAME-CLASS &key width height)   any McCLIM application frame
 (defun wm-spawn-spec (port spec)
   (case (car spec)
@@ -819,7 +824,7 @@
    PPEM) for a shell terminal.  Right-click the workspace for a root menu; pass
    MENU — a list of (LABEL . SPEC) labelled window specs (same vocabulary as
    SPECS), or (LABEL . THUNK) for an arbitrary action — to override its items.
-   BACKGROUND is a desktop-wallpaper image path (any format weft decodes, incl.
+   BACKGROUND is a desktop-wallpaper image path (any format pigment decodes, incl.
    SVG), placed per BACKGROUND-MODE (:cover/:fit/:stretch/:center/:tile).  Serves
    on PORT."
   (let ((p (find-glass-port :port port)))

@@ -7,7 +7,7 @@
 (load "~/quicklisp/setup.lisp")
 (handler-bind ((warning #'muffle-warning))
   (let ((*standard-output* (make-broadcast-stream)))
-    (ql:quickload '(:glass :glass/term :weft/render :zpng :chipz))
+    (ql:quickload '(:glass :glass/term :pigment :zpng :chipz))
     (require :sb-concurrency)
     (asdf:load-asd "/home/claude/glass/backend/mcclim-glass.asd")
     (asdf:load-system :mcclim-glass)))
