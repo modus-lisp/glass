@@ -142,16 +142,36 @@
     (wm-frame fb (wm-surface-x surf) (wm-surface-y surf) cw ch (wm-surface-deco* surf cw)
               (lambda () (blit-fb sfb (wm-surface-x surf) (wm-surface-y surf) fb)))))
 
+(defun %svg-path-p (path)
+  (let ((s (string-downcase (princ-to-string path))))
+    (and (>= (length s) 4) (string= ".svg" (subseq s (- (length s) 4))))))
+
+(defun %bg-render-size (mode sw sh iw ih)
+  "The pixel size to rasterise a VECTOR image at so MODE displays it crisply (the
+   display size for :stretch; the aspect-preserving cover/fit size otherwise), so the
+   sample loop then runs ~1:1 instead of upscaling.  NIL for modes that don't scale."
+  (flet ((r (s) (values (max 1 (round (* iw s))) (max 1 (round (* ih s))))))
+    (case mode
+      (:stretch (values sw sh))
+      (:cover   (r (max (/ sw iw) (/ sh ih))))
+      (:fit     (r (min (/ sw iw) (/ sh ih))))
+      (t        (values nil nil)))))
+
 (defun wm-render-background (port path &key (mode :cover))
   "Rasterise the image at PATH (any format pigment decodes — PNG/JPEG/GIF/WebP/SVG)
    into a screen-sized framebuffer for use as the desktop background.  MODE places
    it: :cover (fill, centre-crop — default), :fit (whole image, teal letterbox),
-   :stretch (distort to fill), :center (1:1), or :tile.  For a crisp SVG, author
-   it at the screen size (it rasterises at its intrinsic size, then scales)."
+   :stretch (distort to fill), :center (1:1), or :tile.  An SVG is re-rasterised at
+   the display size (vector — crisp at any resolution, not an upscaled intrinsic)."
   (multiple-value-bind (iw ih samp) (%decode-image path)
-    (let* ((sw (glass-port-screen-w port)) (sh (glass-port-screen-h port))
-           (fb (glass:make-framebuffer sw sh +wm-teal+))
-           (px (glass:fb-pixels fb)))
+    (let ((sw (glass-port-screen-w port)) (sh (glass-port-screen-h port)))
+      ;; SVG: re-render at the size MODE will show it -> crisp, no upscale blur
+      (when (%svg-path-p path)
+        (multiple-value-bind (tw th) (%bg-render-size mode sw sh iw ih)
+          (when (and tw (or (/= tw iw) (/= th ih)))
+            (multiple-value-setq (iw ih samp) (%decode-image path :width tw :height th)))))
+     (let* ((fb (glass:make-framebuffer sw sh +wm-teal+))
+            (px (glass:fb-pixels fb)))
       (flet ((put (dx dy sx sy)
                (multiple-value-bind (r g b a) (funcall samp (min (1- ih) (max 0 sy)) (min (1- iw) (max 0 sx)))
                  (setf (aref px (+ (* dy sw) dx))
@@ -168,7 +188,7 @@
              (dotimes (dy sh) (dotimes (dx sw)
                (let ((sx (floor (- dx ox) scale)) (sy (floor (- dy oy) scale)))
                  (when (and (<= 0 sx) (< sx iw) (<= 0 sy) (< sy ih)) (put dx dy sx sy)))))))))
-      fb)))
+      fb))))
 
 (defun wm-set-background (port path &key (mode :cover))
   "Set the desktop background to the image at PATH (NIL clears it -> flat teal)."
@@ -630,25 +650,37 @@
     (let ((b (make-array (file-length s) :element-type '(unsigned-byte 8))))
       (read-sequence b s) b)))
 
+(defun %img-sampler (pkg img)
+  "Extract (values W H SAMPLER) from a decoded IMG via PKG's img-w/h/rgba, where
+   SAMPLER is (fn Y X) -> (values R G B A) over the straight-alpha RGBA."
+  (let ((w (funcall (%loom-fn pkg "IMG-W") img))
+        (h (funcall (%loom-fn pkg "IMG-H") img))
+        (rgba (funcall (%loom-fn pkg "IMG-RGBA") img)))     ; w*h*4 straight-alpha
+    (values w h (lambda (y x)
+                  (let ((o (* (+ (* y w) x) 4)))
+                    (values (aref rgba o) (aref rgba (+ o 1)) (aref rgba (+ o 2)) (aref rgba (+ o 3))))))))
+
 (defun %decode-rgba (pkg path)
-  "Decode PATH via PKG's decode-image-bytes + img-w/h/rgba (pigment and — for compat
-   — weft.render share this API), to (values W H SAMPLER), or NIL if PKG isn't loaded."
+  "Decode PATH via PKG's decode-image-bytes (pigment and — for compat — weft.render
+   share this API), to (values W H SAMPLER), or NIL if PKG isn't loaded."
   (let ((dec (%loom-fn pkg "DECODE-IMAGE-BYTES")))
     (when dec
       (let ((img (funcall dec (%read-file-bytes path))))
         (unless img (error "~a could not decode ~a" pkg path))
-        (let ((w (funcall (%loom-fn pkg "IMG-W") img))
-              (h (funcall (%loom-fn pkg "IMG-H") img))
-              (rgba (funcall (%loom-fn pkg "IMG-RGBA") img)))     ; w*h*4 straight-alpha
-          (values w h (lambda (y x)
-                        (let ((o (* (+ (* y w) x) 4)))
-                          (values (aref rgba o) (aref rgba (+ o 1)) (aref rgba (+ o 2)) (aref rgba (+ o 3)))))))))))
+        (%img-sampler pkg img)))))
 
-(defun %decode-image (path)
-  "Decode PATH to (values W H SAMPLER), where SAMPLER is (fn Y X) -> (values R G B
-   A).  Prefers pigment (our pure-CL PNG/JPEG/GIF/WebP/SVG codecs, split out of weft),
-   then weft.render (compat), then opticl — all OPTIONAL runtime deps, by name."
+(defun %decode-image (path &key width height)
+  "Decode PATH to (values W H SAMPLER), SAMPLER = (fn Y X) -> (values R G B A).
+   Prefers pigment (our pure-CL PNG/JPEG/GIF/WebP/SVG codecs, split out of weft),
+   then weft.render (compat), then opticl — all OPTIONAL, by name.  WIDTH/HEIGHT
+   rasterise a VECTOR image (SVG) at that size (crisp — no upscale); raster formats
+   ignore them (fixed size)."
   (cond
+    ((and (or width height) (%loom-fn '#:pigment "DECODE-IMAGE-BYTES"))   ; sized SVG render
+     (let ((img (funcall (%loom-fn '#:pigment "DECODE-IMAGE-BYTES")
+                         (%read-file-bytes path) nil :width width :height height)))
+       (unless img (error "pigment could not decode ~a" path))
+       (%img-sampler '#:pigment img)))
     ((%loom-fn '#:pigment "DECODE-IMAGE-BYTES")     (%decode-rgba '#:pigment path))
     ((%loom-fn '#:weft.render "DECODE-IMAGE-BYTES") (%decode-rgba '#:weft.render path))
     ((%loom-fn '#:opticl "READ-IMAGE-FILE")          ; --- opticl (fallback) ---
