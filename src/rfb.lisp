@@ -483,24 +483,26 @@
         ((and (plusp (first req)) (= (fb-generation fb) (rc-last-gen client)))
          (wake-wait wake 1/60))
         (t
-         (let* ((gen (fb-generation fb)) (frame (fb-frameno fb))
-                ;; if we saw the immediately-previous composite, trust its recorded
-                ;; DAMAGE box (diff only that) and its COPY hint (a window move ->
-                ;; CopyRect); else full diff, no copy.  The compositor already knows.
-                (caught-up (and (plusp (first req)) (eql (rc-last-frame client) (1- frame))))
-                (region (if (and caught-up (consp (fb-damage fb))) (fb-damage fb) :full))
-                (copy   (and caught-up (fb-copy fb)))
-                (tx (list 0)) (t0 (get-internal-real-time))
-                (sent (let ((*tx* tx))
-                        (handler-case (send-update client fb s req region copy)
-                          (error () (setf (rc-running client) nil) nil)))))
-           (when (and sent *perf-on*)
-             (perf-record-send (- (get-internal-real-time) t0) region copy (car tx)))
-           (setf (rc-last-gen client) gen (rc-last-frame client) frame)
-           (if sent
-               (sb-thread:with-mutex ((rc-lock client))
-                 (when (eq (rc-want client) req) (setf (rc-want client) nil)))
-               (wake-wait wake 1/60))))))))     ; nothing dirty (gen bumped, pixels same) — park
+         (let ((gen (fb-generation fb)) (incremental (plusp (first req))))
+           ;; Take everything the compositor accumulated since our last update: a unioned
+           ;; DAMAGE box and a COMPOSED COPY (one window move spanning however many frames we
+           ;; fell behind — "CopyRect farther").  An incremental request with a real damage
+           ;; box diffs only that and trusts the copy; a :FULL mark (or full request) is a
+           ;; whole-screen diff with no copy.
+           (multiple-value-bind (frame damage copy) (fb-take-frame fb)
+             (let* ((region (if (and incremental (consp damage)) damage :full))
+                    (copy   (and incremental (consp damage) copy))
+                    (tx (list 0)) (t0 (get-internal-real-time))
+                    (sent (let ((*tx* tx))
+                            (handler-case (send-update client fb s req region copy)
+                              (error () (setf (rc-running client) nil) nil)))))
+               (when (and sent *perf-on*)
+                 (perf-record-send (- (get-internal-real-time) t0) region copy (car tx)))
+               (setf (rc-last-gen client) gen (rc-last-frame client) frame)
+               (if sent
+                   (sb-thread:with-mutex ((rc-lock client))
+                     (when (eq (rc-want client) req) (setf (rc-want client) nil)))
+                   (wake-wait wake 1/60))))))))))     ; nothing dirty (gen bumped, pixels same) — park
 
 (defun choose-encoding (encs)
   "Pick the best encoding we implement from the client's advertised list.  ZRLE

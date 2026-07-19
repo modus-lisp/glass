@@ -26,6 +26,14 @@
 #+sb-thread (defun %fb-make-lock () (sb-thread:make-mutex :name "framebuffer"))
 #-sb-thread (defun %fb-make-lock () nil)
 
+;; Short critical section around the (damage copy frameno) frame triple — NOT the pixel
+;; FB-LOCK, which the sender holds for a whole (long) encode.  Guards FB-MARK-FRAME's
+;; compose against the sender's FB-TAKE-FRAME (read + reset).
+#+sb-thread (defmacro %with-frame-lock ((fb) &body body)
+              `(sb-thread:with-mutex ((fb-frame-lock ,fb)) ,@body))
+#-sb-thread (defmacro %with-frame-lock ((fb) &body body)
+              (declare (ignore fb)) `(progn ,@body))
+
 (defstruct (framebuffer (:conc-name fb-) (:constructor %make-framebuffer))
   (width  0 :type fixnum)
   (height 0 :type fixnum)
@@ -45,22 +53,59 @@
   ;; screen — the "we're the compositor, we already know what changed" shortcut.
   ;; (Named FRAMENO, not FRAME: FB-FRAME is already the rectangle-outline drawer.)
   (frameno 0)
-  (damage nil)                          ; (x0 y0 x1 y1) of the last frame, or :FULL
-  (copy nil))                           ; a move: (src-x src-y dst-x dst-y w h) -> RFB CopyRect
+  (damage nil)                          ; accumulated (x0 y0 x1 y1), or :FULL, since last take
+  (copy nil)                            ; composed move: (src-x src-y dst-x dst-y w h) -> CopyRect
+  (frame-lock (%fb-make-lock)))         ; guards the (damage copy frameno) triple
 
 (defun fb-touch (fb)
   "Mark FB's contents as changed (bumps its generation).  Writers call this after
    drawing so the RFB sender knows to re-scan; an untouched fb is diff-free."
   (setf (fb-generation fb) (logand (1+ (fb-generation fb)) most-positive-fixnum)))
 
+(defun %fb-damage-union (a b)
+  "Union two damage marks: :FULL dominates, NIL is identity, else the bounding box."
+  (cond ((or (eq a :full) (eq b :full)) :full)
+        ((null a) b)
+        ((null b) a)
+        (t (destructuring-bind (ax0 ay0 ax1 ay1) a
+             (destructuring-bind (bx0 by0 bx1 by1) b
+               (list (min ax0 bx0) (min ay0 by0) (max ax1 bx1) (max ay1 by1)))))))
+
+(defun %fb-copy-compose (old new)
+  "Fold two successive window-move copies (sx sy dx dy w h) into ONE, or NIL if they can't
+   be one CopyRect.  A drag is one window translating, so a chain (OLD's dst == NEW's src,
+   same size) folds to (OLD-src -> NEW-dst) — this is 'CopyRect farther': the hint spans
+   however many frames the sender fell behind.  A non-move composite (NEW NIL) keeps OLD (the
+   window hasn't moved; the extra damage rides the diff).  Two independent moves -> NIL."
+  (cond
+    ((null new) old)
+    ((null old) new)
+    (t (destructuring-bind (osx osy odx ody ow oh) old
+         (declare (ignore osx osy))
+         (destructuring-bind (nsx nsy ndx ndy nw nh) new
+           (if (and (= odx nsx) (= ody nsy) (= ow nw) (= oh nh))
+               (list (first old) (second old) ndx ndy ow oh)
+               nil))))))
+
 (defun fb-mark-frame (fb damage &optional copy)
-  "Record that a composite just changed region DAMAGE ((x0 y0 x1 y1) or :FULL) and,
-   if it was a window MOVE, COPY = (src-x src-y dst-x dst-y w h) so the sender can
-   emit a CopyRect instead of re-encoding the moved pixels.  Advances the frame
-   counter, so a sender one frame behind can diff only DAMAGE (and trust COPY)."
-  (setf (fb-damage fb) damage
-        (fb-copy fb) copy
-        (fb-frameno fb) (logand (1+ (fb-frameno fb)) most-positive-fixnum)))
+  "Record that a composite changed region DAMAGE ((x0 y0 x1 y1) or :FULL) and, if it was a
+   window MOVE, COPY = (src-x src-y dst-x dst-y w h) so the sender can CopyRect the moved
+   pixels.  ACCUMULATES onto whatever the sender has not taken yet: damage is unioned and
+   successive same-window moves are composed (%FB-COPY-COMPOSE), so a sender several frames
+   behind still gets ONE snapshot->current CopyRect instead of re-encoding.  Advances the
+   frame counter."
+  (%with-frame-lock (fb)
+    (setf (fb-damage fb) (%fb-damage-union (fb-damage fb) damage)
+          (fb-copy fb)   (%fb-copy-compose (fb-copy fb) copy)
+          (fb-frameno fb) (logand (1+ (fb-frameno fb)) most-positive-fixnum))))
+
+(defun fb-take-frame (fb)
+  "Atomically read the accumulated (FRAMENO DAMAGE COPY) and clear DAMAGE/COPY, so the next
+   composite starts a fresh accumulation from where the client now is.  The sender calls this
+   once per update it sends.  Returns (values frameno damage copy)."
+  (%with-frame-lock (fb)
+    (multiple-value-prog1 (values (fb-frameno fb) (fb-damage fb) (fb-copy fb))
+      (setf (fb-damage fb) nil (fb-copy fb) nil))))
 
 (defun %clip-intersect (clip x0 y0 x1 y1)
   "Intersect the (possibly NIL) CLIP box with (x0 y0 x1 y1)."
