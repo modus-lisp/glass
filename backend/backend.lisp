@@ -36,7 +36,12 @@
    (menu     :initform nil :accessor glass-port-menu)         ; open workspace root menu, or nil
    (menu-items :initform '() :accessor glass-port-menu-items)  ; (label . thunk) list for the root menu
    (bg       :initform nil :accessor glass-port-bg)           ; desktop background framebuffer, or nil (flat teal)
-   (wake     :initform (glass:make-wake) :accessor glass-port-wake))  ; nudges RFB senders after compositing
+   (wake     :initform (glass:make-wake) :accessor glass-port-wake)   ; nudges RFB senders after compositing
+   ;; McCLIM repaints accumulate their damage here instead of compositing eagerly;
+   ;; the WM tick loop composites the batch once — a McCLIM app repaints ~20x per
+   ;; interaction, so coalescing turns that burst into one composite (like surfaces).
+   (pending  :initform nil :accessor glass-port-pending)      ; :full / (x y w h) / nil
+   (pending-lock :initform (sb-thread:make-mutex :name "glass-pending") :accessor glass-port-pending-lock))
   (:default-initargs :pointer (make-instance 'climi::standard-pointer)))
 
 (defun parse-glass-server-path (path) path)     ; plist tail becomes initargs
@@ -225,11 +230,32 @@
       (ensure-fb-and-server port mirror)       ; main mirror creates the fb + starts the server
       (sync-fb-size port mirror))
     ;; DAMAGE-TRACK McCLIM repaints: recomposite only the mirror's dirty region
-    ;; (what mcclim-render actually redrew), not the whole 1280x800 — so a gadget
-    ;; hover / caret blink / partial redraw isn't a full-screen composite + re-diff.
+    ;; (what mcclim-render actually redrew), not the whole 1280x800.  And COALESCE:
+    ;; a McCLIM app fires ~20 repaints per interaction, so in WM mode accumulate the
+    ;; damage and let the tick loop composite the batch ONCE (eager per-repaint
+    ;; compositing is what made CLIM apps jumpy).  Single-app mode has no tick, so
+    ;; it composites eagerly.
     (let ((box (mirror-damage-box mirror)))
       (unless (eq box :empty)                  ; nothing drawn since last flush -> nothing to do
-        (composite-all port box)))))           ; BOX = (x y w h) damage, or NIL = full
+        (if (glass-port-wm-p port)
+            (port-accumulate-damage port box)
+            (composite-all port box))))))       ; BOX = (x y w h) damage, or NIL = full
+
+(defun port-accumulate-damage (port box)
+  "Union BOX (an (x y w h) rect, or NIL = whole screen) into PORT's pending McCLIM
+   damage.  The WM tick loop drains and composites it, coalescing a repaint burst
+   into one composite."
+  (sb-thread:with-mutex ((glass-port-pending-lock port))
+    (let ((cur (glass-port-pending port)))
+      (setf (glass-port-pending port)
+            (cond ((or (eq cur :full) (null box)) :full)
+                  ((null cur) box)
+                  (t (wm-box-union (list cur box))))))))
+
+(defun port-take-pending (port)
+  "Atomically read + clear PORT's pending McCLIM damage: :full, an (x y w h) box, or NIL."
+  (sb-thread:with-mutex ((glass-port-pending-lock port))
+    (prog1 (glass-port-pending port) (setf (glass-port-pending port) nil))))
 
 (defun mirror-damage-box (mirror)
   "Screen-space (x y w h) of MIRROR's accumulated dirty region — what to recomposite

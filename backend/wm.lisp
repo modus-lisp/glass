@@ -766,12 +766,17 @@
     ;; no wasted full-screen redraws.  A NIL dirty-p means "always redraw" (safe
     ;; default); a static surface (image) reports NIL forever.  WM operations
     ;; (move/resize/menu/...) recomposite directly, so they're not gated here.
-    (loop (sleep 1/30)
+    (loop (sleep 1/60)
           (let ((boxes '()) (full nil))
             (dolist (s (glass-port-surfaces p))
               (cond ((null (wm-surface-dirty-p s)) (setf full t))        ; unknown extent -> whole screen
                     ((funcall (wm-surface-dirty-p s)) (push (wm-window-box s) boxes))))
+            ;; McCLIM app repaints accumulated by present-mirror since the last tick,
+            ;; coalesced into ONE composite here (a burst of ~20 repaints -> 1 paint)
+            (let ((pend (port-take-pending p)))
+              (cond ((eq pend :full) (setf full t))
+                    (pend (push pend boxes))))
             (when (or full boxes)
-              ;; damage only the changed surface windows (a full-screen surface
-              ;; with no dirty-p forces a whole-screen recomposite)
+              ;; damage only the changed windows (a full-screen surface with no
+              ;; dirty-p, or a :full McCLIM repaint, forces a whole-screen recomposite)
               (ignore-errors (composite-all p (unless full (wm-box-union boxes)))))))))

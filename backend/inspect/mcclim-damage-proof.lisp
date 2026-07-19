@@ -37,25 +37,41 @@
       (format t "~&[mcclim-damage: repaint touches only the dirty region]~%")
       (check (wait-until (lambda () (glass-port-mirrors port))) "frame realized a mirror")
       (sleep 0.5)
-      (let ((fb (glass-port-fb port))
-            (mirror (find-if #'glass-mirror-managed (glass-port-mirrors port))))
-        ;; (a) a real full-pane redisplay -> a BOUNDED box (the window), not the 1280x800 screen
-        (setf (glass:fb-damage fb) :consumed)
+      (let ((mirror (find-if #'glass-mirror-managed (glass-port-mirrors port))))
+        ;; (a) a real full-pane redisplay -> a BOUNDED pending box (the window), not
+        ;; 1280x800.  In WM mode present-mirror ACCUMULATES to pending (coalesced) —
+        ;; the tick loop composites it — so read port-take-pending, not fb-damage.
+        (port-take-pending port)                           ; clear any startup accumulation
         (clim:redisplay-frame-pane frame (clim:find-pane-named frame 'canvas) :force-p t)
         (%mirror-force-output port mirror)
-        (let ((d (glass:fb-damage fb)))
-          (check (consp d) "real repaint -> bounded damage box, not :full (~a)" d)
+        (let ((d (port-take-pending port)))                ; (x y w h), accumulated not yet composited
+          (check (consp d) "real repaint -> bounded pending damage box, not :full (~a)" d)
           (when (consp d)
-            (destructuring-bind (x0 y0 x1 y1) d
-              (check (and (< (- x1 x0) 1280) (< (- y1 y0) 800))
-                     "damage bounded to the window (~dx~d), not the whole screen" (- x1 x0) (- y1 y0)))))
+            (destructuring-bind (x y w h) d (declare (ignore x y))
+              (check (and (< w 1280) (< h 800))
+                     "damage bounded to the window (~dx~d), not the whole screen" w h))))
         ;; (b) mirror-damage-box itself: a small dirty region -> a small screen box
         (setf (mcclim-render::image-dirty-region mirror) (clim:make-rectangle* 10 12 34 40))
         (let ((box (mirror-damage-box mirror)))
           (check (and (consp box) (= (third box) 24) (= (fourth box) 28))
                  "small dirty region -> small box ~a (expect 24x28 at mirror origin)" box)
           (check (clim:region-equal (mcclim-render::image-dirty-region mirror) clim:+nowhere+)
-                 "dirty region is consumed (reset to +nowhere+) after reading"))))
+                 "dirty region is consumed (reset to +nowhere+) after reading"))
+        ;; (c) COALESCING: a burst of McCLIM repaints accumulates -> ONE composite
+        (port-take-pending port)
+        (glass:perf-reset)
+        (dotimes (i 15)
+          (setf (mcclim-render::image-dirty-region mirror) (clim:make-rectangle* 5 5 40 40))
+          (%mirror-force-output port mirror))
+        (check (= (glass::pf-composites glass::*perf*) 0)
+               "15 McCLIM repaints -> 0 eager composites (all accumulated), composites=~d"
+               (glass::pf-composites glass::*perf*))
+        (check (consp (glass-port-pending port)) "the burst is one coalesced pending box: ~a"
+               (glass-port-pending port))
+        (let ((pend (port-take-pending port))) (composite-all port pend))
+        (check (= (glass::pf-composites glass::*perf*) 1)
+               "the tick composites the whole burst ONCE, composites=~d"
+               (glass::pf-composites glass::*perf*))))
     (sb-concurrency:send-message (glass-port-mailbox port) (lambda () nil)))
   (format t "~%=> ~:[PASS~;FAIL (~d)~]~%" (plusp fail) fail)
   (finish-output) (sb-ext:exit :code (if (plusp fail) 1 0)))
