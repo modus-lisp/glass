@@ -1,28 +1,26 @@
-;;;; vncauth-test.lisp — validate the from-scratch DES against the FIPS 46-3 test
-;;;; vector, and the VNC-auth response round-trip (encrypt == verify).
+;;;; vncauth-test.lisp — the glass VNC-auth wrapper (RFB key quirk + DES-ECB
+;;;; response, DES from seal).  The DES known-answer vectors live in seal's own
+;;;; self-test; here we check the RFB-specific wiring: a response verifies against
+;;;; its own password and not another, and is 16 bytes.
 ;;;;   sbcl --non-interactive --load backend/inspect/vncauth-test.lisp
 (require :asdf)
 (load "~/quicklisp/setup.lisp")
 (handler-bind ((warning #'muffle-warning))
-  (let ((*standard-output* (make-broadcast-stream))) (ql:quickload '(:glass))))
+  (let ((*standard-output* (make-broadcast-stream))) (ql:quickload '(:glass :glass/vncauth))))
 (in-package :glass)
 
 (let ((fail 0))
   (flet ((check (ok fmt &rest args) (format t "  [~:[FAIL~;pass~]] ~?~%" ok fmt args) (unless ok (incf fail))))
-    (format t "~&[vncauth: DES + VNC challenge/response]~%")
-    ;; FIPS 46-3 known-answer: key 133457799BBCDFF1, PT 0123456789ABCDEF -> CT 85E813540F0AB405
-    (let ((ct (des-encrypt-block (des-subkeys #x133457799BBCDFF1) #x0123456789ABCDEF)))
-      (check (= ct #x85E813540F0AB405) "FIPS DES vector: got ~16,'0X (expect 85E813540F0AB405)" ct))
-    ;; a second independent DES vector (all-zero key + plaintext -> 8CA64DE9C1B123A7)
-    (let ((ct (des-encrypt-block (des-subkeys 0) 0)))
-      (check (= ct #x8CA64DE9C1B123A7) "DES zero vector: got ~16,'0X (expect 8CA64DE9C1B123A7)" ct))
-    ;; VNC round-trip: the response we'd compute verifies; a wrong password does not
-    (let* ((challenge (make-array 16 :element-type '(unsigned-byte 8)))
-           (pw "hunter2"))
+    (format t "~&[vncauth: RFB VNC-auth wrapper over seal's DES]~%")
+    (check *vnc-verify-fn* "loading :glass/vncauth installed the verifier hook")
+    (let* ((challenge (make-array 16 :element-type '(unsigned-byte 8))))
       (dotimes (i 16) (setf (aref challenge i) (logand (* i 37) #xff)))
-      (let ((resp (vnc-auth-response pw challenge)))
-        (check (vnc-auth-verify pw challenge resp) "correct password verifies its own response")
+      (let ((resp (vnc-auth-response "hunter2" challenge)))
+        (check (= (length resp) 16) "response is 16 bytes")
+        (check (vnc-auth-verify "hunter2" challenge resp) "correct password verifies its own response")
         (check (not (vnc-auth-verify "wrongpw" challenge resp)) "a wrong password does NOT verify")
-        (check (= (length resp) 16) "response is 16 bytes"))))
+        ;; >8-char passwords are truncated to 8 by VNC: 'password' == 'password123'
+        (check (equalp (vnc-auth-response "password" challenge) (vnc-auth-response "password123" challenge))
+               "password truncated to 8 chars (VNC rule)"))))
   (format t "~%=> ~:[PASS~;FAIL (~d)~]~%" (plusp fail) fail)
   (finish-output) (sb-ext:exit :code (if (plusp fail) 1 0)))

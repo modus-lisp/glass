@@ -96,14 +96,23 @@
    so it stops prompting).  NIL = the open posture (None for 3.7+, any-password VNC
    auth for 3.3/macOS).  Set it live: (setf glass:*vnc-password* \"...\").")
 
+(defvar *vnc-verify-fn* nil
+  "Installed by the optional :glass/vncauth system: (password challenge response) ->
+   bool, the DES verify via seal.  Kept a HOOK so core :glass carries no crypto
+   dependency — with *vnc-password* set but this NIL, connections FAIL CLOSED.")
+
 (defun vnc-auth-exchange (s)
-  "VNC-auth challenge/response over S.  Returns T to admit the client — verified
-   against *VNC-PASSWORD* when set, else accepted (any password)."
+  "VNC-auth challenge/response over S.  Returns T to admit the client: with no
+   password set, any response is accepted; with a password, the DES verifier
+   (*vnc-verify-fn*, from :glass/vncauth) must confirm it — and if that verifier is
+   absent, the client is rejected (fail closed)."
   (let ((challenge (make-array 16 :element-type '(unsigned-byte 8))))
     (dotimes (i 16) (setf (aref challenge i) (random 256)))
     (w-bytes s challenge) (force-output s)
     (let ((response (r-bytes s 16)))
-      (if *vnc-password* (vnc-auth-verify *vnc-password* challenge response) t))))
+      (cond ((null *vnc-password*) t)                                  ; open: accept any
+            (*vnc-verify-fn* (funcall *vnc-verify-fn* *vnc-password* challenge response))
+            (t nil)))))                                                ; secured, no verifier -> reject
 
 (defun vnc-auth-and-result (s minor)
   "Run VNC auth, send the RFB SecurityResult (0 OK / 1 failed, + a reason string on

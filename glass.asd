@@ -31,9 +31,20 @@ give modus a remote display, developed and tested on SBCL first."
     :serial t
     :components
     ((:file "perf")
-     (:file "vncauth")
      (:file "rfb")
      (:file "zrle")))))
+
+(asdf:defsystem :glass/vncauth
+  :description "VNC Authentication (the RFB DES challenge/response) for glass's
+server, via seal's DES.  OPTIONAL — core :glass carries no crypto dependency and
+leaves *vnc-password* verification to a hook; loading this system installs the
+verifier (so a set *vnc-password* is enforced) and pulls in seal."
+  :version "0.0.1"
+  :author "ynniv"
+  :license "MIT"
+  :depends-on ("glass" "seal")
+  :serial t
+  :components ((:module "src" :serial t :components ((:file "vncauth")))))
 
 (asdf:defsystem :glass/text
   :description "First-class text on a glass framebuffer, via scribe (fb-text) —

@@ -6,7 +6,7 @@
 (require :asdf)
 (load "~/quicklisp/setup.lisp")
 (handler-bind ((warning #'muffle-warning))
-  (let ((*standard-output* (make-broadcast-stream))) (ql:quickload '(:glass))))
+  (let ((*standard-output* (make-broadcast-stream))) (ql:quickload '(:glass :glass/vncauth))))
 (defpackage #:ae (:use #:cl)) (in-package #:ae)
 
 (defun r8 (s) (read-byte s)) (defun r16 (s) (logior (ash (r8 s) 8) (r8 s)))
