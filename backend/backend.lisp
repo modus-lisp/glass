@@ -159,20 +159,25 @@
         (start-glass-server port)))))
 
 (defun blit-mirror (mirror fb)
-  "Composite one mirror's image into FB at the mirror's screen position (opaque)."
+  "Composite one mirror's image into FB at the mirror's screen position (opaque),
+   honoring FB's clip box — so a damage-limited recomposite (McCLIM repaint) only
+   touches the changed region, like blit-fb does for surfaces."
   (when-let ((image (mcclim-render::image-mirror-image mirror)))
     (mcclim-render::with-image-locked (mirror)
       (let* ((arr (climi::pattern-array image))
              (ih (array-dimension arr 0)) (iw (array-dimension arr 1))
              (ox (glass-mirror-x mirror)) (oy (glass-mirror-y mirror))
-             (dpx (glass:fb-pixels fb)) (fw (glass:fb-width fb)) (fh (glass:fb-height fb)))
+             (dpx (glass:fb-pixels fb)) (fw (glass:fb-width fb)) (fh (glass:fb-height fb))
+             (clip (glass:fb-clip fb))
+             (cx0 (if clip (first clip) 0)) (cy0 (if clip (second clip) 0))
+             (cx1 (if clip (third clip) fw)) (cy1 (if clip (fourth clip) fh)))
         (dotimes (iy ih)
           (let ((fy (+ oy iy)))
-            (when (< -1 fy fh)
+            (when (and (< -1 fy fh) (<= cy0 fy) (< fy cy1))
               (let ((frow (* fy fw)))
                 (dotimes (ix iw)
                   (let ((fx (+ ox ix)))
-                    (when (< -1 fx fw)
+                    (when (and (< -1 fx fw) (<= cx0 fx) (< fx cx1))
                       (setf (aref dpx (+ frow fx)) (logand (aref arr iy ix) #x00ffffff)))))))))))))
 
 (defun composite-all (port &optional damage copy)
@@ -188,7 +193,7 @@
                    (wm-composite port fb)
                    ;; mirrors is newest-first; composite oldest (main) first so newer are on top
                    (dolist (mirror (reverse (glass-port-mirrors port))) (blit-mirror mirror fb)))))
-        (if (and damage (glass-port-wm-p port))
+        (if damage                            ; blit-mirror + blit-fb both honor the clip now
             (destructuring-bind (dx dy dw dh) damage
               (glass:with-fb-clip (fb dx dy dw dh) (paint))
               (glass:fb-mark-frame fb (list dx dy (+ dx dw) (+ dy dh)) copy))
@@ -217,7 +222,31 @@
     (when (glass-mirror-main mirror)
       (ensure-fb-and-server port mirror)       ; main mirror creates the fb + starts the server
       (sync-fb-size port mirror))
-    (composite-all port)))
+    ;; DAMAGE-TRACK McCLIM repaints: recomposite only the mirror's dirty region
+    ;; (what mcclim-render actually redrew), not the whole 1280x800 — so a gadget
+    ;; hover / caret blink / partial redraw isn't a full-screen composite + re-diff.
+    (let ((box (mirror-damage-box mirror)))
+      (unless (eq box :empty)                  ; nothing drawn since last flush -> nothing to do
+        (composite-all port box)))))           ; BOX = (x y w h) damage, or NIL = full
+
+(defun mirror-damage-box (mirror)
+  "Screen-space (x y w h) of MIRROR's accumulated dirty region — what to recomposite
+   after a McCLIM repaint.  :EMPTY = nothing changed; NIL = unbounded/full.  Consumes
+   (resets) the dirty region; the box is clamped to the mirror image's bounds."
+  (let ((dr (mcclim-render::image-dirty-region mirror))
+        (image (mcclim-render::image-mirror-image mirror)))
+    (setf (mcclim-render::image-dirty-region mirror) clim:+nowhere+)
+    (cond
+      ((clim:region-equal dr clim:+nowhere+) :empty)
+      ((or (null image) (clim:region-equal dr clim:+everywhere+)) nil)     ; full repaint
+      (t (multiple-value-bind (x1 y1 x2 y2) (clim:bounding-rectangle* dr)
+           (multiple-value-bind (iw ih) (image-wh image)
+             (let ((bx0 (max 0 (min iw (floor x1)))) (by0 (max 0 (min ih (floor y1))))
+                   (bx1 (max 0 (min iw (ceiling x2)))) (by1 (max 0 (min ih (ceiling y2)))))
+               (if (and (< bx0 bx1) (< by0 by1))
+                   (list (+ (glass-mirror-x mirror) bx0) (+ (glass-mirror-y mirror) by0)
+                         (- bx1 bx0) (- by1 by0))
+                   :empty))))))))
 
 (defun %mirror-force-output (port mirror)
   (present-mirror port mirror))
