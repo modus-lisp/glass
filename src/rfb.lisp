@@ -22,10 +22,10 @@
 ;;; ---- stream byte I/O (big-endian on the wire, per RFB) ----------------------
 
 (declaim (inline w-u8 w-u16 w-u32 r-u8 r-u16 r-u32))
-(defun w-u8  (s v) (write-byte (logand v #xff) s))
+(defun w-u8  (s v) (tx+ 1) (write-byte (logand v #xff) s))
 (defun w-u16 (s v) (w-u8 s (ash v -8)) (w-u8 s v))
 (defun w-u32 (s v) (w-u16 s (ash v -16)) (w-u16 s v))
-(defun w-bytes (s b) (write-sequence b s))
+(defun w-bytes (s b) (tx+ (length b)) (write-sequence b s))
 (defun r-u8  (s) (read-byte s))
 (defun r-u16 (s) (logior (ash (read-byte s) 8) (read-byte s)))
 (defun r-u32 (s) (logior (ash (r-u16 s) 16) (r-u16 s)))
@@ -458,8 +458,12 @@
                 (caught-up (and (plusp (first req)) (eql (rc-last-frame client) (1- frame))))
                 (region (if (and caught-up (consp (fb-damage fb))) (fb-damage fb) :full))
                 (copy   (and caught-up (fb-copy fb)))
-                (sent (handler-case (send-update client fb s req region copy)
-                        (error () (setf (rc-running client) nil) nil))))
+                (tx (list 0)) (t0 (get-internal-real-time))
+                (sent (let ((*tx* tx))
+                        (handler-case (send-update client fb s req region copy)
+                          (error () (setf (rc-running client) nil) nil)))))
+           (when (and sent *perf-on*)
+             (perf-record-send (- (get-internal-real-time) t0) region copy (car tx)))
            (setf (rc-last-gen client) gen (rc-last-frame client) frame)
            (if sent
                (sb-thread:with-mutex ((rc-lock client))

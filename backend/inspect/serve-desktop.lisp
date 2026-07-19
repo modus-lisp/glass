@@ -13,9 +13,39 @@
     (asdf:load-system :mcclim-glass)))
 
 (setf glass:*desktop-name* "modus-lisp :: glass desktop")
+
+;;; Bare-TCP control/eval socket on 127.0.0.1:4009 — read one form, eval it in the
+;;; clim-glass package, write the printed result.  Lets us read live perf and poke
+;;; at the RUNNING desktop with no restart:
+;;;   echo '(glass:perf-reset)'  | nc -q1 127.0.0.1 4009
+;;;   echo '(glass:perf-report)' | nc -q1 127.0.0.1 4009
+(defun start-control-socket (&optional (port 4009))
+  (sb-thread:make-thread
+   (lambda ()
+     (let ((listen (glass:tcp-listen port :address "127.0.0.1")))
+       (loop
+         (handler-case
+             (let ((s (sb-bsd-sockets:socket-make-stream
+                       (sb-bsd-sockets:socket-accept listen)
+                       :input t :output t :element-type 'character :buffering :full)))
+               (unwind-protect
+                    (let ((*package* (find-package :clim-glass))
+                          (form (read s nil nil)))
+                      (when form
+                        (write-string
+                         (handler-case (princ-to-string (eval form))
+                           (error (e) (format nil "ERROR: ~a" e)))
+                         s)
+                        (terpri s) (force-output s)))
+                 (ignore-errors (close s))))
+           (error () nil)))))
+   :name "glass-control"))
+
 (let ((wp (namestring (merge-pathnames "assets/wallpaper.svg"
                                        (asdf:system-source-directory :mcclim-glass)))))
+  (start-control-socket 4009)
   (format *error-output* "~&@@ glass desktop serving on 0.0.0.0:5901 (~a)~%" wp)
+  (format *error-output* "@@ control socket on 127.0.0.1:4009~%")
   (finish-output *error-output*)
   (clim-glass:run-wm '((:terminal :cols 80 :rows 24 :ppem 14))
                      :port 5901 :width 1280 :height 800

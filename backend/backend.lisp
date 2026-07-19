@@ -187,18 +187,20 @@
    the whole screen (menus, resize, McCLIM updates, first paint).  COPY = (sx sy
    dx dy w h) marks a window MOVE so the sender can CopyRect it (near-free drag)."
   (when-let ((fb (glass-port-fb port)))
-    (glass:with-fb-locked (fb)
-      (flet ((paint ()
-               (if (glass-port-wm-p port)
-                   (wm-composite port fb)
-                   ;; mirrors is newest-first; composite oldest (main) first so newer are on top
-                   (dolist (mirror (reverse (glass-port-mirrors port))) (blit-mirror mirror fb)))))
-        (if damage                            ; blit-mirror + blit-fb both honor the clip now
-            (destructuring-bind (dx dy dw dh) damage
-              (glass:with-fb-clip (fb dx dy dw dh) (paint))
-              (glass:fb-mark-frame fb (list dx dy (+ dx dw) (+ dy dh)) copy))
-            (progn (paint) (glass:fb-mark-frame fb :full))))
-      (glass:fb-touch fb))                ; content changed -> the sender should re-scan
+    (let ((%t0 (get-internal-real-time)))
+      (glass:with-fb-locked (fb)
+        (flet ((paint ()
+                 (if (glass-port-wm-p port)
+                     (wm-composite port fb)
+                     ;; mirrors is newest-first; composite oldest (main) first so newer are on top
+                     (dolist (mirror (reverse (glass-port-mirrors port))) (blit-mirror mirror fb)))))
+          (if damage                          ; blit-mirror + blit-fb both honor the clip now
+              (destructuring-bind (dx dy dw dh) damage
+                (glass:with-fb-clip (fb dx dy dw dh) (paint))
+                (glass:fb-mark-frame fb (list dx dy (+ dx dw) (+ dy dh)) copy))
+              (progn (paint) (glass:fb-mark-frame fb :full))))
+        (glass:fb-touch fb))              ; content changed -> the sender should re-scan
+      (glass:perf-record-composite (- (get-internal-real-time) %t0) damage))
     (glass:wake-signal (glass-port-wake port))))   ; …and wake it now, don't wait for its poll
 
 (defun sync-fb-size (port mirror)

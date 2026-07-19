@@ -30,7 +30,8 @@ give modus a remote display, developed and tested on SBCL first."
   ((:module "src"
     :serial t
     :components
-    ((:file "rfb")
+    ((:file "perf")
+     (:file "rfb")
      (:file "zrle")))))
 
 (asdf:defsystem :glass/text
