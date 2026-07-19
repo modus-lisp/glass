@@ -15,10 +15,14 @@ lands, without fighting bare-metal quirks in the meantime).
 
 ## Status & disclaimer
 
-Early and small: RFB 3.8, `None` security, keyboard/pointer input, and three
-lossless encodings — Raw, Hextile, and ZRLE (zlib-compressed, via
-[cram](https://github.com/modus-lisp/cram)) — with dirty-region tracking so a
-mostly-static screen costs almost nothing. **Research / educational; not audited.**
+A version-adaptive handshake (**RFB 3.3 and 3.8**), `None` and **VNC-authentication**
+security, keyboard/pointer input, and lossless encodings — Raw, Hextile, ZRLE
+(zlib-compressed, via [cram](https://github.com/modus-lisp/cram)) and TRLE, plus
+**CopyRect** for window moves and a **stored-block ZRLE** fast path — with
+dirty-region tracking so a mostly-static screen costs almost nothing.
+Interoperates with **TigerVNC** and **macOS Screen Sharing**. On top of the server
+sits an optional **McCLIM OPEN LOOK desktop** (see below). **Research /
+educational; not audited.**
 No warranty (see [LICENSE](LICENSE)).
 
 Validated in-process by a self-test (an RFB client that reads the framebuffer back
@@ -42,8 +46,10 @@ client. See [Build & test](#build--test).
 - **Framebuffer** — a row-major `(unsigned-byte 32)` buffer of `0x00RRGGBB`
   pixels, with clipped drawing: `fb-put` / `fb-get`, `fb-fill`, `fb-rect`,
   `fb-hline` / `fb-vline`, `fb-frame` (outline), `fb-blit` (compose), `rgb`.
-- **RFB server** — the version + security handshake (`None`), `ServerInit`
-  (32-bit X8R8G8B8), and the message loop:
+- **RFB server** — a **version-adaptive** handshake (**3.3** clients like macOS
+  Screen Sharing get a single security type + `VNC` authentication; **3.7/3.8**
+  clients get the type list + `None`), `ServerInit` (32-bit X8R8G8B8), and the
+  message loop:
   - **Dirty-region tracking** — each client keeps a snapshot; an incremental
     `FramebufferUpdateRequest` sends only the tiles that changed since, so a
     static screen costs almost nothing.
@@ -52,8 +58,15 @@ client. See [Build & test](#build--test).
     raw) run through one *persistent* zlib stream per connection (via
     [cram](https://github.com/modus-lisp/cram)'s `Z_SYNC_FLUSH`), the strongest
     ratio; **Hextile** — zlib-free, excellent for desktop UI (solid runs cost a
-    byte or two), ~**88× smaller than Raw** on a typical 800×600 frame; **Raw** as
-    the fallback. All pixel-identical.
+    byte or two), ~**88× smaller than Raw** on a typical 800×600 frame; **TRLE**
+    (16×16 tiles, no zlib); **Raw** as the fallback. All pixel-identical.
+  - **`CopyRect`** — a window move sends "copy those pixels to the new spot"
+    instead of re-encoding them (near-free drags on clients that support it).
+  - **Stored-block ZRLE fast path** — for big/incompressible frames, skip
+    deflate's LZ77 (it's the encode wall and barely helps) and emit stored zlib
+    blocks: still ordinary ZRLE on the wire, ~an order of magnitude cheaper to
+    encode on a fast link (`*zrle-stored-threshold*`).
+  - **`TCP_NODELAY`** so small interactive frames aren't held ~40 ms by Nagle.
   - **`KeyEvent` / `PointerEvent`** dispatched to caller callbacks.
   - **Desktop resize**, both ways — `DesktopSize` tells the client when the
     framebuffer changes size, and `SetDesktopSize` (client-driven, via
@@ -62,21 +75,40 @@ client. See [Build & test](#build--test).
 
   Each client runs in its own thread; `:once` serves a single client (for tests).
 
-## Running McCLIM apps over VNC (no X)
+## An OPEN LOOK desktop over VNC (no X)
 
 [`backend/`](backend/) is an optional **McCLIM backend** (`mcclim-glass`) that
 renders CLIM applications into a glass framebuffer and serves them over VNC —
 `(clim-glass:run-frame 'my-frame :port 5900)`, then point any VNC client at
 `localhost:5900`. Pure Lisp end to end: McCLIM's software renderer draws into an
 image, glass ships it, RFB input comes back as CLIM events. Stock apps
-(`clim-demo::gadget-test`, …) render and interact. See [backend/README](backend/README.md).
+(`clim-demo::gadget-test`, the calculator, the listener, …) render and interact.
+
+`(clim-glass:run-wm …)` goes further — a tiny **OPEN LOOK** window manager (Sun
+teal workspace, title bars, drag/raise/resize/close, a workspace root menu) that
+composites McCLIM apps, PTY terminals, and a browser side by side. The compositor
+does the interesting work:
+
+- **Damage-tracked, coalesced compositing** — a repaint recomposites (and
+  re-encodes) only the region that actually changed, and a burst of McCLIM
+  repaints coalesces to one composite per tick, not twenty.
+- **Adaptive window drag** — moving a window is opaque (with `CopyRect`) while the
+  connection keeps up; if the socket send-queue backs up (a big window on a client
+  that can't `CopyRect`, e.g. macOS), the drag switches to a **wireframe** outline
+  and snaps into place on release — so it never lags behind the cursor.
+- **Live perf + control socket** — standing per-frame counters (composite/encode
+  time, bytes, fps, send-queue backlog) readable, and every knob tunable, on the
+  *running* server with no restart.
+
+See [backend/README](backend/README.md).
 
 ## Not yet
 
 ZRLE's run-length subencodings (plain/palette RLE) and the Tight encoding; a
 client's format request (`SetPixelFormat`) is read but not honored (we always
-serve X8R8G8B8); no VNC authentication; no `CopyRect`-based scroll optimization.
-Contributions welcome.
+serve X8R8G8B8); VNC authentication completes the challenge/response but does not
+*verify* the password (any password is accepted — the same open posture as
+`None`; real enforcement needs a DES verify). Contributions welcome.
 
 ## Build & test
 

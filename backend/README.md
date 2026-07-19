@@ -26,15 +26,42 @@ by a framebuffer copy, and X's event source replaced by glass's `on-key` /
 loop (blocking). The port starts an RFB server on the first paint and the CLIM
 event-loop thread that drives it.
 
+## An OPEN LOOK desktop
+
+`(clim-glass:run-wm SPECS &key port width height background)` runs a tiny
+**OPEN LOOK** window manager over VNC: a Sun-teal (or image/SVG) workspace with
+decorated windows — title bars with the abbreviated-menu button, drag/raise,
+functional resize and close, a right-click workspace root menu — compositing
+McCLIM application frames, PTY **terminals**, and a **browser** side by side. Each
+`spec` is a window: `(FRAME-CLASS …)`, `(:terminal …)`, `(:browse URL …)`,
+`(:inspect FORM)` (Clouseau), `(:edit …)` (Climacs), … The compositor adds:
+
+- **Damage-tracked, coalesced compositing** — recomposite + re-encode only the
+  region that changed; a burst of McCLIM repaints coalesces to one composite per
+  tick.
+- **Adaptive drag** — opaque with `CopyRect` while the connection keeps up;
+  switches to a **wireframe** outline when the socket send-queue backs up (a big
+  window on a no-`CopyRect` client like macOS), snapping into place on release.
+- **Live perf + control socket** — standing per-frame counters and every knob
+  tunable on the running server (see `inspect/serve-desktop.lisp`, which also
+  opens a bare-TCP eval socket: `echo '(glass:perf-report)' | nc -q1 127.0.0.1 4009`).
+
+Also a **message-port** backend (`clim-glass:make-message-port`) + **compositor**
+that run each app as an isolated actor drawing to a shared display over a mailbox —
+an unmodified CLIM frame across an actor boundary — the shape glass takes toward
+modus.
+
 ## Status
 
-Proof of concept. Working: a live frame renders over VNC at its laid-out size,
-incremental (dirty-tile) updates, and both pointer and keyboard input driving
-real state changes (see `inspect/interactive.lisp`, a headless end-to-end test
-that reads the framebuffer back over RFB and verifies the app reacted).
+Working over VNC (validated with **TigerVNC** and **macOS Screen Sharing**): live
+frames at their laid-out size, incremental (dirty-tile) updates, pointer +
+keyboard input, **desktop resize both ways** (`DesktopSize` / `SetDesktopSize`),
+and the OPEN LOOK desktop above. Headless in-process proofs under `inspect/`
+(`interactive`, `compositor-proof`, `mcclim-damage-proof`, `adaptive-drag-proof`,
+`handshake33-proof`, …) read the framebuffer back over RFB, or the compositor
+state directly, and verify behavior.
 
-Not yet: window/desktop resize after the first paint (the fb size is fixed once
-the client negotiates it — needs the DesktopSize pseudo-encoding), a pointer
-cursor, multiple top-level windows (menus/dialogs share the single framebuffer),
-and command `:keystroke` accelerators without an interactor pane (standard CLIM —
-key events are delivered; a frame with an interactor gets accelerators for free).
+Not yet: a pointer cursor shape; multiple top-level windows of one frame
+(menus/dialogs) still share the single framebuffer; command `:keystroke`
+accelerators without an interactor pane (standard CLIM — key events are delivered;
+a frame with an interactor gets accelerators for free).
