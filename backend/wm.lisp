@@ -270,12 +270,14 @@
 
 (defun wm-drag-wire-drop (port obj ncx ncy)
   "End a wireframe drag: move the real window to (NCX,NCY) and composite the union of
-   the last outline and the window's new box — the one time the moved content is
-   re-sent."
-  (let ((wire (glass-port-drag-wire-box port)))
+   the window's OLD position (it stayed put through the drag, so its pixels are still
+   on the client and must be ERASED — otherwise a ghost window lingers there), the
+   last outline, and the window's NEW box.  The one time the moved content is re-sent."
+  (let ((old (wm-window-box obj))            ; real position BEFORE the move (the ghost source)
+        (wire (glass-port-drag-wire-box port)))
     (wm-move obj ncx ncy)
     (setf (glass-port-drag-wire port) nil (glass-port-drag-wire-box port) nil)
-    (composite-all port (wm-box-union (list wire (wm-window-box obj))))))
+    (composite-all port (wm-box-union (list old wire (wm-window-box obj))))))
 
 (defun wm-box-union (boxes)
   "Bounding (x y w h) of BOXES, or NIL if empty."
