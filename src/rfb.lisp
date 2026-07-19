@@ -45,6 +45,12 @@
 
 (defun accept-stream (listen)
   (let ((sock (sb-bsd-sockets:socket-accept listen)))
+    ;; TCP_NODELAY: an interactive frame is small (a drag is ~1.6 KB), and with
+    ;; Nagle on, TCP holds each one up to ~40 ms waiting on the peer's ACK — which
+    ;; caps interactive updates at ~17-25 fps regardless of how fast we encode.
+    ;; VNC is request/response with tiny payloads, exactly Nagle's worst case, so
+    ;; every real VNC server disables it.
+    (setf (sb-bsd-sockets:sockopt-tcp-nodelay sock) t)
     (sb-bsd-sockets:socket-make-stream
      sock :input t :output t :element-type '(unsigned-byte 8) :buffering :full)))
 

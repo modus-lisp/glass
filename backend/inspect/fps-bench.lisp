@@ -21,6 +21,7 @@
 (defun connect (port)
   (loop repeat 500 do (let ((sock (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
     (handler-case (progn (sb-bsd-sockets:socket-connect sock (sb-bsd-sockets:make-inet-address "127.0.0.1") port)
+                    (setf (sb-bsd-sockets:sockopt-tcp-nodelay sock) t)   ; like TigerVNC: no Nagle client-side
                     (return-from connect (sb-bsd-sockets:socket-make-stream sock :input t :output t :element-type '(unsigned-byte 8) :buffering :full)))
       (error () (ignore-errors (sb-bsd-sockets:socket-close sock)) (sleep 0.05))))))
 (defun handshake (s)
