@@ -269,16 +269,24 @@
     ((= enc +enc-hextile+) (write-rect-hextile s fb x y w h))
     (t                     (write-rect-raw s fb x y w h))))
 
+(defparameter *use-trle* nil
+  "Whether to upgrade big rects to TRLE (enc 15) for clients that advertise it.
+   OFF by default: TRLE has no validation against a real client's decoder (only our
+   own parser), and macOS Screen Sharing — which DOES negotiate TRLE — fails to
+   render when we send it.  Stored-block ZRLE is chipz-verified, decoded by every
+   ZRLE client, and nearly as fast, so it's the universal big-frame path.  Kept as
+   a flag in case a specific client benefits and is known to decode our TRLE.")
+
 (defun emit-rect (s fb x y w h enc zs trle)
   "Write one rect, choosing the cheapest encoding a large rect's client can take.
-   For a big ZRLE rect: TRLE if the client negotiated it (no zlib, ~200x cheaper),
-   else STORED-block ZRLE (~5x cheaper than full deflate, still ordinary ZRLE — the
-   path TigerVNC-class clients actually get).  Small rects take normal ENC."
+   Big ZRLE rect -> STORED-block ZRLE (~5x cheaper than full deflate, still ordinary
+   ZRLE, so every client decodes it); TRLE only if explicitly enabled AND negotiated.
+   Small rects take normal ENC (cheap because small, best ratio)."
   (cond
-    ((and (= enc +enc-zrle+) (>= (* w h) *trle-threshold*) trle)
-     (write-rect-trle s fb x y w h))                       ; TRLE-capable client
+    ((and *use-trle* trle (= enc +enc-zrle+) (>= (* w h) *trle-threshold*))
+     (write-rect-trle s fb x y w h))                       ; opt-in TRLE (off by default)
     ((and (= enc +enc-zrle+) (>= (* w h) *zrle-stored-threshold*))
-     (write-rect-zrle s fb x y w h zs t))                  ; big ZRLE: stored fast path
+     (write-rect-zrle s fb x y w h zs t))                  ; big ZRLE: stored fast path (universal)
     (t (write-rect s fb x y w h enc zs))))
 
 (defun send-rects (s fb rects enc zs &optional trle)
