@@ -64,13 +64,26 @@
   (w-u8 s 16) (w-u8 s 8) (w-u8 s 0)
   (w-u8 s 0) (w-u8 s 0) (w-u8 s 0))
 
+(defun client-minor-version (ver)
+  "Parse the RFB minor version from a 12-byte \"RFB 003.00X\" ProtocolVersion, or 8."
+  (or (ignore-errors (parse-integer (map 'string #'code-char ver) :start 8 :end 11)) 8))
+
 (defun handshake (fb s name)
-  "RFB 3.8 handshake through ServerInit.  Returns T on success."
+  "RFB handshake through ServerInit, honoring the client's protocol version.  We
+   advertise 3.8, but macOS Screen Sharing (and other legacy clients) answer 3.3,
+   whose security phase is INCOMPATIBLE with 3.7+: 3.3 wants a single u32 security
+   type from the server (client doesn't choose, no SecurityResult), while 3.7+ wants
+   a type LIST + the client's choice + a SecurityResult.  Getting this wrong is a
+   protocol deadlock (a spinning connection that never opens).  Returns T on success."
   (w-bytes s (string->bytes "RFB 003.008")) (w-u8 s 10) (force-output s)
-  (r-bytes s 12)                              ; client ProtocolVersion
-  (w-u8 s 1) (w-u8 s 1) (force-output s)       ; 1 security type: None (1)
-  (r-u8 s)                                     ; client's choice
-  (w-u32 s 0) (force-output s)                 ; SecurityResult = OK
+  (let ((minor (client-minor-version (r-bytes s 12))))   ; client ProtocolVersion
+    (if (>= minor 7)
+        (progn                                 ; 3.7 / 3.8: type list -> client choice -> result
+          (w-u8 s 1) (w-u8 s 1) (force-output s)   ; 1 security type: None (1)
+          (r-u8 s)                                 ; client's chosen type
+          (w-u32 s 0) (force-output s))            ; SecurityResult = OK
+        (progn                                 ; 3.3: server dictates one u32 type, no result
+          (w-u32 s 1) (force-output s))))          ; None (1) -> straight to ClientInit
   (r-u8 s)                                     ; ClientInit (shared-flag)
   (w-u16 s (fb-width fb)) (w-u16 s (fb-height fb))
   (write-pixel-format s)
