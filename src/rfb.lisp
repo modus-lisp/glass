@@ -43,6 +43,19 @@
     (sb-bsd-sockets:socket-listen sock backlog)
     sock))
 
+(defconstant +siocoutq+ #x5411 "Linux SIOCOUTQ: bytes in a socket's send queue not yet sent to the peer.")
+(defun socket-unsent-bytes (fd)
+  "Bytes queued in FD's TCP send buffer the client hasn't drained yet — the real
+   backlog when the sender out-produces a slow client.  0 on any error / non-Linux."
+  (handler-case
+      (sb-alien:with-alien ((n sb-alien:int 0))
+        (if (zerop (sb-alien:alien-funcall
+                    (sb-alien:extern-alien "ioctl"
+                      (function sb-alien:int sb-alien:int sb-alien:unsigned-long (* sb-alien:int)))
+                    fd +siocoutq+ (sb-alien:addr n)))
+            n 0))
+    (error () 0)))
+
 (defun accept-stream (listen)
   (let ((sock (sb-bsd-sockets:socket-accept listen)))
     ;; TCP_NODELAY: an interactive frame is small (a drag is ~1.6 KB), and with
@@ -474,6 +487,7 @@
 (defun rfb-sender-loop (client fb s wake)
   "Fulfil the client's pending request the moment the fb changes (parked on WAKE,
    ~60 Hz safety timeout).  Runs in its own thread; exits when the client stops."
+  (let ((fd (ignore-errors (sb-sys:fd-stream-fd s))))    ; for the socket-queue backlog
   (loop while (rc-running client) do
     (let ((req (sb-thread:with-mutex ((rc-lock client)) (rc-want client))))
       (cond
@@ -498,12 +512,13 @@
                             (handler-case (send-update client fb s req region copy)
                               (error () (setf (rc-running client) nil) nil)))))
                (when (and sent *perf-on*)
-                 (perf-record-send (- (get-internal-real-time) t0) region copy (car tx)))
+                 (perf-record-send (- (get-internal-real-time) t0) region copy (car tx))
+                 (when fd (note-send-queue (socket-unsent-bytes fd))))  ; real downstream backlog
                (setf (rc-last-gen client) gen (rc-last-frame client) frame)
                (if sent
                    (sb-thread:with-mutex ((rc-lock client))
                      (when (eq (rc-want client) req) (setf (rc-want client) nil)))
-                   (wake-wait wake 1/60))))))))))     ; nothing dirty (gen bumped, pixels same) — park
+                   (wake-wait wake 1/60)))))))))))     ; nothing dirty (gen bumped, pixels same) — park
 
 (defun choose-encoding (encs)
   "Pick the best encoding we implement from the client's advertised list.  ZRLE

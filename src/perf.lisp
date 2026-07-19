@@ -26,6 +26,16 @@
   (let ((ms (/ (* 1000d0 (- (get-internal-real-time) mark-time))
                (float internal-time-units-per-second 1d0))))
     (setf *send-lag* (+ (* 0.8d0 *send-lag*) (* 0.2d0 (max 0d0 ms))))))
+
+(defparameter *send-queue* 0.0d0
+  "EWMA (KB) of the socket SEND-QUEUE backlog (SIOCOUTQ) — bytes we've written that
+   the client hasn't drained.  THIS is the real downstream backlog when the sender
+   out-produces a slow client (frames piling up in the kernel), which *send-lag*
+   (the compositor->sender handoff) can't see.")
+(declaim (type double-float *send-queue*))
+(defun note-send-queue (bytes)
+  "Fold one send's socket-queue depth (BYTES) into *SEND-QUEUE* (KB)."
+  (setf *send-queue* (+ (* 0.8d0 *send-queue*) (* 0.2d0 (/ (float bytes 1d0) 1024d0)))))
 (defvar *tx* nil
   "When bound to a (count) cons on the send path, the byte writers add to its car,
    so the sender can total the bytes it actually wrote for one frame.")
@@ -84,7 +94,8 @@
              (f (pf-frames p)) (c (pf-composites p)))
         (with-output-to-string (o)
           (format o "glass perf — ~,1fs window~:[~; (perf OFF)~]~%" el (not *perf-on*))
-          (format o "  SEND       ~d frames, ~,1f fps, backlog ~,1f ms (EWMA)~%" f (/ f el) *send-lag*)
+          (format o "  SEND       ~d frames, ~,1f fps | handoff ~,1f ms | socket-queue ~,1f KB (EWMA)~%"
+                  f (/ f el) *send-lag* *send-queue*)
           (when (plusp f)
             (format o "    encode     ~,2f ms/frame~%" (%pf-ms (/ (pf-enc p) f)))
             (format o "    bytes      ~,1f KB/frame  (~,0f KB/s)~%"

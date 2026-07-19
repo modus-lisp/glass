@@ -1,7 +1,7 @@
 ;;;; adaptive-drag-proof.lisp — a drag stays OPAQUE while the link keeps up, and
 ;;;; switches to WIREFRAME (window stays put, only an outline moves) once the send
 ;;;; backlog crosses the threshold; on release the window lands at the final spot.
-;;;; Drives wm-on-pointer directly with a forced glass:*send-lag*.  In-process.
+;;;; Drives wm-on-pointer directly with a forced glass:*send-queue*.  In-process.
 ;;;;   sbcl --control-stack-size 256 --dynamic-space-size 4096 --non-interactive --load backend/inspect/adaptive-drag-proof.lisp
 (require :asdf)
 (load "~/quicklisp/setup.lisp")
@@ -22,18 +22,18 @@
     (flet ((check (ok fmt &rest args) (format t "  [~:[FAIL~;pass~]] ~?~%" ok fmt args) (unless ok (incf fail))))
       (format t "~&[adaptive drag: opaque when the link keeps up, wireframe when it lags]~%")
       ;; (1) low backlog -> opaque: the real window moves, no wireframe
-      (setf glass:*send-lag* 0d0)
+      (setf glass:*send-queue* 0d0)
       (wm-on-pointer port 1 150 150)                          ; button down, content -> (140,140)
       (check (and (= (wm-surface-x surf) 140) (not (glass-port-drag-wire port)))
              "low backlog -> OPAQUE move (surf x=~d, wire=~a)" (wm-surface-x surf) (glass-port-drag-wire port))
       ;; (2) high backlog -> switch to wireframe: window stays put, outline appears
-      (setf glass:*send-lag* 500d0)
+      (setf glass:*send-queue* 500d0)
       (wm-on-pointer port 1 200 200)                          ; content -> (190,190)
       (check (glass-port-drag-wire port) "high backlog -> switched to WIREFRAME")
       (check (= (wm-surface-x surf) 140) "the real window did NOT move in wireframe (still x=~d)" (wm-surface-x surf))
       (check (consp (glass-port-drag-wire-box port)) "a moving outline box exists: ~a" (glass-port-drag-wire-box port))
       ;; (3) stays wireframe even if backlog recovers (no flapping mid-drag)
-      (setf glass:*send-lag* 0d0)
+      (setf glass:*send-queue* 0d0)
       (wm-on-pointer port 1 220 220)
       (check (and (glass-port-drag-wire port) (= (wm-surface-x surf) 140))
              "stays wireframe for the rest of the drag (no flapping)")

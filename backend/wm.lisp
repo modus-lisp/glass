@@ -230,8 +230,12 @@
 ;;; the outline is a few thin rects, near-free to encode; the real window snaps to
 ;;; the final spot on release.
 (defparameter *drag-adaptive* t "Auto-switch a laggy opaque drag to wireframe.")
-(defparameter *wireframe-lag-ms* 120.0d0
-  "Send-backlog EWMA (ms) past which an in-progress drag switches to wireframe.")
+(defparameter *wireframe-queue-kb* 100.0d0
+  "Socket send-queue backlog EWMA (KB, glass:*send-queue*) past which an in-progress
+   drag switches to wireframe — the real 'client can't keep up' signal.  A CopyRect
+   client's cheap opaque drags never back the queue up, so it stays opaque; a
+   no-CopyRect client (macOS) re-encoding the whole window backs it up and trips
+   wireframe.  Tune live over the control socket.")
 
 (defun wm-drag-move-opaque (port obj ncx ncy)
   "Opaque move step: move the real window to content-position (NCX,NCY) and composite
@@ -245,10 +249,10 @@
                              (third old) (fourth old)))))))
 
 (defun wm-drag-move (port obj ncx ncy)
-  "A drag move: opaque, unless the send backlog (glass:*send-lag*) shows the link
-   can't keep up — then switch THIS drag to wireframe (outline starts at the window's
-   current box) and don't move the real window."
-  (if (and *drag-adaptive* (> glass:*send-lag* *wireframe-lag-ms*))
+  "A drag move: opaque, unless the socket send-queue (glass:*send-queue*) shows the
+   client can't keep up — then switch THIS drag to wireframe (outline starts at the
+   window's current box) and don't move the real window."
+  (if (and *drag-adaptive* (> glass:*send-queue* *wireframe-queue-kb*))
       (progn
         (setf (glass-port-drag-wire port) t
               (glass-port-drag-wire-box port) (wm-window-box obj))
