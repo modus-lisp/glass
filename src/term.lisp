@@ -33,22 +33,41 @@
     v))
 (defun pal (i) (aref *palette* (logand i 255)))
 (defun q6 (x) (cond ((< x 48) 0) ((< x 115) 1) ((< x 155) 2) ((< x 195) 3) ((< x 235) 4) (t 5)))
-(defun rgb->256 (r g b) (+ 16 (* 36 (q6 r)) (* 6 (q6 g)) (q6 b)))   ; truecolor -> nearest cube
-(defconstant +def-fg+ 7)
-(defconstant +def-bg+ 0)
+;;; ---- colour tokens ---------------------------------------------------------
+;;; A "colour token" is what the SGR state carries: a palette INDEX (0-255) for
+;;; ANSI/256 colours, or a truecolor RGB with bit 24 set as the tag.  Tokens are
+;;; resolved to a real 24-bit RGB (0xRRGGBB) at write time (see put-char), so the
+;;; cell grid stores full 16.7M-colour fg/bg — no more nearest-cube quantisation.
+(defconstant +def-fg+ 7)                                ; default fg: ANSI index 7
+(defconstant +def-bg+ 0)                                ; default bg: ANSI index 0
+(declaim (inline rgb-token resolve-fg resolve-bg))
+(defun rgb-token (rgb) (logior #x1000000 (logand rgb #xffffff)))   ; truecolor SGR -> token
+(defun resolve-fg (token bold)
+  "Token -> RGB.  Palette indices get bold-brightening (0-7 -> 8-15); RGB is verbatim."
+  (if (logbitp 24 token)
+      (logand token #xffffff)
+      (pal (if (and bold (< token 8)) (+ token 8) token))))
+(defun resolve-bg (token)
+  (if (logbitp 24 token) (logand token #xffffff) (pal token)))
 
-;;; ---- cell packing: char | fg<<21 | bg<<25 | bold<<29 -----------------------
-
-(declaim (inline mkcell cell-char cell-fg cell-bg cell-wide-p cell-spacer-p))
-(defun mkcell (ch fg bg bold &key wide spacer)   ; char(21) fg(8) bg(8) bold wide spacer -> 40 bits
-  (logior (logand ch #x1fffff) (ash (logand fg 255) 21) (ash (logand bg 255) 29)
-          (ash (if bold 1 0) 37) (ash (if wide 1 0) 38) (ash (if spacer 1 0) 39)))
-(defun cell-char (c) (logand c #x1fffff))
-(defun cell-fg (c) (logand (ash c -21) 255))
-(defun cell-bg (c) (logand (ash c -29) 255))
-(defun cell-wide-p (c) (logbitp 38 c))          ; glyph spans this + the next cell
-(defun cell-spacer-p (c) (logbitp 39 c))        ; right half of a wide char (draw nothing)
-(defun blank-cell () (mkcell (char-code #\Space) +def-fg+ +def-bg+ nil))
+;;; ---- cell storage: two parallel specialised arrays -------------------------
+;;; A cell is split across two arrays indexed alike (row-major x + y*cols):
+;;;   chars  : (unsigned-byte 32)  char(21) | bold@21 | wide@22 | spacer@23
+;;;   colors : (unsigned-byte 64)  fg(24)<<24 | bg(24)      (each a 24-bit 0xRRGGBB)
+;;; Two typed arrays (~4+8 = 12 bytes/cell) buy true 24-bit fg AND bg per cell,
+;;; which won't co-fit one 62-bit fixnum (21+24+24+flags = 72 bits).
+(declaim (inline mkchar ch-code ch-bold-p ch-wide-p ch-spacer-p mkcolor color-fg color-bg))
+(defun mkchar (ch bold &key wide spacer)
+  (logior (logand ch #x1fffff) (ash (if bold 1 0) 21) (ash (if wide 1 0) 22) (ash (if spacer 1 0) 23)))
+(defun ch-code (c) (logand c #x1fffff))
+(defun ch-bold-p (c) (logbitp 21 c))
+(defun ch-wide-p (c) (logbitp 22 c))            ; glyph spans this + the next cell
+(defun ch-spacer-p (c) (logbitp 23 c))          ; right half of a wide char (draw nothing)
+(defun mkcolor (fg bg) (logior (ash (logand fg #xffffff) 24) (logand bg #xffffff)))
+(defun color-fg (c) (ldb (byte 24 24) c))
+(defun color-bg (c) (ldb (byte 24 0) c))
+(defparameter *blank-char* (mkchar (char-code #\Space) nil))
+(defparameter *blank-color* (mkcolor (pal +def-fg+) (pal +def-bg+)))
 
 ;;; ---- character width (wcwidth-lite: 0 combining, 2 CJK/emoji, else 1) -------
 
@@ -67,7 +86,7 @@
 ;;; ---- terminal ---------------------------------------------------------------
 
 (defstruct (terminal (:constructor %make-terminal))
-  cols rows cells                       ; grid: (simple-vector rows*cols) of packed cells
+  cols rows chars colors                ; grid: two parallel (u32 chars / u64 colors) arrays
   (cx 0) (cy 0)                         ; cursor
   (fg +def-fg+) (bg +def-bg+) (bold nil) (reverse nil)   ; current SGR
   (top 0) (bot 0)                       ; scroll region (inclusive rows)
@@ -87,18 +106,34 @@
   (mouse-buttons 0) (mouse-col 0) (mouse-row 0)   ; last mouse state (for diffing)
   (dirty t))                            ; fb changed since the compositor last consumed it?
 
-(defun cell (tm x y) (aref (terminal-cells tm) (+ (* y (terminal-cols tm)) x)))
-(defun (setf cell) (v tm x y) (setf (aref (terminal-cells tm) (+ (* y (terminal-cols tm)) x)) v))
+(declaim (inline tidx tchar tcolor))
+(defun tidx (tm x y) (+ (* y (terminal-cols tm)) x))
+(defun tchar (tm x y) (aref (terminal-chars tm) (tidx tm x y)))
+(defun (setf tchar) (v tm x y) (setf (aref (terminal-chars tm) (tidx tm x y)) v))
+(defun tcolor (tm x y) (aref (terminal-colors tm) (tidx tm x y)))
+(defun (setf tcolor) (v tm x y) (setf (aref (terminal-colors tm) (tidx tm x y)) v))
+(defun copy-cell (tm dx dy sx sy)               ; copy one cell (both arrays)
+  (setf (tchar tm dx dy) (tchar tm sx sy) (tcolor tm dx dy) (tcolor tm sx sy)))
+(defun blank-at (tm x y) (setf (tchar tm x y) *blank-char* (tcolor tm x y) *blank-color*))
 
-(defun make-grid (cols rows)
-  (let ((v (make-array (* cols rows)))) (dotimes (i (length v) v) (setf (aref v i) (blank-cell)))))
+(defun make-grid (cols rows)                    ; -> (values chars colors), blank
+  (values (make-array (* cols rows) :element-type '(unsigned-byte 32) :initial-element *blank-char*)
+          (make-array (* cols rows) :element-type '(unsigned-byte 64) :initial-element *blank-color*)))
+
+;; bulk moves operate on BOTH arrays in lockstep (linear indices into the grid)
+(defun grid-move (tm d1 e1 s2)
+  (replace (terminal-chars tm) (terminal-chars tm) :start1 d1 :end1 e1 :start2 s2)
+  (replace (terminal-colors tm) (terminal-colors tm) :start1 d1 :end1 e1 :start2 s2))
+(defun grid-blank (tm start end)
+  (fill (terminal-chars tm) *blank-char* :start start :end end)
+  (fill (terminal-colors tm) *blank-color* :start start :end end))
 
 ;;; ---- ANSI / VT parser -------------------------------------------------------
 
 (defun eff-colors (tm)
-  "Current (fg . bg) after reverse-video, with bold brightening the fg."
-  (let ((fg (if (and (terminal-bold tm) (< (terminal-fg tm) 8)) (+ (terminal-fg tm) 8) (terminal-fg tm)))
-        (bg (terminal-bg tm)))
+  "Current (fg . bg) as resolved 24-bit RGB, after reverse-video and bold-brighten."
+  (let ((fg (resolve-fg (terminal-fg tm) (terminal-bold tm)))
+        (bg (resolve-bg (terminal-bg tm))))
     (if (terminal-reverse tm) (cons bg fg) (cons fg bg))))
 
 (defun put-char (tm ch)
@@ -107,18 +142,19 @@
     (when (> (+ (terminal-cx tm) w) (terminal-cols tm))   ; wrap if it won't fit
       (setf (terminal-cx tm) 0) (line-feed tm))
     (destructuring-bind (fg . bg) (eff-colors tm)
-      (setf (cell tm (terminal-cx tm) (terminal-cy tm))
-            (mkcell ch fg bg (terminal-bold tm) :wide (= w 2)))
-      (when (= w 2)
-        (setf (cell tm (1+ (terminal-cx tm)) (terminal-cy tm))
-              (mkcell 0 fg bg (terminal-bold tm) :spacer t))))
+      (let ((col (mkcolor fg bg)) (cx (terminal-cx tm)) (cy (terminal-cy tm)))
+        (setf (tchar tm cx cy) (mkchar ch (terminal-bold tm) :wide (= w 2))
+              (tcolor tm cx cy) col)
+        (when (= w 2)
+          (setf (tchar tm (1+ cx) cy) (mkchar 0 (terminal-bold tm) :spacer t)
+                (tcolor tm (1+ cx) cy) col))))
     (incf (terminal-cx tm) w)))
 
 (defun scroll-up (tm)
-  (let ((cols (terminal-cols tm)) (cells (terminal-cells tm)))
+  (let ((cols (terminal-cols tm)))
     (loop for y from (terminal-top tm) below (terminal-bot tm) do
-      (replace cells cells :start1 (* y cols) :end1 (* (1+ y) cols) :start2 (* (1+ y) cols)))
-    (fill cells (blank-cell) :start (* (terminal-bot tm) cols) :end (* (1+ (terminal-bot tm)) cols)))
+      (grid-move tm (* y cols) (* (1+ y) cols) (* (1+ y) cols)))
+    (grid-blank tm (* (terminal-bot tm) cols) (* (1+ (terminal-bot tm)) cols)))
   ;; sixel images scroll with the text
   (dolist (g (terminal-graphics tm)) (decf (cadr g) (terminal-cell-h tm)))
   (setf (terminal-graphics tm)
@@ -133,51 +169,50 @@
 (defun erase (tm from-x from-y to-x to-y)
   (loop for y from from-y to to-y do
     (loop for x from (if (= y from-y) from-x 0) to (if (= y to-y) to-x (1- (terminal-cols tm)))
-          do (setf (cell tm x y) (blank-cell)))))
+          do (blank-at tm x y))))
 
 (defun scroll-down (tm)
   "Scroll the region down one line (blank line inserted at the top)."
-  (let ((cols (terminal-cols tm)) (cells (terminal-cells tm)))
+  (let ((cols (terminal-cols tm)))
     (loop for y from (terminal-bot tm) above (terminal-top tm) do
-      (replace cells cells :start1 (* y cols) :end1 (* (1+ y) cols) :start2 (* (1- y) cols)))
-    (fill cells (blank-cell) :start (* (terminal-top tm) cols) :end (* (1+ (terminal-top tm)) cols))))
+      (grid-move tm (* y cols) (* (1+ y) cols) (* (1- y) cols)))
+    (grid-blank tm (* (terminal-top tm) cols) (* (1+ (terminal-top tm)) cols))))
 
 (defun ins-lines (tm n)                 ; IL: insert N blank lines at the cursor row
-  (let ((cols (terminal-cols tm)) (cells (terminal-cells tm))
-        (cy (terminal-cy tm)) (bot (terminal-bot tm)))
+  (let ((cols (terminal-cols tm)) (cy (terminal-cy tm)) (bot (terminal-bot tm)))
     (loop for y from bot downto (+ cy n) do
-      (replace cells cells :start1 (* y cols) :end1 (* (1+ y) cols) :start2 (* (- y n) cols)))
+      (grid-move tm (* y cols) (* (1+ y) cols) (* (- y n) cols)))
     (loop for y from cy below (min (+ cy n) (1+ bot)) do
-      (fill cells (blank-cell) :start (* y cols) :end (* (1+ y) cols)))))
+      (grid-blank tm (* y cols) (* (1+ y) cols)))))
 
 (defun del-lines (tm n)                 ; DL: delete N lines at the cursor row
-  (let ((cols (terminal-cols tm)) (cells (terminal-cells tm))
-        (cy (terminal-cy tm)) (bot (terminal-bot tm)))
+  (let ((cols (terminal-cols tm)) (cy (terminal-cy tm)) (bot (terminal-bot tm)))
     (loop for y from cy to (- bot n) do
-      (replace cells cells :start1 (* y cols) :end1 (* (1+ y) cols) :start2 (* (+ y n) cols)))
+      (grid-move tm (* y cols) (* (1+ y) cols) (* (+ y n) cols)))
     (loop for y from (max cy (1+ (- bot n))) to bot do
-      (fill cells (blank-cell) :start (* y cols) :end (* (1+ y) cols)))))
+      (grid-blank tm (* y cols) (* (1+ y) cols)))))
 
 (defun ins-chars (tm n)                 ; ICH: shift the line right by N at the cursor
   (let ((y (terminal-cy tm)) (cols (terminal-cols tm)) (cx (terminal-cx tm)))
-    (loop for x from (1- cols) downto (+ cx n) do (setf (cell tm x y) (cell tm (- x n) y)))
-    (loop for x from cx below (min (+ cx n) cols) do (setf (cell tm x y) (blank-cell)))))
+    (loop for x from (1- cols) downto (+ cx n) do (copy-cell tm x y (- x n) y))
+    (loop for x from cx below (min (+ cx n) cols) do (blank-at tm x y))))
 
 (defun ech (tm n)                       ; ECH: erase N chars from the cursor (no shift)
   (let ((y (terminal-cy tm)) (cx (terminal-cx tm)) (cols (terminal-cols tm)))
-    (loop for x from cx below (min (+ cx n) cols) do (setf (cell tm x y) (blank-cell)))))
+    (loop for x from cx below (min (+ cx n) cols) do (blank-at tm x y))))
 
 (defun set-alt (tm on)
   "Switch to / from the alternate screen buffer (?1049/?47/?1047)."
   (cond
     ((and on (not (terminal-alt tm)))
-     (setf (terminal-alt tm) (list (terminal-cells tm) (terminal-cx tm) (terminal-cy tm)
-                                   (terminal-fg tm) (terminal-bg tm) (terminal-bold tm))
-           (terminal-cells tm) (make-grid (terminal-cols tm) (terminal-rows tm))
-           (terminal-cx tm) 0 (terminal-cy tm) 0))
+     (multiple-value-bind (gch gco) (make-grid (terminal-cols tm) (terminal-rows tm))
+       (setf (terminal-alt tm) (list (terminal-chars tm) (terminal-colors tm) (terminal-cx tm) (terminal-cy tm)
+                                     (terminal-fg tm) (terminal-bg tm) (terminal-bold tm))
+             (terminal-chars tm) gch (terminal-colors tm) gco
+             (terminal-cx tm) 0 (terminal-cy tm) 0)))
     ((and (not on) (terminal-alt tm))
-     (destructuring-bind (cells cx cy fg bg bold) (terminal-alt tm)
-       (setf (terminal-cells tm) cells (terminal-cx tm) cx (terminal-cy tm) cy
+     (destructuring-bind (chars colors cx cy fg bg bold) (terminal-alt tm)
+       (setf (terminal-chars tm) chars (terminal-colors tm) colors (terminal-cx tm) cx (terminal-cy tm) cy
              (terminal-fg tm) fg (terminal-bg tm) bg (terminal-bold tm) bold
              (terminal-alt tm) nil)))))
 
@@ -204,11 +239,12 @@
 (defun p (tm n default) (or (nth n (terminal-params tm)) default))
 
 (defun sgr-ext (ps i)
-  "Parse an extended colour after 38/48 at PS[I]: 5;n (256) or 2;r;g;b (truecolor
-   -> nearest 256).  Returns (values colour-index params-consumed)."
+  "Parse an extended colour after 38/48 at PS[I]: 5;n (256-index) or 2;r;g;b (true
+   24-bit).  Returns (values colour-token params-consumed) — truecolour is kept
+   verbatim as an RGB token, no nearest-cube quantisation."
   (let ((kind (nth i ps)))
     (cond ((eql kind 5) (values (or (nth (1+ i) ps) 0) 2))
-          ((eql kind 2) (values (rgb->256 (or (nth (1+ i) ps) 0) (or (nth (+ i 2) ps) 0) (or (nth (+ i 3) ps) 0)) 4))
+          ((eql kind 2) (values (rgb-token (glass:rgb (or (nth (1+ i) ps) 0) (or (nth (+ i 2) ps) 0) (or (nth (+ i 3) ps) 0))) 4))
           (t (values +def-fg+ 1)))))
 
 (defun sgr (tm)
@@ -254,9 +290,9 @@
     (#\u (setf (terminal-cx tm) (terminal-saved-cx tm) (terminal-cy tm) (terminal-saved-cy tm)))
     (#\P (let ((n (p tm 0 1)) (y (terminal-cy tm)))   ; DCH delete chars: shift line left
            (loop for x from (terminal-cx tm) below (- (terminal-cols tm) n)
-                 do (setf (cell tm x y) (cell tm (+ x n) y)))
+                 do (copy-cell tm x y (+ x n) y))
            (loop for x from (max 0 (- (terminal-cols tm) n)) below (terminal-cols tm)
-                 do (setf (cell tm x y) (blank-cell)))))
+                 do (blank-at tm x y))))
     (#\@ (ins-chars tm (p tm 0 1)))                    ; ICH
     (#\X (ech tm (p tm 0 1)))                          ; ECH
     (#\L (ins-lines tm (p tm 0 1)))                    ; IL
@@ -472,17 +508,17 @@
       (setf (gethash code (terminal-glyphs tm)) (render-glyph tm code))))
 
 (defun draw-cell (tm x y)
-  (let ((c (cell tm x y)))
-    (when (cell-spacer-p c) (return-from draw-cell))   ; right half of a wide char
+  (let ((c (tchar tm x y)) (col (tcolor tm x y)))
+    (when (ch-spacer-p c) (return-from draw-cell))   ; right half of a wide char
   (let* ((fb (terminal-fb tm))
          (cw (terminal-cell-w tm)) (ch (terminal-cell-h tm))
-         (span (if (cell-wide-p c) 2 1))
+         (span (if (ch-wide-p c) 2 1))
          (px0 (* x cw)) (py0 (* y ch))
          (cursor (and (terminal-cursor-vis tm) (= x (terminal-cx tm)) (= y (terminal-cy tm))))
-         (fg (pal (if cursor (cell-bg c) (cell-fg c))))
-         (bg (pal (if cursor (cell-fg c) (cell-bg c)))))   ; cursor = inverse block
+         (fg (if cursor (color-bg col) (color-fg col)))
+         (bg (if cursor (color-fg col) (color-bg col))))   ; cursor = inverse block
     (glass:fb-rect fb px0 py0 (* cw span) ch bg)
-    (let ((code (cell-char c)))
+    (let ((code (ch-code c)))
       (when (> code 32)
         (let ((g (glyph tm code)) (asc (terminal-ascent tm)))
           (ecase (car g)
@@ -640,15 +676,16 @@
                                                       "PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
                                                       (format nil "COLUMNS=~d" cols) (format nil "LINES=~d" rows)
                                                       (format nil "HOME=~a" (or (sb-ext:posix-getenv "HOME") "/root")))))
-         (pty (sb-ext:process-pty proc))
-         (tm (%make-terminal :cols cols :rows rows :cells (make-grid cols rows)
+         (pty (sb-ext:process-pty proc)))
+    (multiple-value-bind (gch gco) (make-grid cols rows)
+     (let ((tm (%make-terminal :cols cols :rows rows :chars gch :colors gco
                             :bot (1- rows) :pty pty :proc proc :font font :nerd-font nerd :ppem ppem
                             :emoji-font (load-emoji-font emoji-font)
                             :cell-w cell-w :cell-h cell-h :ascent asc
                             :fb (glass:make-framebuffer (* cols cell-w) (* rows cell-h) glass:+black+))))
     (set-winsize pty rows cols)
     (enable-echo pty)                       ; SBCL's pty comes up -echo; the shell needs it on
-    tm))
+    tm))))
 
 (defun kill-terminal (tm)
   "Close the terminal: SIGHUP the shell's whole process group (so children die
@@ -662,15 +699,18 @@
    (which SIGWINCHes the shell so it re-queries the size and redraws its line)."
   (setf cols (max 1 cols) rows (max 1 rows))
   (glass:with-fb-locked ((terminal-fb tm))
-    (let ((old (terminal-cells tm)) (ocols (terminal-cols tm)) (orows (terminal-rows tm))
-          (new (make-grid cols rows)))
+    (let ((old-ch (terminal-chars tm)) (old-co (terminal-colors tm))
+          (ocols (terminal-cols tm)) (orows (terminal-rows tm)))
+     (multiple-value-bind (new-ch new-co) (make-grid cols rows)
       (dotimes (y (min rows orows))                          ; carry over existing cells
         (dotimes (x (min cols ocols))
-          (setf (aref new (+ (* y cols) x)) (aref old (+ (* y ocols) x)))))
-      (setf (terminal-cells tm) new (terminal-cols tm) cols (terminal-rows tm) rows
+          (let ((ni (+ (* y cols) x)) (oi (+ (* y ocols) x)))
+            (setf (aref new-ch ni) (aref old-ch oi) (aref new-co ni) (aref old-co oi)))))
+      (setf (terminal-chars tm) new-ch (terminal-colors tm) new-co
+            (terminal-cols tm) cols (terminal-rows tm) rows
             (terminal-cx tm) (min (terminal-cx tm) (1- cols))
             (terminal-cy tm) (min (terminal-cy tm) (1- rows))
-            (terminal-top tm) 0 (terminal-bot tm) (1- rows)))
+            (terminal-top tm) 0 (terminal-bot tm) (1- rows))))
     (glass:fb-resize (terminal-fb tm) (* cols (terminal-cell-w tm)) (* rows (terminal-cell-h tm))))
   (render tm)                                                ; show the preserved content now
   (set-winsize (terminal-pty tm) rows cols)
