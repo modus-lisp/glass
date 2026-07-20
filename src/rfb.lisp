@@ -641,10 +641,20 @@
                      (when (eq (rc-want client) req) (setf (rc-want client) nil)))
                    (wake-wait wake 1/60)))))))))))     ; nothing dirty (gen bumped, pixels same) — park
 
+(defconstant +enc-zrle2+ 24
+  "RealVNC's proprietary ZRLE2.  We don't implement it, but a client that lists it
+   is RealVNC-family — and RealVNC's RLE decoder rejects our standard ZRLE tile
+   stream with \"bad xrle data\" (it decodes encoding-16 rects through its ZRLE2
+   path).  Its presence is our cue to serve Hextile instead.")
+
 (defun choose-encoding (encs)
   "Pick the best encoding we implement from the client's advertised list.  ZRLE
-   (lossless, zlib-compressed) is preferred, then Hextile, then Raw."
-  (cond ((member +enc-zrle+ encs) +enc-zrle+)
+   (lossless, zlib-compressed) is preferred, then Hextile, then Raw — EXCEPT a
+   RealVNC-family client (advertises ZRLE2) gets Hextile: zlib-free, a distinct
+   decoder, so it sidesteps RealVNC's ZRLE incompatibility (and the pixel-format
+   switch mid-stream that comes with it)."
+  (cond ((and (member +enc-zrle2+ encs) (member +enc-hextile+ encs)) +enc-hextile+)
+        ((member +enc-zrle+ encs) +enc-zrle+)
         ((member +enc-hextile+ encs) +enc-hextile+)
         (t +enc-raw+)))
 
