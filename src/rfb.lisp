@@ -133,6 +133,14 @@
           (if be (dotimes (k 3) (setf (aref buf (+ i k)) (logand (ash v (- (+ base (* 8 (- 2 k))))) #xff)))
                  (dotimes (k 3) (setf (aref buf (+ i k)) (logand (ash v (- (+ base (* 8 k)))) #xff))))
           (+ i 3)))))
+(defun w-pixel (s px fmt)                      ; write ONE full pixel straight to the stream
+  (if fmt
+      (let ((v (pxval px fmt)) (n (pxfmt-pbytes fmt)))
+        (if (pxfmt-big-endian fmt)
+            (loop for k from (1- n) downto 0 do (w-u8 s (logand (ash v (* -8 k)) #xff)))
+            (dotimes (k n) (w-u8 s (logand (ash v (* -8 k)) #xff)))))
+      (progn (w-u8 s (logand px #xff)) (w-u8 s (logand (ash px -8) #xff))
+             (w-u8 s (logand (ash px -16) #xff)) (w-u8 s 0))))
 
 (defun client-minor-version (ver)
   "Parse the RFB minor version from a 12-byte \"RFB 003.00X\" ProtocolVersion, or 8."
@@ -484,17 +492,16 @@
     "o....oxxo.."
     "......oo..."))
 
-(defun send-cursor (s &optional (rows *cursor-arrow*))
-  "Send the cursor shape as a Cursor pseudo-rect (hotspot 0,0)."
+(defun send-cursor (s &optional fmt (rows *cursor-arrow*))
+  "Send the cursor shape as a Cursor pseudo-rect (hotspot 0,0), pixels in the
+   client's FMT (NIL = native 32bpp)."
   (let ((w (reduce #'max rows :key #'length)) (h (length rows)))
     (w-u8 s 0) (w-u8 s 0) (w-u16 s 1)                        ; FramebufferUpdate, 1 rect
     (w-u16 s 0) (w-u16 s 0) (w-u16 s w) (w-u16 s h) (w-u32 s +pseudo-cursor+)
-    (loop for row in rows do                                 ; pixels: w*h, format order (B,G,R,X)
+    (loop for row in rows do                                 ; pixels: w*h in the client pixel format
       (dotimes (x w)
         (let ((c (if (< x (length row)) (char row x) #\.)))
-          (multiple-value-bind (px) (case c (#\o 0) (#\x #xffffff) (t 0))
-            (w-u8 s (logand px #xff)) (w-u8 s (logand (ash px -8) #xff))
-            (w-u8 s (logand (ash px -16) #xff)) (w-u8 s 0)))))
+          (w-pixel s (case c (#\o 0) (#\x #xffffff) (t 0)) fmt))))
     (loop for row in rows do                                 ; 1-bpp mask, MSB first, row-padded
       (let ((acc 0) (nb 0))
         (dotimes (x w)
@@ -531,7 +538,7 @@
    were written, NIL if there was nothing to send."
   (destructuring-bind (inc x y w h) req
     (when (and (rc-cursor client) (not (rc-cursor-sent client)))     ; cursor shape, once
-      (send-cursor s) (setf (rc-cursor-sent client) t))
+      (send-cursor s (rc-fmt client)) (setf (rc-cursor-sent client) t))
     (let ((ls (rc-last-size client)))                                ; resize takes priority
       (when (rc-dss client)
         (with-fb-locked (fb)
@@ -639,7 +646,8 @@
                (0 (skip s 3)                               ; SetPixelFormat
                   (let* ((pf (r-bytes s 16)) (fmt (parse-pxfmt pf)))
                     (sb-thread:with-mutex ((rc-lock client))
-                      (setf (rc-fmt client) fmt (car (rc-snap-box client)) nil))   ; format change: full re-send
+                      ;; format change: drop the snapshot (full re-send) and re-send the cursor in the new format
+                      (setf (rc-fmt client) fmt (car (rc-snap-box client)) nil (rc-cursor-sent client) nil))
                     (format *trace-output* "~&glass: client SetPixelFormat bpp=~d depth=~d big-endian=~d true-colour=~d rgb-max=~d,~d,~d shift=~d,~d,~d -> ~a~%"
                             (aref pf 0) (aref pf 1) (aref pf 2) (aref pf 3)
                             (logior (ash (aref pf 4) 8) (aref pf 5)) (logior (ash (aref pf 6) 8) (aref pf 7))
