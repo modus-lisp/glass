@@ -438,14 +438,30 @@
      (write-rect-zrle s fb x y w h zs t fmt))              ; big ZRLE: stored fast path (universal)
     (t (write-rect s fb x y w h enc zs fmt))))
 
+(defparameter *max-band-rows* 64
+  "Cap a single rectangle at this many rows: a tall rect is split into horizontal
+   bands, each its own rect in the same FramebufferUpdate.  A whole-screen refresh
+   as ONE 1280x800 ZRLE rect is a big incompressible unit some progressive clients
+   (RealVNC iOS, which itself requests ~13-row strips) reject; banding keeps each
+   rect's decode buffer bounded and pipelines the paint.  NIL disables banding.")
+
+(defun band-rects (rects)
+  "Split any rect taller than *MAX-BAND-ROWS* into horizontal bands (row order)."
+  (if (null *max-band-rows*)
+      rects
+      (loop for (x y w h) in rects
+            if (<= h *max-band-rows*) collect (list x y w h)
+            else nconc (loop for yy from y below (+ y h) by *max-band-rows*
+                             collect (list x yy w (min *max-band-rows* (- (+ y h) yy)))))))
+
 (defun send-rects (s fb rects enc zs &optional trle fmt)
-  "One FramebufferUpdate carrying RECTS.  ENC is the client's chosen encoding; ZS
-   its persistent ZRLE zlib stream; TRLE whether it also accepts TRLE (used for
-   big rects); FMT the client's pixel format (NIL = native).  Encoding per rect
-   by EMIT-RECT."
-  (w-u8 s 0) (w-u8 s 0) (w-u16 s (length rects))             ; msg-type, pad, #rects
-  (dolist (r rects) (destructuring-bind (x y w h) r (emit-rect s fb x y w h enc zs trle fmt)))
-  (force-output s))
+  "One FramebufferUpdate carrying RECTS (tall ones banded).  ENC is the client's
+   chosen encoding; ZS its persistent ZRLE zlib stream; TRLE whether it also
+   accepts TRLE (used for big rects); FMT the client's pixel format (NIL = native)."
+  (let ((rects (band-rects rects)))
+    (w-u8 s 0) (w-u8 s 0) (w-u16 s (length rects))           ; msg-type, pad, #rects
+    (dolist (r rects) (destructuring-bind (x y w h) r (emit-rect s fb x y w h enc zs trle fmt)))
+    (force-output s)))
 
 ;;; ---- desktop resize (RFC 6143 §7.8) -----------------------------------------
 ;;; DesktopSize (-223): a pseudo-encoding the client lists in SetEncodings to say
@@ -567,7 +583,7 @@
                 ((and copy (rc-copyrect client) (copy-in-bounds-p copy fb))
                  (destructuring-bind (sx sy dx dy w h) copy
                    (snapshot-move snap (fb-width fb) sx sy dx dy w h)
-                   (let ((rects (dirty-rects fb snap (and (consp region) region))))
+                   (let ((rects (band-rects (dirty-rects fb snap (and (consp region) region)))))
                      (w-u8 s 0) (w-u8 s 0) (w-u16 s (1+ (length rects)))    ; #rects = CopyRect + exposed
                      (write-rect-copy s dx dy w h sx sy)
                      (dolist (r rects) (destructuring-bind (rx ry rw rh) r (emit-rect s fb rx ry rw rh enc zs trle fmt)))
