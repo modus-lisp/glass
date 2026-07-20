@@ -454,12 +454,15 @@
             else nconc (loop for yy from y below (+ y h) by *max-band-rows*
                              collect (list x yy w (min *max-band-rows* (- (+ y h) yy)))))))
 
-(defun send-rects (s fb rects enc zs &optional trle fmt)
+(defun send-rects (s fb rects enc zs &optional trle fmt cursor)
   "One FramebufferUpdate carrying RECTS (tall ones banded).  ENC is the client's
    chosen encoding; ZS its persistent ZRLE zlib stream; TRLE whether it also
-   accepts TRLE (used for big rects); FMT the client's pixel format (NIL = native)."
+   accepts TRLE (used for big rects); FMT the client's pixel format (NIL = native).
+   CURSOR non-NIL prepends the cursor pseudo-rect to THIS update (one update per
+   request — never a separate cursor message)."
   (let ((rects (band-rects rects)))
-    (w-u8 s 0) (w-u8 s 0) (w-u16 s (length rects))           ; msg-type, pad, #rects
+    (w-u8 s 0) (w-u8 s 0) (w-u16 s (+ (if cursor 1 0) (length rects)))   ; msg-type, pad, #rects
+    (when cursor (emit-cursor-rect s fmt))
     (dolist (r rects) (destructuring-bind (x y w h) r (emit-rect s fb x y w h enc zs trle fmt)))
     (force-output s)))
 
@@ -508,11 +511,14 @@
     "o....oxxo.."
     "......oo..."))
 
-(defun send-cursor (s &optional fmt (rows *cursor-arrow*))
-  "Send the cursor shape as a Cursor pseudo-rect (hotspot 0,0), pixels in the
-   client's FMT (NIL = native 32bpp)."
+(defun emit-cursor-rect (s &optional fmt (rows *cursor-arrow*))
+  "Write the cursor shape as ONE Cursor pseudo-rect (hotspot 0,0) — just the rect,
+   NO FramebufferUpdate header — so the caller folds it into a frame update as an
+   extra leading rect.  (A separate unsolicited FramebufferUpdate for the cursor
+   throws off clients that map responses to their requests by order — RealVNC:
+   the extra update shifts its request/format correlation by one, so a later
+   SetPixelFormat lands on the wrong update and it desyncs.)  Pixels in FMT."
   (let ((w (reduce #'max rows :key #'length)) (h (length rows)))
-    (w-u8 s 0) (w-u8 s 0) (w-u16 s 1)                        ; FramebufferUpdate, 1 rect
     (w-u16 s 0) (w-u16 s 0) (w-u16 s w) (w-u16 s h) (w-u32 s +pseudo-cursor+)
     (loop for row in rows do                                 ; pixels: w*h in the client pixel format
       (dotimes (x w)
@@ -524,8 +530,7 @@
           (let ((opaque (and (< x (length row)) (member (char row x) '(#\o #\x)))))
             (setf acc (logior (ash acc 1) (if opaque 1 0)) nb (1+ nb))
             (when (= nb 8) (w-u8 s acc) (setf acc 0 nb 0))))
-        (when (plusp nb) (w-u8 s (ash acc (- 8 nb))))))
-    (force-output s)))
+        (when (plusp nb) (w-u8 s (ash acc (- 8 nb))))))))
 
 ;;; ---- client message loop ----------------------------------------------------
 
@@ -553,8 +558,6 @@
    exposed area, instead of re-encoding the moved pixels.  Returns T if bytes
    were written, NIL if there was nothing to send."
   (destructuring-bind (inc x y w h) req
-    (when (and (rc-cursor client) (not (rc-cursor-sent client)))     ; cursor shape, once
-      (send-cursor s (rc-fmt client)) (setf (rc-cursor-sent client) t))
     (let ((ls (rc-last-size client)))                                ; resize takes priority
       (when (rc-dss client)
         (with-fb-locked (fb)
@@ -563,31 +566,41 @@
             (setf (car ls) (fb-width fb) (cdr ls) (fb-height fb) (car (rc-snap-box client)) nil)
             (return-from send-update t)))))
     (let ((snap-box (rc-snap-box client)) (enc (rc-enc client)) (zs (rc-zs client))
-          (trle (rc-trle client)) (fmt (rc-fmt client)))
-      (if (or (zerop inc) (null (car snap-box)))                     ; full / first frame
-          (with-fb-locked (fb)
-            (send-rects s fb (list (clip-rect fb x y w h)) enc zs trle fmt)
-            (setf (car snap-box) (copy-pixels fb))
-            t)
-          (with-fb-locked (fb)                                       ; incremental: dirty tiles
-            (let ((snap (car snap-box)))
-              (cond
-                ((not (snap-matches-p snap fb)) (setf (car snap-box) nil) nil)  ; resized; resync
-                ;; a window MOVE and the client can CopyRect: copy the moved block
-                ;; in the snapshot, then diff only leaves the EXPOSED area to send.
-                ((and copy (rc-copyrect client) (copy-in-bounds-p copy fb))
-                 (destructuring-bind (sx sy dx dy w h) copy
-                   (snapshot-move snap (fb-width fb) sx sy dx dy w h)
-                   (let ((rects (band-rects (dirty-rects fb snap (and (consp region) region)))))
-                     (w-u8 s 0) (w-u8 s 0) (w-u16 s (1+ (length rects)))    ; #rects = CopyRect + exposed
-                     (write-rect-copy s dx dy w h sx sy)
-                     (dolist (r rects) (destructuring-bind (rx ry rw rh) r (emit-rect s fb rx ry rw rh enc zs trle fmt)))
-                     (force-output s)
-                     (update-snapshot fb snap rects)
-                     t)))
-                (t (let ((rects (dirty-rects fb snap (and (consp region) region))))
-                     (when rects (send-rects s fb rects enc zs trle fmt) (update-snapshot fb snap rects))
-                     (and rects t))))))))))
+          (trle (rc-trle client)) (fmt (rc-fmt client))
+          ;; cursor shape rides ALONG with a frame update (as its leading rect), never
+          ;; as its own message — see emit-cursor-rect.
+          (cur (and (rc-cursor client) (not (rc-cursor-sent client)))))
+      (flet ((cursor-done () (when cur (setf (rc-cursor-sent client) t))))
+        (if (or (zerop inc) (null (car snap-box)))                   ; full / first frame
+            (with-fb-locked (fb)
+              (send-rects s fb (list (clip-rect fb x y w h)) enc zs trle fmt cur)
+              (cursor-done)
+              (setf (car snap-box) (copy-pixels fb))
+              t)
+            (with-fb-locked (fb)                                     ; incremental: dirty tiles
+              (let ((snap (car snap-box)))
+                (cond
+                  ((not (snap-matches-p snap fb)) (setf (car snap-box) nil) nil)  ; resized; resync
+                  ;; a window MOVE and the client can CopyRect: copy the moved block
+                  ;; in the snapshot, then diff only leaves the EXPOSED area to send.
+                  ((and copy (rc-copyrect client) (copy-in-bounds-p copy fb))
+                   (destructuring-bind (sx sy dx dy w h) copy
+                     (snapshot-move snap (fb-width fb) sx sy dx dy w h)
+                     (let ((rects (band-rects (dirty-rects fb snap (and (consp region) region)))))
+                       (w-u8 s 0) (w-u8 s 0) (w-u16 s (+ (if cur 1 0) 1 (length rects)))  ; cursor? + CopyRect + exposed
+                       (when cur (emit-cursor-rect s fmt))
+                       (write-rect-copy s dx dy w h sx sy)
+                       (dolist (r rects) (destructuring-bind (rx ry rw rh) r (emit-rect s fb rx ry rw rh enc zs trle fmt)))
+                       (force-output s)
+                       (cursor-done)
+                       (update-snapshot fb snap rects)
+                       t)))
+                  (t (let ((rects (dirty-rects fb snap (and (consp region) region))))
+                       (when (or rects cur)                          ; send if there's dirt OR a pending cursor
+                         (send-rects s fb (or rects '()) enc zs trle fmt cur)
+                         (cursor-done)
+                         (when rects (update-snapshot fb snap rects)))
+                       (and (or rects cur) t)))))))))))
 
 ;;; A WAKE lets the compositor and the reader thread nudge a parked sender the
 ;;; instant there's something to send, instead of it polling every ~16ms — the
@@ -647,13 +660,19 @@
    stream with \"bad xrle data\" (it decodes encoding-16 rects through its ZRLE2
    path).  Its presence is our cue to serve Hextile instead.")
 
+(defparameter *realvnc-encoding* +enc-hextile+
+  "Encoding to serve a RealVNC-family client (one that advertises ZRLE2).  The real
+   RealVNC bug was the cursor going out as its OWN FramebufferUpdate, which shifted
+   RealVNC's response<->request (and thus pixel-format) mapping by one — that, not
+   the encoding, produced both \"bad xrle data\" (ZRLE) and \"invalid message type\"
+   (Hextile/Raw).  With the cursor folded into the frame update, Hextile (proven
+   byte-exact, lossless, zlib-free) is the safe choice.  Live-tunable.")
+
 (defun choose-encoding (encs)
   "Pick the best encoding we implement from the client's advertised list.  ZRLE
    (lossless, zlib-compressed) is preferred, then Hextile, then Raw — EXCEPT a
-   RealVNC-family client (advertises ZRLE2) gets Hextile: zlib-free, a distinct
-   decoder, so it sidesteps RealVNC's ZRLE incompatibility (and the pixel-format
-   switch mid-stream that comes with it)."
-  (cond ((and (member +enc-zrle2+ encs) (member +enc-hextile+ encs)) +enc-hextile+)
+   RealVNC-family client (advertises ZRLE2) gets *REALVNC-ENCODING*."
+  (cond ((member +enc-zrle2+ encs) *realvnc-encoding*)
         ((member +enc-zrle+ encs) +enc-zrle+)
         ((member +enc-hextile+ encs) +enc-hextile+)
         (t +enc-raw+)))
