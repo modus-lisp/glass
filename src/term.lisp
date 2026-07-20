@@ -428,11 +428,17 @@
                                     (ash (ch (aref rgb (+ (* 3 i) 1)) (ldb (byte 8 8) d)) 8)
                                     (ch (aref rgb (+ (* 3 i) 2))      (ldb (byte 8 0) d)))))))))))))))
 
+(defparameter *hinting* t
+  "Grid-fit terminal glyphs via scribe's TrueType hinting (crisp stems + baseline
+   at small ppem — terminals are exactly its sweet spot).  NIL = geometric outlines
+   with analytic AA (softer).")
+
 (defun render-glyph (tm code)
   "Render CODE: colour (COLR emoji) -> (:color rgb alpha w h left top adv), else
    monochrome coverage -> (:mono cov w h left top adv), picking the primary mono
    font, a colour-emoji font, or a scribe script fallback as appropriate."
-  (let ((primary (terminal-font tm)) (ppem (terminal-ppem tm))
+  (let ((scribe::*hinting* *hinting*)                ; grid-fit outline (mono) glyphs
+        (primary (terminal-font tm)) (ppem (terminal-ppem tm))
         (ef (terminal-emoji-font tm)) (nerd (terminal-nerd-font tm)))
     (cond
       ((scribe:font-covers-p primary code)
