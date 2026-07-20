@@ -562,12 +562,7 @@
             (send-desktop-size s (fb-width fb) (fb-height fb))
             (setf (car ls) (fb-width fb) (cdr ls) (fb-height fb) (car (rc-snap-box client)) nil)
             (return-from send-update t)))))
-    (let ((snap-box (rc-snap-box client)) (enc (rc-enc client))
-          ;; NIL zs = a pixel-format change asked us to start a FRESH ZRLE zlib
-          ;; stream (RealVNC resets its inflater on SetPixelFormat; a persistent
-          ;; stream would then reference a window it has discarded -> drop).
-          (zs (sb-thread:with-mutex ((rc-lock client))
-                (or (rc-zs client) (setf (rc-zs client) (cram:make-zstream)))))
+    (let ((snap-box (rc-snap-box client)) (enc (rc-enc client)) (zs (rc-zs client))
           (trle (rc-trle client)) (fmt (rc-fmt client)))
       (if (or (zerop inc) (null (car snap-box)))                     ; full / first frame
           (with-fb-locked (fb)
@@ -667,11 +662,13 @@
                (0 (skip s 3)                               ; SetPixelFormat
                   (let* ((pf (r-bytes s 16)) (fmt (parse-pxfmt pf)))
                     (sb-thread:with-mutex ((rc-lock client))
-                      ;; format change: full re-send (drop snapshot), re-send cursor in the new
-                      ;; format, and start a FRESH ZRLE zlib stream (NIL zs; the sender remakes it)
-                      ;; — RealVNC resets its inflater on SetPixelFormat, so ours must reset too.
+                      ;; format change: full re-send (drop snapshot) and re-send the cursor in the
+                      ;; new format.  Do NOT touch the ZRLE zlib stream: it is ONE persistent stream
+                      ;; for the whole connection (RFC 6143), and clients keep their inflater across
+                      ;; a SetPixelFormat — a fresh zlib header mid-stream desyncs them (RealVNC).
+                      ;; Only the CPIXEL size inside the stream changes, which is fine.
                       (setf (rc-fmt client) fmt (car (rc-snap-box client)) nil
-                            (rc-cursor-sent client) nil (rc-zs client) nil))
+                            (rc-cursor-sent client) nil))
                     (format *trace-output* "~&glass: client SetPixelFormat bpp=~d depth=~d big-endian=~d true-colour=~d rgb-max=~d,~d,~d shift=~d,~d,~d -> ~a~%"
                             (aref pf 0) (aref pf 1) (aref pf 2) (aref pf 3)
                             (logior (ash (aref pf 4) 8) (aref pf 5)) (logior (ash (aref pf 6) 8) (aref pf 7))
