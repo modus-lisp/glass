@@ -77,6 +77,63 @@
   (w-u8 s 16) (w-u8 s 8) (w-u8 s 0)
   (w-u8 s 0) (w-u8 s 0) (w-u8 s 0))
 
+;;; ---- client pixel-format conversion ----------------------------------------
+;;; We advertise 32bpp 0xRRGGBB, but a client may SetPixelFormat to something
+;;; smaller (mobile VNC — RealVNC/Remotix iOS — ask for 8bpp RGB222 to save
+;;; bandwidth).  RFB then REQUIRES every pixel be sent in the client's format, so
+;;; we convert.  NIL = the native fast path (client kept our format); a PXFMT here
+;;; drives every pixel/CPIXEL write.  Per-channel LUTs (8-bit fb channel -> its
+;;; shifted, range-scaled contribution) keep conversion a few array reads/pixel.
+(defstruct (pxfmt (:constructor %make-pxfmt))
+  (pbytes 4) (cbytes 3) (big-endian nil) (chi nil)     ; chi: 3-byte CPIXEL takes the HIGH 3 bytes
+  rtab gtab btab)
+
+(defun %scale-tab (max shift)
+  (let ((tab (make-array 256 :element-type '(unsigned-byte 32))))
+    (dotimes (c 256 tab) (setf (aref tab c) (ash (floor (+ (* c max) 127) 255) shift)))))
+
+(defun parse-pxfmt (pf)
+  "A 16-byte RFB PIXEL_FORMAT -> a PXFMT, or NIL for our native format (32bpp,
+   little-endian, max 255, shift 16/8/0) or any non-true-colour request (we only
+   serve true-colour)."
+  (let ((bpp (aref pf 0)) (depth (aref pf 1)) (be (plusp (aref pf 2))) (tc (plusp (aref pf 3)))
+        (rmax (logior (ash (aref pf 4) 8) (aref pf 5)))
+        (gmax (logior (ash (aref pf 6) 8) (aref pf 7)))
+        (bmax (logior (ash (aref pf 8) 8) (aref pf 9)))
+        (rsh (aref pf 10)) (gsh (aref pf 11)) (bsh (aref pf 12)))
+    (cond
+      ((not (and tc (member bpp '(8 16 32)))) nil)                    ; can't serve -> keep native
+      ((and (= bpp 32) (not be) (= rmax 255) (= gmax 255) (= bmax 255)
+            (= rsh 16) (= gsh 8) (= bsh 0)) nil)                      ; exactly native
+      (t (let* ((pbytes (ash bpp -3))
+                (hi (max (+ rsh (integer-length rmax)) (+ gsh (integer-length gmax)) (+ bsh (integer-length bmax))))
+                (lo (min rsh gsh bsh))
+                (fits-low (<= hi 24)) (fits-high (>= lo 8))
+                (cbytes (if (and (= bpp 32) (<= depth 24) (or fits-low fits-high)) 3 pbytes)))
+           (%make-pxfmt :pbytes pbytes :cbytes cbytes :big-endian be
+                        :chi (and (= cbytes 3) (not fits-low) fits-high)
+                        :rtab (%scale-tab rmax rsh) :gtab (%scale-tab gmax gsh) :btab (%scale-tab bmax bsh)))))))
+
+(declaim (inline pxval put-px put-cpix))
+(defun pxval (p fmt)                          ; fb 0xRRGGBB -> client pixel value
+  (logior (aref (the (simple-array (unsigned-byte 32) (256)) (pxfmt-rtab fmt)) (logand (ash p -16) #xff))
+          (aref (the (simple-array (unsigned-byte 32) (256)) (pxfmt-gtab fmt)) (logand (ash p -8) #xff))
+          (aref (the (simple-array (unsigned-byte 32) (256)) (pxfmt-btab fmt)) (logand p #xff))))
+(defun %put-bytes (buf i v n be)              ; write V as N bytes, LE or BE; return i+n
+  (if be (dotimes (k n) (setf (aref buf (+ i k)) (logand (ash v (* -8 (- n 1 k))) #xff)))
+         (dotimes (k n) (setf (aref buf (+ i k)) (logand (ash v (* -8 k)) #xff))))
+  (+ i n))
+(defun put-px (buf i p fmt)                   ; full pixel (Raw/Hextile): PBYTES bytes
+  (%put-bytes buf i (pxval p fmt) (pxfmt-pbytes fmt) (pxfmt-big-endian fmt)))
+(defun put-cpix (buf i p fmt)                 ; CPIXEL (ZRLE/TRLE): CBYTES bytes
+  (let ((v (pxval p fmt)) (cb (pxfmt-cbytes fmt)))
+    (if (= cb (pxfmt-pbytes fmt))
+        (%put-bytes buf i v cb (pxfmt-big-endian fmt))                 ; full-size CPIXEL
+        (let ((base (if (pxfmt-chi fmt) 8 0)) (be (pxfmt-big-endian fmt)))   ; 32bpp -> drop unused byte
+          (if be (dotimes (k 3) (setf (aref buf (+ i k)) (logand (ash v (- (+ base (* 8 (- 2 k))))) #xff)))
+                 (dotimes (k 3) (setf (aref buf (+ i k)) (logand (ash v (- (+ base (* 8 k)))) #xff))))
+          (+ i 3)))))
+
 (defun client-minor-version (ver)
   "Parse the RFB minor version from a 12-byte \"RFB 003.00X\" ProtocolVersion, or 8."
   (or (ignore-errors (parse-integer (map 'string #'code-char ver) :start 8 :end 11)) 8))
@@ -252,17 +309,19 @@
       (let ((dst (+ (* (+ dy yy) fbw) dx)))
         (replace snap tmp :start1 dst :end1 (+ dst w) :start2 (* yy w))))))
 
-(defun write-rect-raw (s fb x y w h)
+(defun write-rect-raw (s fb x y w h &optional fmt)
   (w-u16 s x) (w-u16 s y) (w-u16 s w) (w-u16 s h) (w-u32 s +enc-raw+)
-  (let ((px (fb-pixels fb)) (fw (fb-width fb))
-        (buf (make-array (* w h 4) :element-type '(unsigned-byte 8))) (o 0))
+  (let* ((px (fb-pixels fb)) (fw (fb-width fb)) (pb (if fmt (pxfmt-pbytes fmt) 4))
+         (buf (make-array (* w h pb) :element-type '(unsigned-byte 8))) (o 0))
     (loop for yy from y below (+ y h) for row = (* yy fw) do
       (loop for xx from x below (+ x w) for p = (aref px (+ row xx)) do
-        (setf (aref buf o)       (logand p #xff)             ; B (little-endian)
-              (aref buf (+ o 1)) (logand (ash p -8) #xff)    ; G
-              (aref buf (+ o 2)) (logand (ash p -16) #xff)   ; R
-              (aref buf (+ o 3)) 0)                           ; X
-        (incf o 4)))
+        (if fmt
+            (setf o (put-px buf o p fmt))
+            (progn (setf (aref buf o)       (logand p #xff)             ; B (little-endian)
+                         (aref buf (+ o 1)) (logand (ash p -8) #xff)    ; G
+                         (aref buf (+ o 2)) (logand (ash p -16) #xff)   ; R
+                         (aref buf (+ o 3)) 0)                           ; X
+                   (incf o 4)))))
     (w-bytes s buf)))
 
 ;;; ---- Hextile encoding (RFC 6143 §7.7.4) ------------------------------------
@@ -272,11 +331,15 @@
 ;;; desktop UI where most tiles are solid or near-solid.  Background persists
 ;;; across tiles, so runs of the same colour cost one byte each.
 
-(defun %push-pixel (buf p)
-  (vector-push-extend (logand p #xff) buf)
-  (vector-push-extend (logand (ash p -8) #xff) buf)
-  (vector-push-extend (logand (ash p -16) #xff) buf)
-  (vector-push-extend 0 buf))
+(defun %push-pixel (buf p &optional fmt)
+  (if fmt
+      (let ((v (pxval p fmt)) (n (pxfmt-pbytes fmt)) (be (pxfmt-big-endian fmt)))
+        (if be (loop for k from (1- n) downto 0 do (vector-push-extend (logand (ash v (* -8 k)) #xff) buf))
+               (dotimes (k n) (vector-push-extend (logand (ash v (* -8 k)) #xff) buf))))
+      (progn (vector-push-extend (logand p #xff) buf)
+             (vector-push-extend (logand (ash p -8) #xff) buf)
+             (vector-push-extend (logand (ash p -16) #xff) buf)
+             (vector-push-extend 0 buf))))
 
 (defun tile-info (px fw ax ay tw th)
   "(values distinct-colour-count most-common-colour) for the tile."
@@ -303,7 +366,7 @@
                   (push (list c start ly (- lx start)) subs)))))))
     (nreverse subs)))
 
-(defun write-rect-hextile (s fb x y w h)
+(defun write-rect-hextile (s fb x y w h &optional fmt)
   (w-u16 s x) (w-u16 s y) (w-u16 s w) (w-u16 s h) (w-u32 s +enc-hextile+)
   (let ((px (fb-pixels fb)) (fw (fb-width fb)) (cur-bg -1)
         (buf (make-array 512 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0)))
@@ -315,7 +378,7 @@
               ((= ncol 1)                                  ; solid tile
                (if (= bg cur-bg)
                    (vector-push-extend 0 buf)              ; mask 0 — same background
-                   (progn (vector-push-extend 2 buf) (%push-pixel buf bg) (setf cur-bg bg))))
+                   (progn (vector-push-extend 2 buf) (%push-pixel buf bg fmt) (setf cur-bg bg))))
               (t
                (let* ((subs (tile-subrects px fw ax ay tw th bg))
                       (nsub (length subs)))
@@ -323,11 +386,11 @@
                      (let ((mask (logior 8 16)))            ; AnySubrects | SubrectsColoured
                        (unless (= bg cur-bg) (setf mask (logior mask 2)))
                        (vector-push-extend mask buf)
-                       (unless (= bg cur-bg) (%push-pixel buf bg) (setf cur-bg bg))
+                       (unless (= bg cur-bg) (%push-pixel buf bg fmt) (setf cur-bg bg))
                        (vector-push-extend nsub buf)
                        (dolist (sr subs)
                          (destructuring-bind (c lx ly len) sr
-                           (%push-pixel buf c)
+                           (%push-pixel buf c fmt)
                            (vector-push-extend (logior (ash lx 4) ly) buf)
                            (vector-push-extend (logior (ash (1- len) 4) 0) buf))))
                      (progn                                 ; raw tile
@@ -335,17 +398,17 @@
                        (setf cur-bg -1)
                        (dotimes (ly th)
                          (let ((row (* (+ ay ly) fw)))
-                           (dotimes (lx tw) (%push-pixel buf (aref px (+ row ax lx)))))))))))))))
+                           (dotimes (lx tw) (%push-pixel buf (aref px (+ row ax lx)) fmt)))))))))))))
     (w-bytes s buf)))
 
 ;;; ---- update assembly --------------------------------------------------------
 
-(defun write-rect (s fb x y w h enc zs)
+(defun write-rect (s fb x y w h enc zs &optional fmt)
   (cond
-    ((= enc +enc-trle+)    (write-rect-trle s fb x y w h))
-    ((= enc +enc-zrle+)    (write-rect-zrle s fb x y w h zs))
-    ((= enc +enc-hextile+) (write-rect-hextile s fb x y w h))
-    (t                     (write-rect-raw s fb x y w h))))
+    ((= enc +enc-trle+)    (write-rect-trle s fb x y w h fmt))
+    ((= enc +enc-zrle+)    (write-rect-zrle s fb x y w h zs nil fmt))
+    ((= enc +enc-hextile+) (write-rect-hextile s fb x y w h fmt))
+    (t                     (write-rect-raw s fb x y w h fmt))))
 
 (defparameter *use-trle* nil
   "Whether to upgrade big rects to TRLE (enc 15) for clients that advertise it.
@@ -355,24 +418,25 @@
    ZRLE client, and nearly as fast, so it's the universal big-frame path.  Kept as
    a flag in case a specific client benefits and is known to decode our TRLE.")
 
-(defun emit-rect (s fb x y w h enc zs trle)
+(defun emit-rect (s fb x y w h enc zs trle &optional fmt)
   "Write one rect, choosing the cheapest encoding a large rect's client can take.
    Big ZRLE rect -> STORED-block ZRLE (~5x cheaper than full deflate, still ordinary
    ZRLE, so every client decodes it); TRLE only if explicitly enabled AND negotiated.
    Small rects take normal ENC (cheap because small, best ratio)."
   (cond
     ((and *use-trle* trle (= enc +enc-zrle+) (>= (* w h) *trle-threshold*))
-     (write-rect-trle s fb x y w h))                       ; opt-in TRLE (off by default)
+     (write-rect-trle s fb x y w h fmt))                   ; opt-in TRLE (off by default)
     ((and (= enc +enc-zrle+) (>= (* w h) *zrle-stored-threshold*))
-     (write-rect-zrle s fb x y w h zs t))                  ; big ZRLE: stored fast path (universal)
-    (t (write-rect s fb x y w h enc zs))))
+     (write-rect-zrle s fb x y w h zs t fmt))              ; big ZRLE: stored fast path (universal)
+    (t (write-rect s fb x y w h enc zs fmt))))
 
-(defun send-rects (s fb rects enc zs &optional trle)
+(defun send-rects (s fb rects enc zs &optional trle fmt)
   "One FramebufferUpdate carrying RECTS.  ENC is the client's chosen encoding; ZS
    its persistent ZRLE zlib stream; TRLE whether it also accepts TRLE (used for
-   big rects).  Encoding is chosen per rect by EMIT-RECT."
+   big rects); FMT the client's pixel format (NIL = native).  Encoding per rect
+   by EMIT-RECT."
   (w-u8 s 0) (w-u8 s 0) (w-u16 s (length rects))             ; msg-type, pad, #rects
-  (dolist (r rects) (destructuring-bind (x y w h) r (emit-rect s fb x y w h enc zs trle)))
+  (dolist (r rects) (destructuring-bind (x y w h) r (emit-rect s fb x y w h enc zs trle fmt)))
   (force-output s))
 
 ;;; ---- desktop resize (RFC 6143 §7.8) -----------------------------------------
@@ -450,6 +514,7 @@
 ;;; (polling ~60 Hz).  ONLY the sender writes pixels to the socket.
 (defstruct (rfb-client (:conc-name rc-))
   (enc +enc-raw+) dss cursor cursor-sent copyrect trle
+  (fmt nil)                     ; client pixel format (a PXFMT), or NIL = our native 32bpp
   (snap-box (list nil)) (zs (cram:make-zstream))
   last-size                     ; (cons w h) — fb size last announced to this client
   (want nil)                    ; latest pending request (inc x y w h), or NIL
@@ -475,10 +540,10 @@
             (setf (car ls) (fb-width fb) (cdr ls) (fb-height fb) (car (rc-snap-box client)) nil)
             (return-from send-update t)))))
     (let ((snap-box (rc-snap-box client)) (enc (rc-enc client)) (zs (rc-zs client))
-          (trle (rc-trle client)))
+          (trle (rc-trle client)) (fmt (rc-fmt client)))
       (if (or (zerop inc) (null (car snap-box)))                     ; full / first frame
           (with-fb-locked (fb)
-            (send-rects s fb (list (clip-rect fb x y w h)) enc zs trle)
+            (send-rects s fb (list (clip-rect fb x y w h)) enc zs trle fmt)
             (setf (car snap-box) (copy-pixels fb))
             t)
           (with-fb-locked (fb)                                       ; incremental: dirty tiles
@@ -493,12 +558,12 @@
                    (let ((rects (dirty-rects fb snap (and (consp region) region))))
                      (w-u8 s 0) (w-u8 s 0) (w-u16 s (1+ (length rects)))    ; #rects = CopyRect + exposed
                      (write-rect-copy s dx dy w h sx sy)
-                     (dolist (r rects) (destructuring-bind (rx ry rw rh) r (emit-rect s fb rx ry rw rh enc zs trle)))
+                     (dolist (r rects) (destructuring-bind (rx ry rw rh) r (emit-rect s fb rx ry rw rh enc zs trle fmt)))
                      (force-output s)
                      (update-snapshot fb snap rects)
                      t)))
                 (t (let ((rects (dirty-rects fb snap (and (consp region) region))))
-                     (when rects (send-rects s fb rects enc zs trle) (update-snapshot fb snap rects))
+                     (when rects (send-rects s fb rects enc zs trle fmt) (update-snapshot fb snap rects))
                      (and rects t))))))))))
 
 ;;; A WAKE lets the compositor and the reader thread nudge a parked sender the
@@ -571,7 +636,16 @@
          (loop
            (let ((msg (read-byte s nil :eof)))
              (case msg
-               (0 (skip s 3) (r-bytes s 16))               ; SetPixelFormat (we keep ours)
+               (0 (skip s 3)                               ; SetPixelFormat
+                  (let* ((pf (r-bytes s 16)) (fmt (parse-pxfmt pf)))
+                    (sb-thread:with-mutex ((rc-lock client))
+                      (setf (rc-fmt client) fmt (car (rc-snap-box client)) nil))   ; format change: full re-send
+                    (format *trace-output* "~&glass: client SetPixelFormat bpp=~d depth=~d big-endian=~d true-colour=~d rgb-max=~d,~d,~d shift=~d,~d,~d -> ~a~%"
+                            (aref pf 0) (aref pf 1) (aref pf 2) (aref pf 3)
+                            (logior (ash (aref pf 4) 8) (aref pf 5)) (logior (ash (aref pf 6) 8) (aref pf 7))
+                            (logior (ash (aref pf 8) 8) (aref pf 9)) (aref pf 10) (aref pf 11) (aref pf 12)
+                            (if fmt (format nil "converted (~d-byte pixel, ~d-byte cpixel)" (pxfmt-pbytes fmt) (pxfmt-cbytes fmt)) "native"))
+                    (force-output *trace-output*)))
                (2 (skip s 1)                               ; SetEncodings
                   (let ((n (r-u16 s)) (encs '()))
                     (dotimes (i n) (push (r-u32 s) encs))
@@ -600,7 +674,10 @@
                       (skip s 1)
                       (dotimes (i nscreens) (r-bytes s 16))   ; per-screen layout (ignored)
                       (when on-resize (funcall on-resize rw rh))))
-               (t (return)))))                             ; :eof or unknown -> done
+               (t (unless (eq msg :eof)                    ; EOF = normal disconnect; anything else is notable
+                    (format *trace-output* "~&glass: dropping client on unhandled message-type ~a~%" msg)
+                    (force-output *trace-output*))
+                  (return)))))                             ; :eof or unknown -> done
       (setf (rc-running client) nil)
       (ignore-errors (sb-thread:join-thread sender)))))
 
