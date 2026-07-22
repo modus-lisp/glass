@@ -247,10 +247,30 @@
     ;; compositing is what made CLIM apps jumpy).  Single-app mode has no tick, so
     ;; it composites eagerly.
     (let ((box (mirror-damage-box mirror)))
+      ;; Pop-up mirrors (pull-down menus, submenus, tooltips) render into their own
+      ;; image but never flush their medium, so present-mirror is only ever called for
+      ;; the MAIN frame — which flushes often during any interaction.  Fold in the
+      ;; other mirrors' pending damage here so a just-opened submenu gets composited on
+      ;; the next main-frame flush instead of staying invisible until the frame repaints.
+      (dolist (m (glass-port-mirrors port))
+        (unless (eq m mirror)
+          (let ((mb (mirror-damage-box m)))            ; mb: :empty / NIL=full / (x y w h)
+            (unless (eq mb :empty)
+              (setf box (cond ((eq box :empty) mb)     ; nothing yet -> take mb
+                              ((or (null box) (null mb)) nil)   ; either full -> full
+                              (t (bbox-union box mb))))))))
       (unless (eq box :empty)                  ; nothing drawn since last flush -> nothing to do
         (if (glass-port-wm-p port)
             (port-accumulate-damage port box)
             (composite-all port box))))))       ; BOX = (x y w h) damage, or NIL = full
+
+(defun bbox-union (a b)
+  "Union two (x y w h) boxes; NIL means full-screen (absorbs)."
+  (if (or (null a) (null b)) nil
+      (destructuring-bind (ax ay aw ah) a
+        (destructuring-bind (bx by bw bh) b
+          (let ((x0 (min ax bx)) (y0 (min ay by)))
+            (list x0 y0 (- (max (+ ax aw) (+ bx bw)) x0) (- (max (+ ay ah) (+ by bh)) y0)))))))
 
 (defun port-accumulate-damage (port box)
   "Union BOX (an (x y w h) rect, or NIL = whole screen) into PORT's pending McCLIM
@@ -380,9 +400,42 @@
         ;; blank-area and DISMISSES it.  (X does this with a server-side grab; without
         ;; it, a click over the workspace never reached the menu, so it never closed.)
         ((and grab (climi::sheet-mirrored-ancestor grab))
-         (route-to-grabbed-sheet port grab mask x y))
+         ;; Deliver to the leaf sheet under the pointer WITHIN the grabbing frame (so a
+         ;; hover over a submenu button opens it — the tracker keys off event-sheet);
+         ;; if the pointer is outside that frame's windows (workspace / another app),
+         ;; deliver to the grab sheet so the tracker sees an outside event -> dismiss.
+         (let ((frame (ignore-errors (pane-frame grab))))
+           (multiple-value-bind (leaf lx ly)
+               (when frame (grab-frame-leaf-at port frame x y))
+             (if leaf
+                 (emit-pointer-events port leaf mask (round lx) (round ly))
+                 (route-to-grabbed-sheet port grab mask x y)))))
         ((glass-port-wm-p port) (wm-on-pointer port mask x y))
         (t (glass-on-pointer/single port mask x y))))))
+
+(defun leaf-sheet-at (top sx sy)
+  "Descend from TOP (point SX,SY in TOP's local coordinates) to the innermost child
+   containing the point; (values leaf local-x local-y)."
+  (let ((sheet top) (x sx) (y sy))
+    (loop (let ((child (ignore-errors (child-containing-position sheet x y))))
+            (unless child (return (values sheet x y)))
+            (multiple-value-setq (x y) (untransform-position (sheet-transformation child) x y))
+            (setf sheet child)))))
+
+(defun grab-frame-leaf-at (port frame x y)
+  "Topmost MIRROR belonging to FRAME whose screen region contains SCREEN (X,Y),
+   descended to its innermost child; (values leaf local-x local-y), or NIL.  A menu's
+   pull-downs are separate mirrors but the SAME frame as its menu bar, so this reaches
+   a hovered submenu button while excluding other apps / the bare workspace."
+  (dolist (m (glass-port-mirrors port))
+    (when (typep m 'glass-mirror)
+      (let ((sheet (glass-mirror-sheet m))
+            (img (ignore-errors (mcclim-render::image-mirror-image m))))
+        (when (and sheet img (eq (ignore-errors (pane-frame sheet)) frame))
+          (multiple-value-bind (iw ih) (image-wh img)
+            (let ((gmx (glass-mirror-x m)) (gmy (glass-mirror-y m)))
+              (when (and (<= gmx x (+ gmx iw)) (<= gmy y (+ gmy ih)))
+                (return-from grab-frame-leaf-at (leaf-sheet-at sheet (- x gmx) (- y gmy)))))))))))
 
 (defun route-to-grabbed-sheet (port grab mask x y)
   "Deliver a pointer event at SCREEN (X,Y) to the grabbed sheet GRAB, mapped into its
