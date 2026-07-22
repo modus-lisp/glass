@@ -120,7 +120,15 @@
         (setf (glass-mirror-managed mirror) t
               (glass-mirror-title mirror) (wm-sheet-title sheet))
         (let ((c (glass-port-cascade port)))
-          (setf (glass-mirror-x mirror) (+ 40 c) (glass-mirror-y mirror) (+ 40 c +wm-titleh+)
+          ;; Place the window by MOVING its McCLIM sheet, not by poking glass-mirror-x/y
+          ;; directly: this keeps McCLIM's coordinate math in sync, so pull-down menus,
+          ;; dialogs and tooltips land relative to the window's REAL screen spot (a
+          ;; window at a non-zero origin otherwise gets its menus at the native origin).
+          ;; native-transformation stays identity (content still renders at the image's
+          ;; 0,0); only the on-screen mirror position shifts.  glass-mirror-x/y is then
+          ;; read back from McCLIM's region in set-mirror-geometry (below).
+          (setf (sheet-transformation sheet)
+                (make-translation-transformation (+ 40 c) (+ 40 c +wm-titleh+))
                 (glass-port-cascade port) (mod (+ c 28) 200)))))
     (climi::update-mirror-geometry sheet)          ; creates the render image (via set-mirror-geometry)
     (dispatch-repaint sheet climi::+everywhere+)
@@ -441,8 +449,10 @@
   ;; (always at a 0,0 origin), so position lives here, size in the image.
   (multiple-value-bind (x1 y1 x2 y2) (bounding-rectangle* region)
     (when-let ((mirror (sheet-direct-mirror sheet)))
-      (when (and (typep mirror 'glass-mirror)
-                 (not (glass-mirror-managed mirror)))   ; WM owns managed-window positions
+      ;; REGION is the mirror rect in screen coords — where we composite this sheet.
+      ;; Managed windows are positioned by moving their SHEET (realize-mirror / wm-move),
+      ;; so McCLIM's region already carries the WM slot; just read it back here.
+      (when (typep mirror 'glass-mirror)
         (setf (glass-mirror-x mirror) (floor x1)
               (glass-mirror-y mirror) (floor y1))))
     (values x1 y1 x2 y2)))

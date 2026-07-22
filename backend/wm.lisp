@@ -314,6 +314,19 @@
   (if (wm-surface-p obj) (setf (wm-surface-x obj) x (wm-surface-y obj) y)
       (setf (glass-mirror-x obj) x (glass-mirror-y obj) y)))
 
+(defun wm-sync-sheet (port obj)
+  "After a WM move settles, resync a McCLIM window's SHEET transformation to its new
+   glass-mirror-x/y so McCLIM positions its pull-down menus/dialogs at the window's
+   new spot (wm-move only pokes glass-mirror-x/y, cheap, for per-motion blitting).
+   Runs on the event thread (marshalled via the mailbox) — update-mirror-geometry
+   touches sheet state.  Surfaces have no McCLIM sheet, so they're skipped."
+  (unless (wm-surface-p obj)
+    (when-let ((sheet (glass-mirror-sheet obj)))
+      (let ((x (glass-mirror-x obj)) (y (glass-mirror-y obj)))
+        (enqueue port (lambda ()
+                        (setf (sheet-transformation sheet) (make-translation-transformation x y))
+                        (climi::update-mirror-geometry sheet)))))))
+
 (defun wm-hit (port x y)
   "Topmost window (surfaces are above mirrors) whose decoration or content contains
    (X,Y): (values obj REGION cx cy cw ch), REGION one of :winmenu (title-bar menu
@@ -529,7 +542,9 @@
                   (t (wm-drag-move-opaque port obj ncx ncy)))))) ; release -> final opaque, no switch
            (:resize (destructuring-bind (x0 y0 cw0 ch0) rest
                       (wm-resize port obj (+ cw0 (- x x0)) (+ ch0 (- y y0))) (composite-all port))))
-         (unless down (setf (glass-port-drag port) nil))))
+         (unless down                                        ; release: end the drag
+           (setf (glass-port-drag port) nil)
+           (when (eq mode :move) (wm-sync-sheet port obj)))))   ; keep McCLIM's menu coords tracking
       (t
        (multiple-value-bind (obj region cx cy cw ch) (wm-hit port x y)
          (cond
