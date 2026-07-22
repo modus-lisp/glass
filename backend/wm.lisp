@@ -548,7 +548,7 @@
       (t
        (multiple-value-bind (obj region cx cy cw ch) (wm-hit port x y)
          (cond
-           ((and (null obj) (logtest mask 4))                 ; right-press on workspace: root menu
+           ((and (null obj) (logtest mask 5))                 ; press on workspace (left OR right): root menu
             (wm-open-menu port x y) (composite-all port))
            ((null obj))                                       ; workspace: ignore
            ((eq region :winmenu)                              ; title-bar wedge: the Window Menu
@@ -618,47 +618,37 @@
     (and p (let ((s (find-symbol name p))) (and s (fboundp s) s)))))
 
 (defun wm-browse-default-url ()
-  "A generic start page for (:browse) with no URL: loom's bundled home page if
-   loom is loadable, else a well-known site."
-  (let ((dir (ignore-errors (asdf:system-source-directory '#:loom))))
-    (if dir (namestring (merge-pathnames "assets/home.html" dir)) "https://example.com")))
+  "The start page for (:browse) with no URL: about:blank, so the window appears
+   instantly (no page fetch) — type a URL in the address bar to go somewhere."
+  "about:blank")
 
 (defun wm-add-browser (port &optional url &key (width 900) (height 620))
-  "Open URL (default: a generic start page) as a loom browser surface window:
-   loom/glass renders weft into a glass framebuffer, the WM decorates it, and RFB
-   input routes to the live page (links navigate in place).  loom/glass is an
-   OPTIONAL runtime dependency, resolved by name (no .asd dep — glass must not
-   depend on loom, which depends on glass)."
+  "Open URL (default: about:blank) as a loom browser surface window WITH CHROME —
+   loom.glass:attach-browser renders a toolbar (back / forward / reload + address
+   bar) over weft's page into a glass framebuffer; the WM decorates it and routes
+   RFB input to the live browser.  loom/glass is an OPTIONAL runtime dependency,
+   resolved by name (no .asd dep — glass must not depend on loom, which depends on
+   glass)."
   (unless url (setf url (wm-browse-default-url)))
-  (let ((load-url  (%loom-fn '#:loom "LOAD-URL"))
-        (load-file (%loom-fn '#:loom "LOAD-FILE"))
-        (render    (%loom-fn '#:loom "RENDER-PAGE"))
-        (title-of  (%loom-fn '#:loom "PAGE-TITLE"))
-        (attach    (%loom-fn '#:loom.glass "ATTACH"))
-        (onk       (%loom-fn '#:loom.glass "ON-KEY"))
-        (onp       (%loom-fn '#:loom.glass "ON-POINTER"))
-        (pump      (%loom-fn '#:loom.glass "PUMP-LOOP"))
-        (stop      (%loom-fn '#:loom.glass "STOP")))
-    (unless (and attach onk onp pump (or load-url load-file))
+  (let ((attach-b (%loom-fn '#:loom.glass "ATTACH-BROWSER"))
+        (onk      (%loom-fn '#:loom.glass "ON-KEY"))
+        (onp      (%loom-fn '#:loom.glass "ON-POINTER"))
+        (pump     (%loom-fn '#:loom.glass "PUMP-LOOP"))
+        (stop     (%loom-fn '#:loom.glass "STOP")))
+    (unless (and attach-b onk onp pump)
       (error "loom/glass not loaded — (ql:quickload :loom/glass)"))
-    (let* ((u (string-downcase url))
-           (httpp (or (and (>= (length u) 5) (string= u "http:"  :end1 5))
-                      (and (>= (length u) 6) (string= u "https:" :end1 6))))
-           (page (if httpp (funcall load-url url :width width :viewport-height height)
-                     (funcall load-file url :width width :viewport-height height)))
-           (fb (glass:make-framebuffer width height (glass:rgb 255 255 255)))
-           (c (glass-port-cascade port)))
-      (when render (funcall render page))
-      (let ((app (funcall attach page fb)))
-        (prog1
-            (wm-add-surface* port
-              (make-wm-surface :fb fb :x (+ 40 c) :y (+ 40 c +wm-titleh+)
-                               :title (or (and title-of (funcall title-of page)) "browser")
-                               :on-key (lambda (down k) (funcall onk app down k))
-                               :on-pointer (lambda (mask lx ly) (funcall onp app mask lx ly))
-                               ;; on close, stop weft's render pump (else it re-renders forever)
-                               :close-fn (and stop (lambda () (funcall stop app)))))
-          (sb-thread:make-thread (lambda () (funcall pump app)) :name "wm-browse-pump"))))))
+    (let* ((fb (glass:make-framebuffer width height (glass:rgb 255 255 255)))
+           (c (glass-port-cascade port))
+           (app (funcall attach-b url fb)))
+      (prog1
+          (wm-add-surface* port
+            (make-wm-surface :fb fb :x (+ 40 c) :y (+ 40 c +wm-titleh+)
+                             :title "browser"
+                             :on-key (lambda (down k) (funcall onk app down k))
+                             :on-pointer (lambda (mask lx ly) (funcall onp app mask lx ly))
+                             ;; on close, stop weft's render pump (else it re-renders forever)
+                             :close-fn (and stop (lambda () (funcall stop app)))))
+        (sb-thread:make-thread (lambda () (funcall pump app)) :name "wm-browse-pump")))))
 
 (defun %read-file-bytes (path)
   (with-open-file (s path :element-type '(unsigned-byte 8))
