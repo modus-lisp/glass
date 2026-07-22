@@ -1,0 +1,68 @@
+;;;; wm-menu-dismiss.lisp — verify that clicking OUTSIDE an open McCLIM menu (e.g.
+;;;; the empty workspace) dismisses it, in WM mode.  Without a pointer grab a
+;;;; workspace click never reached the menu's tracking loop, so it stayed open.
+;;;; IN-PROCESS (reads the fb directly, injects pointer events through the backend).
+;;;;   sbcl --dynamic-space-size 4096 --disable-debugger --load backend/inspect/wm-menu-dismiss.lisp
+(require :asdf)
+(load "~/quicklisp/setup.lisp")
+(handler-bind ((warning #'muffle-warning))
+  (let ((*standard-output* (make-broadcast-stream)))
+    (ql:quickload '(:mcclim :mcclim-render :glass :zpng :clim-examples))
+    (require :sb-concurrency)
+    (asdf:load-asd "/home/claude/glass/backend/mcclim-glass.asd")
+    (asdf:load-system :mcclim-glass)))
+
+(defpackage #:glass-menu-dismiss (:use #:cl))
+(in-package #:glass-menu-dismiss)
+
+(defun fb-copy (port)
+  (let ((fb (clim-glass::glass-port-fb port)))
+    (glass:with-fb-locked (fb)
+      (values (copy-seq (glass:fb-pixels fb)) (glass:fb-width fb) (glass:fb-height fb)))))
+(defun save (px w h path)
+  (let* ((png (make-instance 'zpng:png :width w :height h :color-type :truecolor)) (d (zpng:data-array png)))
+    (dotimes (y h) (dotimes (x w)
+      (let ((p (aref px (+ (* y w) x))))
+        (setf (aref d y x 0) (ldb (byte 8 16) p) (aref d y x 1) (ldb (byte 8 8) p) (aref d y x 2) (ldb (byte 8 0) p)))))
+    (zpng:write-png png path)) (format t "~&wrote ~a~%" path) (finish-output))
+(defun diff (a b) (let ((n 0)) (dotimes (i (length a)) (unless (= (aref a i) (aref b i)) (incf n))) n))
+(defun ptr (port mask x y) (clim-glass::glass-on-pointer port mask x y))
+(defun click (port x y) (ptr port 0 x y) (ptr port 1 x y) (ptr port 0 x y))
+(defun managed-mirror (port)
+  (find-if (lambda (m) (and (typep m 'clim-glass::glass-mirror) (clim-glass::glass-mirror-managed m)))
+           (clim-glass::glass-port-mirrors port)))
+
+(let ((port-num 5945) (sw 900) (sh 640))
+  (sb-thread:make-thread
+   (lambda () (handler-case (clim-glass:run-wm '((clim-demo::gadget-test :width 420 :height 320))
+                                               :port port-num :width sw :height sh)
+                (error (e) (format t "~&WM ERROR ~a~%" e) (finish-output))))
+   :name "wm")
+  (let ((port nil) (mir nil))
+    (loop repeat 400 until (and (setf port (clim-glass::find-glass-port :port port-num))
+                                (clim-glass::glass-port-fb port) (setf mir (managed-mirror port)))
+          do (sleep 0.1))
+    (unless mir (format t "~&NO WINDOW~%") (finish-output) (sb-ext:exit :code 1))
+    (sleep 2.0) (clim-glass::composite-all port)
+    (let ((mx (clim-glass::glass-mirror-x mir)) (my (clim-glass::glass-mirror-y mir)))
+      (multiple-value-bind (base bw bh) (fb-copy port)
+        (save base bw bh "/tmp/dismiss-0-baseline.png")
+        ;; open the Lisp menu
+        (click port (+ mx 20) (+ my 8)) (sleep 0.9)
+        (multiple-value-bind (opened ow oh) (fb-copy port)
+          (save opened ow oh "/tmp/dismiss-1-open.png")
+          (format t "~&menu opened: ~d px differ from baseline~%" (diff base opened)) (finish-output)
+          ;; CLICK THE EMPTY WORKSPACE (far from the window) — should dismiss the menu
+          (click port 760 520) (sleep 0.9)
+          (multiple-value-bind (after aw ah) (fb-copy port)
+            (declare (ignore aw ah))
+            (save after ow oh "/tmp/dismiss-2-after-workspace-click.png")
+            (let ((vs-open (diff opened after)) (vs-base (diff base after)))
+              (format t "~&after workspace click: ~d px differ from OPEN, ~d px differ from BASELINE~%" vs-open vs-base)
+              (format t "~&VERDICT: ~a~%"
+                      (cond ((< vs-base (max 1 (floor (diff base opened) 20))) "MENU DISMISSED (reverted to baseline)")
+                            ((> vs-open 0) "menu changed but not fully closed")
+                            (t "MENU STILL OPEN (unchanged)")))
+              (finish-output)))))
+      (format t "DONE~%") (finish-output))))
+(sb-ext:exit)

@@ -35,6 +35,7 @@
    (cascade  :initform 0   :accessor glass-port-cascade)      ; next window placement offset
    (surfaces :initform '() :accessor glass-port-surfaces)     ; non-McCLIM windows (e.g. terminals)
    (focus-surface :initform nil :accessor glass-port-focus-surface)  ; surface grabbing the keyboard
+   (grab-sheet :initform nil :accessor glass-port-grab-sheet)  ; McCLIM sheet grabbing the pointer (menu tracking)
    (menu     :initform nil :accessor glass-port-menu)         ; open workspace root menu, or nil
    (menu-items :initform '() :accessor glass-port-menu-items)  ; (label . thunk) list for the root menu
    (bg       :initform nil :accessor glass-port-bg)           ; desktop background framebuffer, or nil (flat teal)
@@ -370,9 +371,31 @@
 (defun glass-on-pointer (port mask x y)
   (with-reported-errors
     (setf (glass-port-px port) x (glass-port-py port) y)
-    (if (glass-port-wm-p port)
-        (wm-on-pointer port mask x y)
-        (glass-on-pointer/single port mask x y))))
+    (let ((grab (glass-port-grab-sheet port)))
+      (cond
+        ;; A McCLIM sheet (an open pull-down menu, a drag-tracker) has GRABBED the
+        ;; pointer.  We are the window system, so we enforce the grab: route ALL
+        ;; pointer events to that sheet (in its own coordinates), so its tracking loop
+        ;; sees moves/clicks wherever the pointer is — and a click OUTSIDE it reads as
+        ;; blank-area and DISMISSES it.  (X does this with a server-side grab; without
+        ;; it, a click over the workspace never reached the menu, so it never closed.)
+        ((and grab (climi::sheet-mirrored-ancestor grab))
+         (route-to-grabbed-sheet port grab mask x y))
+        ((glass-port-wm-p port) (wm-on-pointer port mask x y))
+        (t (glass-on-pointer/single port mask x y))))))
+
+(defun route-to-grabbed-sheet (port grab mask x y)
+  "Deliver a pointer event at SCREEN (X,Y) to the grabbed sheet GRAB, mapped into its
+   own coordinate system (via its mirror's screen position + native transformation)."
+  (let* ((mirror (sheet-direct-mirror (climi::sheet-mirrored-ancestor grab)))
+         (gmx (if (typep mirror 'glass-mirror) (glass-mirror-x mirror) 0))
+         (gmy (if (typep mirror 'glass-mirror) (glass-mirror-y mirror) 0)))
+    (multiple-value-bind (lx ly)
+        (ignore-errors (untransform-position (sheet-native-transformation grab)
+                                             (- x gmx) (- y gmy)))
+      (if lx
+          (emit-pointer-events port grab mask (round lx) (round ly))
+          (emit-pointer-events port grab mask (- x gmx) (- y gmy))))))
 
 (defun glass-on-pointer/single (port mask x y)
   (when-let ((sheet (glass-port-top port)))
@@ -462,6 +485,20 @@
 ;; never reach an interactor/editor.
 (defmethod set-sheet-pointer-cursor ((port glass-port) sheet cursor)
   (declare (ignore sheet cursor)) nil)
+
+;; Pointer grabbing: basic-port only WARNS "not implemented" (so the grab was never
+;; recorded and menus had no grab).  We record the TRACKED SHEET ourselves — even for
+;; a :multiple-window grab (menu bars use one), where climi::port-grabbed-sheet is
+;; merely T — and glass-on-pointer routes every pointer event to it, so a menu's
+;; tracking loop sees clicks anywhere and a click OUTSIDE it dismisses it.
+(defmethod port-grab-pointer ((port glass-port) pointer sheet &key multiple-window)
+  (declare (ignore pointer multiple-window))
+  (setf (glass-port-grab-sheet port) sheet)
+  t)
+(defmethod port-ungrab-pointer ((port glass-port) pointer sheet)
+  (declare (ignore pointer sheet))
+  (setf (glass-port-grab-sheet port) nil)
+  t)
 
 ;;; ---- convenience: run a frame ----------------------------------------------
 
