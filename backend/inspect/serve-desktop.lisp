@@ -9,6 +9,7 @@
     (ql:quickload '(:glass :glass/vncauth :mcclim :mcclim-render :sb-concurrency
                     :pigment :clim-examples :clim-listener))   ; vncauth = DES via seal
     (ignore-errors (asdf:load-system :loom/glass))            ; the browser (optional)
+    (ignore-errors (asdf:load-system :warren))                ; the file browser (optional)
     (asdf:load-asd "/home/claude/glass/backend/mcclim-glass.asd")
     (asdf:load-system :mcclim-glass)))
 
@@ -58,6 +59,15 @@
   (format *error-output* "@@ VNC auth: ~:[OPEN — any password accepted~;REQUIRED — ~:*~d-char password loaded~]~%"
           (and glass:*vnc-password* (length glass:*vnc-password*)))
   (finish-output *error-output*)
+  ;; If warren (the pure-CL file browser) loaded, register it in the root menu as a
+  ;; generic :surface app — found by name so this is a no-op when warren is absent
+  ;; (mirrors the loom/glass optional dependency; read-time-safe: no warren symbol
+  ;; is referenced literally, only resolved at run time).
+  (when (find-package :warren)
+    (ignore-errors
+     (clim-glass:register-app "File Browser"
+       (list :surface (symbol-function (find-symbol "DESKTOP-SURFACE" :warren))
+             :title "Files" :width 1000 :height 640))))
   (clim-glass:run-wm '((:terminal :cols 80 :rows 24 :ppem 14))
                      :port 5901 :width 1280 :height 800
                      :background wp :background-mode :cover))

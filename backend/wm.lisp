@@ -585,6 +585,21 @@
   (setf (glass-port-focus-surface port) surf)
   surf)
 
+(defun add-surface (port make-fn &key (title "surface") (width 800) (height 600))
+  "GENERIC, app-agnostic surface launcher — the public extension point for hosting
+   ANY external glass-surface app as a decorated WM window.  Makes a fresh WIDTH x
+   HEIGHT framebuffer, calls MAKE-FN on it to build the app over that fb; MAKE-FN
+   returns (values ON-KEY ON-POINTER DIRTY-P) — the same surface contract the
+   terminal exposes (on-key/on-pointer forward RFB input, dirty-p repaints into the
+   fb and reports change).  The WM decorates, composites, drags, raises and closes
+   it like any window.  Nothing here knows about any particular app."
+  (let* ((fb (glass:make-framebuffer width height (glass:rgb 255 255 255)))
+         (c (glass-port-cascade port)))
+    (multiple-value-bind (on-key on-pointer dirty-p) (funcall make-fn fb)
+      (wm-add-surface* port
+        (make-wm-surface :fb fb :x (+ 40 c) :y (+ 40 c +wm-titleh+) :title title
+                         :on-key on-key :on-pointer on-pointer :dirty-p dirty-p)))))
+
 (defun wm-add-terminal (port &key (cols 80) (rows 24) (ppem 14))
   "Create a terminal (shell in a pty) and add it as a WM surface window."
   (let* ((tm (glass-term:make-terminal :cols cols :rows rows :ppem ppem))
@@ -801,6 +816,9 @@
 ;;;   (:edit &optional FILE)            Climacs, the McCLIM editor
 ;;;   (:browse URL &key width height)   a loom/weft browser window
 ;;;   (:image PATH &key max-w max-h)    an image (pigment's decoder, else opticl)
+;;;   (:surface MAKE-FN &key title width height)  ANY external glass-surface app —
+;;;       MAKE-FN, called with a fresh fb, returns (values on-key on-pointer
+;;;       dirty-p) (the generic, warren-agnostic extension hook; see ADD-SURFACE)
 ;;;   (FRAME-CLASS &key width height)   any McCLIM application frame
 (defun wm-spawn-spec (port spec)
   (case (car spec)
@@ -811,6 +829,7 @@
     (:edit     (apply #'wm-edit port (cdr spec)))
     (:browse   (apply #'wm-add-browser port (cdr spec)))
     (:image    (apply #'wm-add-image port (cdr spec)))
+    (:surface  (apply #'add-surface port (cdr spec)))
     (t (destructuring-bind (class &key (width 480) (height 320)) spec
          (wm-run-frame port (make-application-frame class :frame-manager (find-frame-manager :port port)
                                                     :width width :height height)
@@ -834,25 +853,46 @@
   (let ((dir (ignore-errors (asdf:system-source-directory '#:mcclim-glass))))
     (and dir (let ((p (merge-pathnames "assets/sample.png" dir))) (and (probe-file p) (namestring p))))))
 
+(defvar *extra-apps* '()
+  "External-app root-menu items (LABEL . SPEC), contributed by other packages via
+   REGISTER-APP and APPENDED to the default menu — so an out-of-tree glass app
+   (e.g. a file browser) joins the workspace menu without editing WM-DEFAULT-MENU.
+   Empty by default, so the stock menu is unchanged until something registers.")
+
+(defun register-app (label spec)
+  "Register an external app so it appears in the workspace root menu: push
+   (LABEL . SPEC) onto *EXTRA-APPS* (which WM-DEFAULT-MENU appends).  SPEC is any
+   window spec — typically (:surface MAKE-FN &key title width height) for a pure
+   glass-surface app.  Re-registering the same LABEL replaces the prior entry, so
+   this is idempotent.  Registrations made BEFORE run-wm show up automatically; to
+   add one to an ALREADY-running desktop, also refresh that port's menu-items
+   ((setf (glass-port-menu-items port) (wm-default-menu)))."
+  (setf *extra-apps* (append (remove label *extra-apps* :key #'car :test #'equal)
+                             (list (cons label spec))))
+  label)
+
 (defun wm-default-menu ()
   "The default workspace root menu: generic Browse / Inspect / Debug / Terminal,
-   plus an Apps submenu of whatever McCLIM apps are loaded.  Built at call time so
-   app class symbols only appear when their packages exist."
-  (list*
-   '("Browse"   :browse)                                  ; generic start page
-   '("Inspect"  :inspect (list-all-packages))             ; generic: the environment
-   '("Debug"    :debug (break "Workspace debugger"))      ; generic: enter the debugger
-   '("Terminal" :terminal)
-   (list
-    (list* "Apps" :submenu
-           (remove nil
-                   (list '("Tabbed Terminal" :tabterm)
-                         (wm-app-item "Calculator" '#:clim-demo.calculator "CALCULATOR-APP" :width 360 :height 320)
-                         (wm-app-item "Gadget Demo" '#:clim-demo "GADGET-TEST" :width 380 :height 320)
-                         (wm-app-item "Listener" '#:clim-listener "LISTENER" :width 720 :height 480)
-                         '("Editor (Climacs)" :edit)
-                         (let ((img (wm-sample-image))) (and img (list "Image Viewer" :image img)))
-                         '("Browse example.com" :browse "https://example.com")))))))
+   an Apps submenu of whatever McCLIM apps are loaded, plus any externally
+   REGISTER-APP'd items appended after.  Built at call time so app class symbols
+   only appear when their packages exist (and *extra-apps* is read live)."
+  (append
+   (list*
+    '("Browse"   :browse)                                 ; generic start page
+    '("Inspect"  :inspect (list-all-packages))            ; generic: the environment
+    '("Debug"    :debug (break "Workspace debugger"))     ; generic: enter the debugger
+    '("Terminal" :terminal)
+    (list
+     (list* "Apps" :submenu
+            (remove nil
+                    (list '("Tabbed Terminal" :tabterm)
+                          (wm-app-item "Calculator" '#:clim-demo.calculator "CALCULATOR-APP" :width 360 :height 320)
+                          (wm-app-item "Gadget Demo" '#:clim-demo "GADGET-TEST" :width 380 :height 320)
+                          (wm-app-item "Listener" '#:clim-listener "LISTENER" :width 720 :height 480)
+                          '("Editor (Climacs)" :edit)
+                          (let ((img (wm-sample-image))) (and img (list "Image Viewer" :image img)))
+                          '("Browse example.com" :browse "https://example.com"))))))
+   *extra-apps*))                                          ; external apps (empty unless registered)
 
 (defun run-wm (specs &key (port 5900) (width 1000) (height 720) menu
                           background (background-mode :cover))

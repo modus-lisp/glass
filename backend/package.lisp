@@ -7,4 +7,6 @@
   (:export #:glass-port
            #:find-glass-port
            #:run-frame
-           #:run-wm))
+           #:run-wm
+           #:register-app                ; register an external app in the root menu
+           #:add-surface))               ; launch any external glass-surface app as a window
