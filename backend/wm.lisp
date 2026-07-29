@@ -113,7 +113,28 @@
   (dirty-p nil)                         ; ()->bool: did the content fb change? (nil = always redraw)
   (resize-fn nil)                       ; (px-w px-h)->() : resize the content, or nil = not resizable
   (close-fn nil)                        ; ()->() : tear down the content on window close
-  (saved-geom nil))                     ; (x y w h) saved by Full Size, for Restore Size
+  (saved-geom nil)                      ; (x y w h) saved by Full Size, for Restore Size
+  (err-count 0))                        ; consecutive per-frame poll/draw errors (see wm-note-surface-error)
+
+(defparameter *wm-surface-error-limit* 60
+  "Consecutive per-frame errors from a surface's dirty-p poll or draw that the
+   compositor tolerates before dropping the surface.  A misbehaving window is skipped
+   each frame and, if it keeps failing (~1s at 60fps), removed — so one broken window
+   can never wedge or kill the desktop.  A surface that recovers has its count reset.")
+
+(defun wm-note-surface-error (port surf e)
+  "Record a per-frame error from SURF's poll/draw: log it, count it, and once it has
+   failed *WM-SURFACE-ERROR-LIMIT* frames in a row, drop it from the compositor so the
+   loop stays alive.  Never signals (called from inside the compositor's guards)."
+  (ignore-errors
+   (format *trace-output* "~&[wm] surface ~s poll/draw error: ~a~%"
+           (ignore-errors (wm-surface-title surf)) e))
+  (when (>= (incf (wm-surface-err-count surf)) *wm-surface-error-limit*)
+    (ignore-errors
+     (setf (glass-port-surfaces port) (remove surf (glass-port-surfaces port)))
+     (when (eq (glass-port-focus-surface port) surf)
+       (setf (glass-port-focus-surface port) nil))
+     (when (wm-surface-close-fn surf) (ignore-errors (funcall (wm-surface-close-fn surf)))))))
 
 (defun wm-surface-deco* (surf cw)
   (when (or (null (wm-surface-deco surf)) (/= cw (wm-surface-deco-w surf)))
@@ -202,9 +223,11 @@
       (blit-fb (glass-port-bg port) 0 0 fb)                    ; desktop wallpaper
       (glass:fb-fill fb +wm-teal+))
   (dolist (mirror (reverse (glass-port-mirrors port)))        ; McCLIM windows (bottom-to-top)
-    (if (glass-mirror-managed mirror) (wm-draw-window mirror fb) (blit-mirror mirror fb)))
+    (ignore-errors                                            ; a bad window draws nothing, not a crash
+     (if (glass-mirror-managed mirror) (wm-draw-window mirror fb) (blit-mirror mirror fb))))
   (dolist (surf (reverse (glass-port-surfaces port)))         ; surface windows, on top
-    (wm-draw-surface surf fb))
+    (handler-case (wm-draw-surface surf fb)                   ; isolate each surface's draw
+      (error (e) (wm-note-surface-error port surf e))))       ; skip it this frame; cull if persistent
   (when-let ((b (and (glass-port-drag-wire port) (glass-port-drag-wire-box port))))  ; wireframe outline
     (destructuring-bind (x y w h) b
       (glass:fb-frame fb x y w h glass:+white+ 2)             ; white + inner black = visible on any bg
@@ -925,8 +948,15 @@
     (loop (sleep 1/60)
           (let ((boxes '()) (full nil))
             (dolist (s (glass-port-surfaces p))
-              (cond ((null (wm-surface-dirty-p s)) (setf full t))        ; unknown extent -> whole screen
-                    ((funcall (wm-surface-dirty-p s)) (push (wm-window-box s) boxes))))
+              ;; isolate each surface's poll: a signalling dirty-p is caught, the
+              ;; surface skipped this frame (and culled if it keeps failing), and the
+              ;; compositor loop kept ALIVE — one bad window can't take down the desktop.
+              (handler-case
+                  (let ((dp (wm-surface-dirty-p s)))
+                    (cond ((null dp) (setf full t))                      ; unknown extent -> whole screen
+                          ((funcall dp) (push (wm-window-box s) boxes)))
+                    (setf (wm-surface-err-count s) 0))                   ; healthy poll -> reset
+                (error (e) (wm-note-surface-error p s e))))
             ;; McCLIM app repaints accumulated by present-mirror since the last tick,
             ;; coalesced into ONE composite here (a burst of ~20 repaints -> 1 paint)
             (let ((pend (port-take-pending p)))
