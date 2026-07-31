@@ -655,6 +655,20 @@
   (let ((p (find-package pkg)))
     (and p (let ((s (find-symbol name p))) (and s (fboundp s) s)))))
 
+(defun fb-generation-poll (fb)
+  "A DIRTY-P thunk for a surface whose content FB is written by somebody else's render
+   loop: true exactly when FB's generation has moved since the last poll.  Every glass
+   drawing primitive bumps the generation (FB-TOUCH), so this needs no cooperation from
+   the renderer beyond drawing through — or explicitly touching — the framebuffer.
+
+   The alternative the compositor falls back to for a surface with NO dirty-p is 'assume
+   the whole screen changed', which for a permanently-open window means a full-screen
+   recomposite every tick forever, whether or not anything moved."
+  (let ((seen -1))
+    (lambda ()
+      (let ((g (glass:fb-generation fb)))
+        (and (not (eql g seen)) (setf seen g) t)))))
+
 (defun wm-browse-default-url ()
   "The start page for (:browse) with no URL: about:blank, so the window appears
    instantly (no page fetch) — type a URL in the address bar to go somewhere."
@@ -684,6 +698,13 @@
                              :title "browser"
                              :on-key (lambda (down k) (funcall onk app down k))
                              :on-pointer (lambda (mask lx ly) (funcall onp app mask lx ly))
+                             ;; loom's pump paints into FB only when the page or the chrome
+                             ;; actually changed, and touches it when it does — so the fb
+                             ;; generation is exactly this window's damage signal.  Without
+                             ;; a dirty-p the compositor must assume "unknown extent" and
+                             ;; recomposite the whole screen every tick for as long as the
+                             ;; window is open, browsing or not.
+                             :dirty-p (fb-generation-poll fb)
                              ;; on close, stop weft's render pump (else it re-renders forever)
                              :close-fn (and stop (lambda () (funcall stop app)))))
         (sb-thread:make-thread (lambda () (funcall pump app)) :name "wm-browse-pump")))))

@@ -73,20 +73,34 @@
                (list (min ax0 bx0) (min ay0 by0) (max ax1 bx1) (max ay1 by1)))))))
 
 (defun %fb-copy-compose (old new)
-  "Fold two successive window-move copies (sx sy dx dy w h) into ONE, or NIL if they can't
-   be one CopyRect.  A drag is one window translating, so a chain (OLD's dst == NEW's src,
-   same size) folds to (OLD-src -> NEW-dst) — this is 'CopyRect farther': the hint spans
-   however many frames the sender fell behind.  A non-move composite (NEW NIL) keeps OLD (the
-   window hasn't moved; the extra damage rides the diff).  Two independent moves -> NIL."
+  "Fold two successive move copies (sx sy dx dy w h) into ONE, or NIL if nothing survives.
+   Both are translations, so the pixels a single CopyRect can still carry are exactly those
+   NEW moved AND OLD had already put there: intersect OLD's destination with NEW's source,
+   then map that patch back to OLD's source and forward to NEW's destination.  This is
+   'CopyRect farther' — the hint spans however many frames the sender fell behind.
+
+   A dragged window (OLD's dst == NEW's src, same size) survives whole, which is the case
+   this started as; a SCROLL, where each frame moves the same full-width block by a
+   different amount, keeps the sub-block common to both (total offset, shorter block) —
+   the previous exact-chain test rejected that and threw the hint away.  A non-move
+   composite (NEW NIL) keeps OLD (nothing moved; the extra damage rides the diff).
+
+   Dropping to NIL is always SAFE, never wrong: a copy is only ever a shortcut past pixels
+   the diff would otherwise re-encode, and the sender applies the same move to the client's
+   snapshot before diffing, so whatever the copy does not carry is simply sent."
   (cond
     ((null new) old)
     ((null old) new)
     (t (destructuring-bind (osx osy odx ody ow oh) old
-         (declare (ignore osx osy))
          (destructuring-bind (nsx nsy ndx ndy nw nh) new
-           (if (and (= odx nsx) (= ody nsy) (= ow nw) (= oh nh))
-               (list (first old) (second old) ndx ndy ow oh)
-               nil))))))
+           (let* ((x0 (max odx nsx)) (y0 (max ody nsy))                  ; overlap, in OLD's
+                  (x1 (min (+ odx ow) (+ nsx nw)))                       ; destination space
+                  (y1 (min (+ ody oh) (+ nsy nh)))
+                  (w (- x1 x0)) (h (- y1 y0)))
+             (when (and (plusp w) (plusp h))
+               (list (+ osx (- x0 odx)) (+ osy (- y0 ody))               ; back to OLD's source
+                     (+ ndx (- x0 nsx)) (+ ndy (- y0 nsy))               ; on to NEW's destination
+                     w h))))))))
 
 (defun fb-mark-frame (fb damage &optional copy)
   "Record that a composite changed region DAMAGE ((x0 y0 x1 y1) or :FULL) and, if it was a
