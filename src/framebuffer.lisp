@@ -217,6 +217,43 @@
   (fb-touch fb)
   fb)
 
+(defun fb-move-rect (fb sx sy dx dy w h)
+  "Translate the W x H block of FB's OWN pixels at (SX,SY) to (DX,DY) — in RAM, exactly
+   what RFB's CopyRect does on the wire.  Ignores the clip box (the caller decides what
+   may move, and a half-moved block is not a thing); a block that would read or write
+   outside FB is refused whole rather than trimmed, so callers clip first.
+
+   A compositor that knows a window merely SCROLLED can move the pixels the screen
+   already holds instead of blitting the window again, and then redraw only the strip
+   the move exposed.  Rows are copied in the order that keeps an overlapping move from
+   eating its own source: downwards moves bottom-up, upwards moves top-down.  A purely
+   HORIZONTAL move has one row as both source and destination, so it goes through a
+   scratch row rather than trusting REPLACE's same-sequence overlap rule."
+  (declare (optimize (speed 3) (safety 0))
+           (fixnum sx sy dx dy w h))
+  (let* ((px (fb-pixels fb)) (fw (fb-width fb)) (fh (fb-height fb)))
+    (declare (type (simple-array (unsigned-byte 32) (*)) px) (fixnum fw fh))
+    (when (and (plusp w) (plusp h)
+               (<= 0 sx) (<= 0 sy) (<= (+ sx w) fw) (<= (+ sy h) fh)
+               (<= 0 dx) (<= 0 dy) (<= (+ dx w) fw) (<= (+ dy h) fh)
+               (or (/= sx dx) (/= sy dy)))
+      (flet ((row (k)                                  ; move row K of the block
+               (declare (fixnum k))
+               (let ((s (+ (* (+ sy k) fw) sx)) (d (+ (* (+ dy k) fw) dx)))
+                 (declare (fixnum s d))
+                 (replace px px :start1 d :end1 (+ d w) :start2 s :end2 (+ s w)))))
+        (cond
+          ((= sy dy)                                   ; same rows: stage through a scratch row
+           (let ((tmp (make-array w :element-type '(unsigned-byte 32))))
+             (dotimes (k h)
+               (let ((s (+ (* (+ sy k) fw) sx)) (d (+ (* (+ dy k) fw) dx)))
+                 (replace tmp px :start2 s :end2 (+ s w))
+                 (replace px tmp :start1 d :end1 (+ d w))))))
+          ((> dy sy) (loop for k fixnum from (1- h) downto 0 do (row k)))
+          (t         (loop for k fixnum from 0 below h do (row k)))))
+      (fb-touch fb)))
+  fb)
+
 (defun fb-hline (fb x y w color) (fb-rect fb x y w 1 color))
 (defun fb-vline (fb x y h color) (fb-rect fb x y 1 h color))
 

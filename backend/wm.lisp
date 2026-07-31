@@ -238,7 +238,26 @@
    to rely on that repair.  It is not free: on a 1280x800 desktop with a terminal over a
    scrolling browser, refusing measured ~417 KB/frame against ~213 KB/frame for letting
    the copy through (both pixel-identical on the client).  Refusing is never worse than
-   the no-CopyRect behaviour it falls back to.  Live-tunable.")
+   the no-CopyRect behaviour it falls back to.  Live-tunable.
+
+   NB this parameter governs the WIRE copy only.  The same translation done in the
+   SCREEN framebuffer (*WM-SCROLL-STRIP*) is guarded unconditionally, because there the
+   argument above does not hold — see WM-COMPOSITE-SCROLL.")
+
+(defparameter *wm-scroll-strip* t
+  "Composite a scrolling window by TRANSLATING what the screen already holds and
+   redrawing only the strip the translation exposed, instead of blitting the whole
+   window again?  The same move the wire gets as a CopyRect, done in RAM: the screen
+   already holds those pixels, so re-reading them out of the window's framebuffer is
+   the second time the same copy is paid.  NIL restores the plain whole-window blit,
+   which is always correct.  Live-tunable.")
+
+(defparameter *wm-skip-covered-background* t
+  "Skip the desktop background under a region an opaque window completely covers?
+   The wallpaper (or the flat teal) is drawn first and every pixel of it inside a window
+   is then overwritten before anybody sees it — so for the common damage box, ONE
+   window's own rectangle, drawing it is pure waste.  NIL always draws it.
+   Live-tunable.")
 
 (defun wm-box-intersect (a b)
   "Intersection of two (x y w h) boxes, or NIL when they don't overlap."
@@ -250,6 +269,35 @@
           (when (and (< x0 x1) (< y0 y1)) (list x0 y0 (- x1 x0) (- y1 y0))))))))
 
 (defun wm-boxes-overlap-p (a b) (and (wm-box-intersect a b) t))
+
+(defun wm-box-difference (a b)
+  "The parts of box A that box B does not cover, as up to four rectangles: the bands
+   above and below B (full width of A) plus the bands left and right of it (height of B).
+   B need not lie inside A — it is intersected first — and a B that misses A entirely
+   leaves A whole.  Used to redraw exactly what a translation did NOT carry."
+  (let ((i (wm-box-intersect a b)))
+    (if (null i)
+        (list a)
+        (destructuring-bind (ax ay aw ah) a
+          (destructuring-bind (bx by bw bh) i
+            (let ((out '()))
+              (when (> by ay) (push (list ax ay aw (- by ay)) out))
+              (when (< (+ by bh) (+ ay ah))
+                (push (list ax (+ by bh) aw (- (+ ay ah) by bh)) out))
+              (when (> bx ax) (push (list ax by (- bx ax) bh) out))
+              (when (< (+ bx bw) (+ ax aw))
+                (push (list (+ bx bw) by (- (+ ax aw) bx bw) bh) out))
+              out))))))
+
+(defun wm-clip-box (fb)
+  "FB's clip rectangle as an (x y w h) box — the region this composite is responsible
+   for — or NIL when it is unclipped, i.e. the whole screen is being rebuilt."
+  (when-let ((c (glass:fb-clip fb)))
+    (list (first c) (second c) (- (third c) (first c)) (- (fourth c) (second c)))))
+
+(defun wm-box-inside-p (inner outer)
+  "Is box INNER entirely within box OUTER?"
+  (and inner outer (equal inner (wm-box-intersect inner outer))))
 
 (defun wm-boxes-above-surface (port surf)
   "The (x y w h) boxes of everything WM-COMPOSITE draws AFTER SURF — i.e. everything
@@ -271,9 +319,37 @@
               boxes)))
     boxes))
 
+(defun wm-obstructed-p (port surf &rest boxes)
+  "Does anything WM-COMPOSITE draws AFTER SURF — a window stacked over it, the drag
+   wireframe, an open menu — land on any of BOXES?  THE occlusion question, asked once
+   and answered in one place: both the wire CopyRect and the in-RAM screen translation
+   ask it, of different rectangles, so that the two verdicts can differ in strictness
+   without ever differing in what 'above' means."
+  (let ((above (wm-boxes-above-surface port surf)))
+    (and above
+         (some (lambda (b) (some (lambda (a) (wm-boxes-overlap-p a b)) above))
+               (remove nil boxes))
+         t)))
+
 (defun wm-surface-screen-copy (port surf fb)
   "Take SURF's pending content translation and return it as a screen-space CopyRect
    hint (sx sy dx dy w h) for framebuffer FB — or NIL to refuse it.
+
+   Returns (values WIRE SCREEN ALLOWED): the same hint judged twice, plus the rectangle
+   both verdicts are about.  WIRE is the hint to put on the RFB update; SCREEN is the
+   hint the compositor may also apply to the screen framebuffer itself (see
+   *WM-SCROLL-STRIP*), which is refused more often, and ALLOWED is SURF's visible
+   content within this composite — the region the strip path is responsible for.
+
+   The two verdicts differ because the consequences do.  A wrong CopyRect on the WIRE is
+   self-repairing: the sender re-diffs the damage box afterwards, so a dragged-along
+   window is corrected inside the same update, and the z-order refusal there is a bytes
+   policy (*WM-COPYRECT-OCCLUSION-GUARD*, switchable).  A wrong translation of the
+   SCREEN is not: the strip path deliberately does not redraw the rest, so a smear
+   nothing repairs it.  SCREEN therefore refuses whenever ANYTHING above SURF touches
+   ALLOWED — which contains the source, the destination AND the exposed strip — and it
+   refuses whatever that parameter says.  Falling back is free: the whole-window blit
+   the compositor does instead is always correct.
 
    The hint is CONSUMED either way (that is what makes the next one mean \"since this
    composite\"), and SURF's COPY-BASE is refreshed either way.  A hint survives only if:
@@ -327,12 +403,18 @@
                             (list (+ ax ddx) (+ ay ddy) aw ah))))))
           (when (and dst (or (/= ddx 0) (/= ddy 0)))
             (destructuring-bind (dx dy dw dh) dst
-              (let ((src (list (- dx ddx) (- dy ddy) dw dh)))
-                (unless (and *wm-copyrect-occlusion-guard*
-                             (some (lambda (b) (or (wm-boxes-overlap-p b dst)
-                                                   (wm-boxes-overlap-p b src)))
-                                   (wm-boxes-above-surface port surf)))
-                  (list (first src) (second src) dx dy dw dh))))))))))
+              (let* ((src (list (- dx ddx) (- dy ddy) dw dh))
+                     (copy (list (first src) (second src) dx dy dw dh)))
+                (values
+                 ;; wire: refused only while the guard holds and something above sits on
+                 ;; one end of the move — the diff repairs it either way
+                 (unless (and *wm-copyrect-occlusion-guard*
+                              (wm-obstructed-p port surf src dst))
+                   copy)
+                 ;; screen: refused whenever anything above touches the region the strip
+                 ;; path writes, guard or no guard — nothing would repair it
+                 (unless (wm-obstructed-p port surf allowed) copy)
+                 allowed)))))))))
 
 (defun wm-draw-surface (surf fb &optional port)
   "Draw SURF's decorated window into the screen framebuffer FB.  Given a PORT, also
@@ -410,10 +492,104 @@
   (when (glass-port-fb port) (composite-all port))
   (glass-port-bg port))
 
+;;; ---- compositing a scroll: translate the screen, redraw only the strip ----------
+;;;
+;;; The wire stopped re-sending a scrolled window when the CopyRect hint landed; the
+;;; screen framebuffer did not.  A scroll composite still cleared the damage box to the
+;;; wallpaper and blitted all 900x620 of the window over it, to produce a picture that
+;;; differs from the one already there by a ~48 px strip.  So the same copy is paid
+;;; twice in RAM — once when the window paints its own translation, once when the
+;;; compositor reads the result back out — and the wallpaper is drawn where nothing can
+;;; ever see it.
+;;;
+;;; When a surface reports a translation the compositor can believe, this does on the
+;;; screen what the CopyRect does on the client: move the block the screen already
+;;; holds, then blit ONLY what the move did not cover.  The rest of the damage box —
+;;; title bar, border, corner marks, the wallpaper under the window — is not redrawn at
+;;; all, because a full repaint would have produced exactly the pixels already there.
+;;;
+;;; THE OCCLUSION GUARD IS LOAD-BEARING HERE, which it is not on the wire.  A wrong
+;;; CopyRect on the wire is repaired by the sender's own diff of the damage box in the
+;;; same update; a wrong translation of the screen is repaired by nothing, because the
+;;; whole point of the path is that the rest is not redrawn.  So this refuses on the
+;;; strict verdict (WM-SURFACE-SCREEN-COPY's second value) whatever the wire policy
+;;; says, and refusing simply falls back to the whole-window blit below.
+
+(defun wm-covered-p (port box)
+  "Is BOX entirely inside one window that this composite draws opaquely?  Every window,
+   McCLIM or surface, paints its whole decorated rectangle — title bar, content, border
+   — so a region inside one never shows a pixel of whatever was drawn under it.  Used
+   to skip the desktop background, which is otherwise drawn and immediately buried."
+  (and box
+       (or (some (lambda (s) (wm-box-inside-p box (wm-window-box s)))
+                 (glass-port-surfaces port))
+           (some (lambda (m) (and (glass-mirror-managed m)
+                                  (wm-box-inside-p box (wm-window-box m))))
+                 (glass-port-mirrors port)))))
+
+(defun wm-scroll-candidate (port box)
+  "The one surface a composite of region BOX could be painted as a translation of: the
+   topmost one that answers the translation question at all and whose decorated window
+   CONTAINS the whole box.
+
+   Containment is what makes skipping the rest of the paint sound.  A window is opaque
+   over its own box, so everything below it inside BOX is invisible and redrawing it
+   changes nothing; and if two windows had both changed, the tick loop would have
+   unioned their boxes into something no single window contains, and there would be no
+   candidate.  What is left is whatever is stacked ABOVE this surface, which is exactly
+   what the occlusion verdict rules on."
+  (when box
+    (find-if (lambda (s) (and (wm-surface-copy-p s)
+                              (wm-box-inside-p box (wm-window-box s))))
+             (glass-port-surfaces port))))
+
+(defun wm-paint-strip (surf fb copy allowed)
+  "Paint SURF's window as the translation COPY (sx sy dx dy w h) of what FB already
+   holds, plus a blit of everything in ALLOWED the translation did not carry — the
+   newly exposed strip, and (for a scroll, which never moves the chrome) the rows above
+   the moved block.  Both are in screen coordinates; ALLOWED is SURF's visible content."
+  (destructuring-bind (sx sy dx dy w h) copy
+    (glass:fb-move-rect fb sx sy dx dy w h)
+    (let ((sfb (wm-surface-fb surf))
+          (cx (wm-surface-x surf)) (cy (wm-surface-y surf)))
+      (dolist (band (wm-box-difference allowed (list dx dy w h)))
+        (destructuring-bind (bx by bw bh) band
+          (glass:with-fb-clip (fb bx by bw bh) (blit-fb sfb cx cy fb)))))))
+
+(defun wm-composite-scroll (port fb box)
+  "Try to paint this composite as SURF's scroll instead of a redraw: true if it did.
+   The hint is taken under the surface's lock and the translation applied in the same
+   breath, so the copy and the pixels it names cannot drift apart.  Refused or absent,
+   the hint is still handed to the wire (GLASS-PORT-FRAME-COPY) before returning NIL,
+   so falling back here never costs the CopyRect the update would otherwise have had."
+  (when-let ((surf (and *wm-scroll-copyrect* *wm-scroll-strip*
+                        (wm-scroll-candidate port box))))
+    (glass:with-fb-locked ((wm-surface-fb surf))
+      (multiple-value-bind (wire screen allowed)
+          (handler-case (wm-surface-screen-copy port surf fb)
+            (error () (values nil nil nil)))                 ; no hint, not a half-hint
+        (when wire (setf (glass-port-frame-copy port) wire))
+        (when screen
+          ;; A translation that dies half-applied simply reports failure: the caller
+          ;; then paints the region WHOLE, which overwrites whatever it managed to do.
+          (handler-case (progn (wm-paint-strip surf fb screen allowed) t)
+            (error (e) (wm-note-surface-error port surf e) nil)))))))
+
 (defun wm-composite (port fb)
-  (if (glass-port-bg port)
-      (blit-fb (glass-port-bg port) 0 0 fb)                    ; desktop wallpaper
-      (glass:fb-fill fb +wm-teal+))
+  "Draw the desktop into the screen framebuffer FB, within whatever region FB's clip
+   marks as this composite's responsibility."
+  (let ((box (wm-clip-box fb)))
+    (unless (wm-composite-scroll port fb box)
+      (wm-composite-whole port fb box))))
+
+(defun wm-composite-whole (port fb box)
+  "Rebuild region BOX (NIL = the whole screen) from the bottom up: desktop, McCLIM
+   windows, surface windows, drag wireframe, menus.  Always correct, and what every
+   composite that is not a believable scroll does."
+  (unless (and *wm-skip-covered-background* (wm-covered-p port box))
+    (if (glass-port-bg port)
+        (blit-fb (glass-port-bg port) 0 0 fb)                  ; desktop wallpaper
+        (glass:fb-fill fb +wm-teal+)))
   (dolist (mirror (reverse (glass-port-mirrors port)))        ; McCLIM windows (bottom-to-top)
     (ignore-errors                                            ; a bad window draws nothing, not a crash
      (if (glass-mirror-managed mirror) (wm-draw-window mirror fb) (blit-mirror mirror fb))))

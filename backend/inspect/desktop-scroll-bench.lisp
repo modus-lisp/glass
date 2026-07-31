@@ -213,27 +213,43 @@
 (defun snap-counters (c) (list (rc-frames c) (rc-in c) (rc-copyrects c) (rc-rects c)))
 (defun delta (a b) (mapcar #'- b a))
 
+;;; The server-side half of the frame budget, straight off glass's standing counters
+;;; (src/perf.lisp): how long the COMPOSITE that redrew the screen took, and how long
+;;; the diff+encode+write that shipped it took.  The client counters above say what
+;;; arrived; these say what it cost to make.  Reset per case, read after it quiesces.
+(defun perf-costs ()
+  "(values COMPOSITES MS/COMPOSITE SENDS MS/SEND) since the last GLASS:PERF-RESET."
+  (let* ((p glass::*perf*)
+         (c (glass::pf-composites p)) (f (glass::pf-frames p)))
+    (values c (if (plusp c) (glass::%pf-ms (/ (glass::pf-comp p) c)) 0.0)
+            f (if (plusp f) (glass::%pf-ms (/ (glass::pf-enc p) f)) 0.0))))
+
 (defun run-case (c label &key (steps 60) (decode nil) (cadence 1/30) at direct (dir 16))
   (quiesce c)
   (let ((c0 (snap-counters c)) (t0 (get-internal-real-time)))
+    (setf glass:*perf-on* t) (glass:perf-reset)
     (scroll c steps :cadence cadence :at at :direct direct :dir dir)
     (quiesce c)
-    (let* ((d (delta c0 (snap-counters c)))
-           (wall (secs (- (get-internal-real-time) t0)))
-           (frames (first d)) (bytes (second d)) (crs (third d)))
-      (format t "~&~a~%" label)
-      (format t "  frames ~d in ~,1fs = ~,1f fps | ~,1f KB total | ~,1f KB/frame~%"
-              frames wall (/ frames (max 0.001 wall)) (/ bytes 1024.0)
-              (if (plusp frames) (/ bytes frames 1024.0) 0.0))
-      (format t "  rects ~d, CopyRect rects ~d  (CopyRect frames: ~d/~d)~%"
-              (fourth d) crs crs frames)
-      (let ((sd nil) (rd nil))
-        (when decode
-          (setf sd (pixel-diff (rc-px c) (server-pixels))
-                rd (recomposite-diff))
-          (format t "  PIXELS: client-vs-server ~d differing | server-vs-full-recomposite ~d~%" sd rd))
-        (list :label label :frames frames :bytes bytes :copyrects crs
-              :fps (/ frames (max 0.001 wall)) :client-diff sd :recomposite-diff rd)))))
+    (multiple-value-bind (ncomp comp-ms nsend enc-ms) (perf-costs)
+      (let* ((d (delta c0 (snap-counters c)))
+             (wall (secs (- (get-internal-real-time) t0)))
+             (frames (first d)) (bytes (second d)) (crs (third d)))
+        (format t "~&~a~%" label)
+        (format t "  frames ~d in ~,1fs = ~,1f fps | ~,1f KB total | ~,1f KB/frame~%"
+                frames wall (/ frames (max 0.001 wall)) (/ bytes 1024.0)
+                (if (plusp frames) (/ bytes frames 1024.0) 0.0))
+        (format t "  rects ~d, CopyRect rects ~d  (CopyRect frames: ~d/~d)~%"
+                (fourth d) crs crs frames)
+        (format t "  COST: ~d composites at ~,2f ms | ~d sends at ~,2f ms encode~%"
+                ncomp comp-ms nsend enc-ms)
+        (let ((sd nil) (rd nil))
+          (when decode
+            (setf sd (pixel-diff (rc-px c) (server-pixels))
+                  rd (recomposite-diff))
+            (format t "  PIXELS: client-vs-server ~d differing | server-vs-full-recomposite ~d~%" sd rd))
+          (list :label label :frames frames :bytes bytes :copyrects crs
+                :fps (/ frames (max 0.001 wall)) :client-diff sd :recomposite-diff rd
+                :composites ncomp :composite-ms comp-ms :encode-ms enc-ms))))))
 
 (defun main (&key (vncport 5921) (decode nil) (copyrect t) (steps 60))
   (setf cg::*wm-scroll-copyrect* copyrect)
@@ -305,15 +321,19 @@
       ;; ---- F: window DRAG still gets its CopyRect -------------------------
       (quiesce c)
       (let ((c0 (snap-counters c)) (t0 (get-internal-real-time)))
+        (glass:perf-reset)
         (dotimes (i 40) (cg::wm-drag-move-opaque *port* *browser* (+ bx i 1) (+ by (floor i 2)))
                         (sleep 1/30))
         (quiesce c)
-        (let* ((d (delta c0 (snap-counters c))) (wall (secs (- (get-internal-real-time) t0))))
-          (push (list :label "F. window drag (regression)" :frames (first d) :bytes (second d)
-                      :copyrects (third d) :fps (/ (first d) (max 0.001 wall))
-                      :client-diff (when decode (pixel-diff (rc-px c) (server-pixels)))
-                      :recomposite-diff (when decode (recomposite-diff)))
-                results)))
+        (multiple-value-bind (ncomp comp-ms nsend enc-ms) (perf-costs)
+          (declare (ignore nsend))
+          (let* ((d (delta c0 (snap-counters c))) (wall (secs (- (get-internal-real-time) t0))))
+            (push (list :label "F. window drag (regression)" :frames (first d) :bytes (second d)
+                        :copyrects (third d) :fps (/ (first d) (max 0.001 wall))
+                        :client-diff (when decode (pixel-diff (rc-px c) (server-pixels)))
+                        :recomposite-diff (when decode (recomposite-diff))
+                        :composites ncomp :composite-ms comp-ms :encode-ms enc-ms)
+                  results))))
       (cg::wm-move *browser* bx by) (cg::composite-all *port*) (quiesce c)
 
       ;; ---- G: idle composites with a browser window open ------------------
@@ -323,10 +343,13 @@
 
       (format t "~&~%==== summary ====~%")
       (dolist (r (reverse results))
-        (format t "~&~a~%   CopyRect ~d/~d frames, ~,1f KB/frame, ~,1f fps~a~%"
+        (format t "~&~a~%   CopyRect ~d/~d frames, ~,1f KB/frame, ~,1f fps~@[~a~]~a~%"
                 (getf r :label) (getf r :copyrects) (getf r :frames)
                 (if (plusp (getf r :frames)) (/ (getf r :bytes) (getf r :frames) 1024.0) 0.0)
                 (getf r :fps)
+                (when (getf r :composites)
+                  (format nil "~%   COST: composite ~,2f ms x~d | encode ~,2f ms"
+                          (getf r :composite-ms) (getf r :composites) (getf r :encode-ms)))
                 (if (getf r :client-diff)
                     (format nil "~%   PIXELS: client-vs-server ~d, fb-vs-full-recomposite ~d"
                             (getf r :client-diff) (getf r :recomposite-diff))
