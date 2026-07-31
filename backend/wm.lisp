@@ -107,27 +107,58 @@
 ;;; A surface window is a non-McCLIM window: a glass framebuffer somebody else
 ;;; renders into (e.g. a terminal) plus input callbacks.  The WM decorates,
 ;;; composites, drags, raises and focuses it just like a McCLIM window.
-(defstruct wm-surface
-  fb (x 60) (y 60) (title "window")
-  (deco nil) (deco-w -1) on-key on-pointer
-  (dirty-p nil)                         ; ()->bool: did the content fb change? (nil = always redraw)
-  ;; ()->(sx sy dx dy w h) | nil : how the content TRANSLATED, in surface-local pixels,
-  ;; since this was last called — a scrolling window moves a block of its own pixels by
-  ;; a fixed offset, and the compositor can turn that into a CopyRect instead of
-  ;; re-encoding the window.  CONSUMING, exactly like DIRTY-P: each call reports the
-  ;; change since the previous one, so a hint is never replayed against pixels it no
-  ;; longer describes.  NIL (the default, and every non-scrolling window) means "I never
-  ;; translate anything" — the compositor just diffs, which is always correct.
-  (copy-p nil)
-  ;; The content rect (x y w h) as of the last composite that redrew this window WHOLE.
-  ;; A translation may only be believed when the screen still holds that same rect: if
-  ;; the window moved, resized, or was last drawn under a clip that cut it, the pixels a
-  ;; copy would read are not the ones the hint is about.  Compositor-owned.
-  (copy-base nil)
-  (resize-fn nil)                       ; (px-w px-h)->() : resize the content, or nil = not resizable
-  (close-fn nil)                        ; ()->() : tear down the content on window close
-  (saved-geom nil)                      ; (x y w h) saved by Full Size, for Restore Size
-  (err-count 0))                        ; consecutive per-frame poll/draw errors (see wm-note-surface-error)
+;;;
+;;; A CLASS rather than a structure, and deliberately: a desktop runs for weeks and
+;;; grows new slots while it runs.  Redefining a structure strands every instance
+;;; already made — the live windows on a running desktop become obsolete objects and
+;;; the compositor dies on the next tick — whereas redefining a class migrates them
+;;; through UPDATE-INSTANCE-FOR-REDEFINED-CLASS, so a running desktop simply keeps
+;;; going with the new slot unbound-or-defaulted.  The accessor and constructor names
+;;; are the ones a DEFSTRUCT would have made, so nothing else changes.
+(defclass wm-surface ()
+  ((fb        :initarg :fb        :initform nil        :accessor wm-surface-fb)
+   (x         :initarg :x         :initform 60         :accessor wm-surface-x)
+   (y         :initarg :y         :initform 60         :accessor wm-surface-y)
+   (title     :initarg :title     :initform "window"   :accessor wm-surface-title)
+   (deco      :initarg :deco      :initform nil        :accessor wm-surface-deco)
+   (deco-w    :initarg :deco-w    :initform -1         :accessor wm-surface-deco-w)
+   (on-key    :initarg :on-key    :initform nil        :accessor wm-surface-on-key)
+   (on-pointer :initarg :on-pointer :initform nil      :accessor wm-surface-on-pointer)
+   ;; ()->bool: did the content fb change?  (nil = no answer, so always redraw)
+   (dirty-p   :initarg :dirty-p   :initform nil        :accessor wm-surface-dirty-p)
+   ;; ()->(sx sy dx dy w h) | nil : how the content TRANSLATED, in surface-local pixels,
+   ;; since this was last called — a scrolling window moves a block of its own pixels by
+   ;; a fixed offset, and the compositor can turn that into a CopyRect instead of
+   ;; re-encoding the window.  CONSUMING, exactly like DIRTY-P: each call reports the
+   ;; change since the previous one, so a hint is never replayed against pixels it no
+   ;; longer describes.  NIL (the default, and every non-scrolling window) means "I never
+   ;; translate anything" — the compositor just diffs, which is always correct.
+   (copy-p    :initarg :copy-p    :initform nil        :accessor wm-surface-copy-p)
+   ;; The content rect (x y w h) as of the last composite that redrew this window WHOLE.
+   ;; A translation may only be believed when the screen still holds that same rect: if
+   ;; the window moved, resized, or was last drawn under a clip that cut it, the pixels a
+   ;; copy would read are not the ones the hint is about.  Compositor-owned.
+   (copy-base :initarg :copy-base :initform nil        :accessor wm-surface-copy-base)
+   ;; (px-w px-h)->() : resize the content, or nil = not resizable
+   (resize-fn :initarg :resize-fn :initform nil        :accessor wm-surface-resize-fn)
+   ;; ()->() : tear down the content on window close
+   (close-fn  :initarg :close-fn  :initform nil        :accessor wm-surface-close-fn)
+   ;; (x y w h) saved by Full Size, for Restore Size
+   (saved-geom :initarg :saved-geom :initform nil      :accessor wm-surface-saved-geom)
+   ;; consecutive per-frame poll/draw errors (see WM-NOTE-SURFACE-ERROR)
+   (err-count :initarg :err-count :initform 0          :accessor wm-surface-err-count)))
+
+(defun make-wm-surface (&rest initargs)
+  "Make a surface window.  Keyword-for-keyword what the DEFSTRUCT constructor took,
+   so every call site reads the same as before the class conversion."
+  (apply #'make-instance 'wm-surface initargs))
+
+(defun wm-surface-p (object) (typep object 'wm-surface))
+
+(defmethod print-object ((surf wm-surface) stream)
+  (print-unreadable-object (surf stream :type t :identity t)
+    (format stream "~s ~d,~d" (slot-value surf 'title)
+            (slot-value surf 'x) (slot-value surf 'y))))
 
 (defparameter *wm-surface-error-limit* 60
   "Consecutive per-frame errors from a surface's dirty-p poll or draw that the
