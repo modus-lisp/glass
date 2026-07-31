@@ -125,6 +125,17 @@
     (multiple-value-prog1 (values (fb-frameno fb) (fb-damage fb) (fb-copy fb) (fb-mark-time fb))
       (setf (fb-damage fb) nil (fb-copy fb) nil))))
 
+(defun fb-take-copy (fb)
+  "Atomically read and clear FB's accumulated COPY hint, leaving DAMAGE alone.
+
+   For a framebuffer that no RFB sender serves directly — a window-manager SURFACE,
+   which somebody paints into and a compositor then blits onto the screen — this is
+   how the compositor asks the one question it needs: \"how did your content
+   translate since I last looked?\".  The answer is in the surface's own coordinates
+   and, like FB-TAKE-FRAME, is CONSUMED, so a hint is never replayed against pixels
+   it no longer describes.  The damage mark is left for whoever owns it."
+  (%with-frame-lock (fb) (prog1 (fb-copy fb) (setf (fb-copy fb) nil))))
+
 (defun %clip-intersect (clip x0 y0 x1 y1)
   "Intersect the (possibly NIL) CLIP box with (x0 y0 x1 y1)."
   (if clip

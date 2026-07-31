@@ -43,6 +43,12 @@
    ;; McCLIM repaints accumulate their damage here instead of compositing eagerly;
    ;; the WM tick loop composites the batch once — a McCLIM app repaints ~20x per
    ;; interaction, so coalescing turns that burst into one composite (like surfaces).
+   ;; A CopyRect hint contributed BY THE PAINT ITSELF: WM-COMPOSITE, while drawing a
+   ;; surface whose content merely scrolled, leaves the screen-space (sx sy dx dy w h)
+   ;; here for COMPOSITE-ALL to mark.  It has to be collected during the paint (that is
+   ;; where the surface's pixels and its hint are read together, under the surface's
+   ;; lock) yet marked after it, so the paint hands it forward through the port.
+   (frame-copy :initform nil :accessor glass-port-frame-copy)
    (pending  :initform nil :accessor glass-port-pending)      ; :full / (x y w h) / nil
    (pending-lock :initform (sb-thread:make-mutex :name "glass-pending") :accessor glass-port-pending-lock))
   (:default-initargs :pointer (make-instance 'climi::standard-pointer)))
@@ -201,11 +207,17 @@
    sender's diff) to that rectangle — the compositor already knows what changed,
    so an idle move/blink doesn't rebuild + re-diff the whole 1280x800.  NIL means
    the whole screen (menus, resize, McCLIM updates, first paint).  COPY = (sx sy
-   dx dy w h) marks a window MOVE so the sender can CopyRect it (near-free drag)."
+   dx dy w h) marks a window MOVE so the sender can CopyRect it (near-free drag).
+
+   A COPY may also come from the paint itself: a surface window whose content merely
+   SCROLLED leaves a screen-space hint in GLASS-PORT-FRAME-COPY as WM-COMPOSITE draws
+   it (see WM-SURFACE-SCREEN-COPY).  An explicit COPY — a window move, which is about
+   this very composite — wins; only one CopyRect can ride an update."
   (when-let ((fb (glass-port-fb port)))
     (let ((%t0 (get-internal-real-time)))
       (glass:with-fb-locked (fb)
         (flet ((paint ()
+                 (setf (glass-port-frame-copy port) nil)   ; fresh: only THIS paint's hints count
                  (if (glass-port-wm-p port)
                      (wm-composite port fb)
                      ;; mirrors is newest-first; composite oldest (main) first so newer are on top
@@ -213,8 +225,10 @@
           (if damage                          ; blit-mirror + blit-fb both honor the clip now
               (destructuring-bind (dx dy dw dh) damage
                 (glass:with-fb-clip (fb dx dy dw dh) (paint))
-                (glass:fb-mark-frame fb (list dx dy (+ dx dw) (+ dy dh)) copy))
-              (progn (paint) (glass:fb-mark-frame fb :full))))
+                (glass:fb-mark-frame fb (list dx dy (+ dx dw) (+ dy dh))
+                                     (or copy (glass-port-frame-copy port))))
+              (progn (paint) (glass:fb-mark-frame fb :full)))
+          (setf (glass-port-frame-copy port) nil))
         (glass:fb-touch fb))              ; content changed -> the sender should re-scan
       (glass:perf-record-composite (- (get-internal-real-time) %t0) damage))
     (glass:wake-signal (glass-port-wake port))))   ; …and wake it now, don't wait for its poll

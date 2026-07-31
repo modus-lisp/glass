@@ -111,6 +111,19 @@
   fb (x 60) (y 60) (title "window")
   (deco nil) (deco-w -1) on-key on-pointer
   (dirty-p nil)                         ; ()->bool: did the content fb change? (nil = always redraw)
+  ;; ()->(sx sy dx dy w h) | nil : how the content TRANSLATED, in surface-local pixels,
+  ;; since this was last called — a scrolling window moves a block of its own pixels by
+  ;; a fixed offset, and the compositor can turn that into a CopyRect instead of
+  ;; re-encoding the window.  CONSUMING, exactly like DIRTY-P: each call reports the
+  ;; change since the previous one, so a hint is never replayed against pixels it no
+  ;; longer describes.  NIL (the default, and every non-scrolling window) means "I never
+  ;; translate anything" — the compositor just diffs, which is always correct.
+  (copy-p nil)
+  ;; The content rect (x y w h) as of the last composite that redrew this window WHOLE.
+  ;; A translation may only be believed when the screen still holds that same rect: if
+  ;; the window moved, resized, or was last drawn under a clip that cut it, the pixels a
+  ;; copy would read are not the ones the hint is about.  Compositor-owned.
+  (copy-base nil)
   (resize-fn nil)                       ; (px-w px-h)->() : resize the content, or nil = not resizable
   (close-fn nil)                        ; ()->() : tear down the content on window close
   (saved-geom nil)                      ; (x y w h) saved by Full Size, for Restore Size
@@ -158,10 +171,158 @@
       (wm-frame fb (glass-mirror-x mirror) (glass-mirror-y mirror) cw ch
                 (wm-deco mirror cw) (lambda () (blit-mirror mirror fb))))))
 
-(defun wm-draw-surface (surf fb)
+;;; ---- scroll CopyRect: a surface's content translation, mapped onto the screen ----
+;;;
+;;; A window whose content merely SCROLLED has moved a block of its own pixels by a
+;;; fixed offset, and the screen framebuffer already holds that block — so the update
+;;; can go out as one CopyRect plus the newly exposed strip instead of re-encoding the
+;;; whole window.  The window reports the translation in ITS OWN coordinates (see the
+;;; COPY-P slot); the compositor's job is the part only it can know: where that block
+;;; lands on the screen, and whether the screen pixels there are still exclusively this
+;;; window's.  Because a CopyRect moves whatever is ON THE SCREEN in the rectangle —
+;;; including a terminal stacked on top, an open menu, or the desktop showing through
+;;; past the screen edge — every doubtful case is REFUSED.  Refusing is free of
+;;; consequence: the ordinary diff then re-encodes the region, which is always correct.
+;;;
+;;; Two of those checks do different jobs, and it is worth keeping them apart.  Clipping
+;;; the copy into the window's own visible content, the screen, AND THIS COMPOSITE'S
+;;; DAMAGE BOX is load-bearing: the RFB sender applies the copy to its picture of the
+;;; client and then re-diffs only the damage box, so a copy that reached outside it
+;;; would leave pixels nobody ever corrects.  The z-order check on top of that is a
+;;; policy: a copy that drags an overlapping window along lands inside the damage box,
+;;; so the diff does repair it in the very same update — measurably, at about twice the
+;;; bytes of letting the copy through (see *WM-COPYRECT-OCCLUSION-GUARD*).  It is on by
+;;; default because it is right without depending on that argument, or on a client
+;;; implementing an overlapping CopyRect the way we model it.
+
+(defparameter *wm-scroll-copyrect* t
+  "Honour a surface window's scroll CopyRect hint?  NIL falls every window back to the
+   plain damage diff — always correct, just more bytes — which is both the emergency
+   switch and the control arm when measuring what the hint is worth.  Live-tunable.")
+
+(defparameter *wm-copyrect-occlusion-guard* t
+  "Refuse a scroll CopyRect whose moved rectangle has another window or an open menu
+   stacked over it?  The copy would drag those pixels along; the sender's diff then
+   repairs them in the same update, so what this buys is not correctness but not having
+   to rely on that repair.  It is not free: on a 1280x800 desktop with a terminal over a
+   scrolling browser, refusing measured ~417 KB/frame against ~213 KB/frame for letting
+   the copy through (both pixel-identical on the client).  Refusing is never worse than
+   the no-CopyRect behaviour it falls back to.  Live-tunable.")
+
+(defun wm-box-intersect (a b)
+  "Intersection of two (x y w h) boxes, or NIL when they don't overlap."
+  (when (and a b)
+    (destructuring-bind (ax ay aw ah) a
+      (destructuring-bind (bx by bw bh) b
+        (let ((x0 (max ax bx)) (y0 (max ay by))
+              (x1 (min (+ ax aw) (+ bx bw))) (y1 (min (+ ay ah) (+ by bh))))
+          (when (and (< x0 x1) (< y0 y1)) (list x0 y0 (- x1 x0) (- y1 y0))))))))
+
+(defun wm-boxes-overlap-p (a b) (and (wm-box-intersect a b) t))
+
+(defun wm-boxes-above-surface (port surf)
+  "The (x y w h) boxes of everything WM-COMPOSITE draws AFTER SURF — i.e. everything
+   whose pixels can sit on top of SURF's on the screen.  The surface list is composited
+   in REVERSE, so the surfaces listed BEFORE SURF are the ones above it; every McCLIM
+   window is drawn before any surface, so none is ever above one; and the drag
+   wireframe and the open menu chain go on last of all.  A surface that somehow isn't
+   in the list yields the whole list, which errs towards refusing."
+  (let ((boxes '()))
+    (loop for s in (glass-port-surfaces port)
+          until (eq s surf)
+          do (when-let ((b (wm-window-box s))) (push b boxes)))
+    (when (glass-port-drag-wire port)
+      (when-let ((b (glass-port-drag-wire-box port))) (push b boxes)))
+    (when-let ((menu (glass-port-menu port)))
+      (dolist (m (wm-menu-chain menu))
+        (push (list (wm-menu-x m) (wm-menu-y m)
+                    (glass:fb-width (wm-menu-fb m)) (glass:fb-height (wm-menu-fb m)))
+              boxes)))
+    boxes))
+
+(defun wm-surface-screen-copy (port surf fb)
+  "Take SURF's pending content translation and return it as a screen-space CopyRect
+   hint (sx sy dx dy w h) for framebuffer FB — or NIL to refuse it.
+
+   The hint is CONSUMED either way (that is what makes the next one mean \"since this
+   composite\"), and SURF's COPY-BASE is refreshed either way.  A hint survives only if:
+
+     * the screen still holds the pixels it talks about — SURF's content rect is
+       unchanged since the last composite that drew it whole (COPY-BASE), so it has not
+       moved or resized underneath the translation;
+     * the moved rectangle lies inside SURF's own visible CONTENT area — not the title
+       bar, border or corner marks, which the frame redraws over;
+     * it lies inside the screen, so a window hanging off an edge copies only the part
+       that is really there;
+     * it lies inside THIS composite's damage box (the fb clip), which is the region the
+       RFB sender will diff afterwards — a copy reaching outside it could not be
+       corrected;
+     * and, while *WM-COPYRECT-OCCLUSION-GUARD* holds, nothing is stacked above SURF
+       over either end of it (WM-BOXES-ABOVE-SURFACE): another window, or an open menu,
+       would otherwise be dragged along by the copy.
+
+   Both ends matter: the source must be this window's own content (or the copy reads
+   somebody else's pixels) and so must the destination (or it overwrites them)."
+  (let* ((take (wm-surface-copy-p surf))
+         (hint (and take (funcall take)))              ; consumed even if refused below
+         (sfb (wm-surface-fb surf))
+         (content (list (wm-surface-x surf) (wm-surface-y surf)
+                        (glass:fb-width sfb) (glass:fb-height sfb)))
+         (clip (glass:fb-clip fb))
+         (clip-box (if clip
+                       (list (first clip) (second clip)
+                             (- (third clip) (first clip)) (- (fourth clip) (second clip)))
+                       (list 0 0 (glass:fb-width fb) (glass:fb-height fb))))
+         (base (wm-surface-copy-base surf)))
+    ;; This composite redraws the window WHOLE only if the clip contains all of it;
+    ;; that — and only that — makes the screen a base the next translation can read.
+    (setf (wm-surface-copy-base surf)
+          (and (equal content (wm-box-intersect content clip-box)) content))
+    (when (and hint *wm-scroll-copyrect* (equal base content))
+      (destructuring-bind (hsx hsy hdx hdy hw hh) hint
+        (let* ((ddx (- hdx hsx)) (ddy (- hdy hsy))
+               (allowed (wm-box-intersect
+                         (wm-box-intersect content clip-box)
+                         (list 0 0 (glass:fb-width fb) (glass:fb-height fb))))
+               ;; Clip the destination so BOTH it and the source it reads from land
+               ;; inside ALLOWED: intersect with ALLOWED and with ALLOWED shifted by the
+               ;; translation.  Rectangles stay rectangles, so one intersection does it.
+               (dst (and allowed
+                         (wm-box-intersect
+                          (wm-box-intersect
+                           (list (+ (first content) hdx) (+ (second content) hdy) hw hh)
+                           allowed)
+                          (destructuring-bind (ax ay aw ah) allowed
+                            (list (+ ax ddx) (+ ay ddy) aw ah))))))
+          (when (and dst (or (/= ddx 0) (/= ddy 0)))
+            (destructuring-bind (dx dy dw dh) dst
+              (let ((src (list (- dx ddx) (- dy ddy) dw dh)))
+                (unless (and *wm-copyrect-occlusion-guard*
+                             (some (lambda (b) (or (wm-boxes-overlap-p b dst)
+                                                   (wm-boxes-overlap-p b src)))
+                                   (wm-boxes-above-surface port surf)))
+                  (list (first src) (second src) dx dy dw dh))))))))))
+
+(defun wm-draw-surface (surf fb &optional port)
+  "Draw SURF's decorated window into the screen framebuffer FB.  Given a PORT, also
+   collect SURF's scroll CopyRect hint for this composite (GLASS-PORT-FRAME-COPY).
+
+   The hint is taken under the SURFACE's lock, in the same breath as the blit that
+   copies its pixels onto the screen: the two describe each other, and a paint landing
+   between them would leave the hint one translation behind the pixels it names.  Only
+   one CopyRect can ride an RFB update, so if two windows scroll at once the larger
+   block wins and the other simply rides the diff."
   (let* ((sfb (wm-surface-fb surf)) (cw (glass:fb-width sfb)) (ch (glass:fb-height sfb)))
     (wm-frame fb (wm-surface-x surf) (wm-surface-y surf) cw ch (wm-surface-deco* surf cw)
-              (lambda () (blit-fb sfb (wm-surface-x surf) (wm-surface-y surf) fb)))))
+              (lambda ()
+                (glass:with-fb-locked (sfb)
+                  (when port
+                    (when-let ((c (ignore-errors (wm-surface-screen-copy port surf fb))))
+                      (let ((cur (glass-port-frame-copy port)))
+                        (when (or (null cur)
+                                  (> (* (fifth c) (sixth c)) (* (fifth cur) (sixth cur))))
+                          (setf (glass-port-frame-copy port) c)))))
+                  (blit-fb sfb (wm-surface-x surf) (wm-surface-y surf) fb))))))
 
 (defun %svg-path-p (path)
   (let ((s (string-downcase (princ-to-string path))))
@@ -226,7 +387,7 @@
     (ignore-errors                                            ; a bad window draws nothing, not a crash
      (if (glass-mirror-managed mirror) (wm-draw-window mirror fb) (blit-mirror mirror fb))))
   (dolist (surf (reverse (glass-port-surfaces port)))         ; surface windows, on top
-    (handler-case (wm-draw-surface surf fb)                   ; isolate each surface's draw
+    (handler-case (wm-draw-surface surf fb port)              ; isolate each surface's draw
       (error (e) (wm-note-surface-error port surf e))))       ; skip it this frame; cull if persistent
   (when-let ((b (and (glass-port-drag-wire port) (glass-port-drag-wire-box port))))  ; wireframe outline
     (destructuring-bind (x y w h) b
@@ -705,6 +866,13 @@
                              ;; recomposite the whole screen every tick for as long as the
                              ;; window is open, browsing or not.
                              :dirty-p (fb-generation-poll fb)
+                             ;; loom's PAINT already works out, per frame, whether it was
+                             ;; a pure scroll of the previous one, and leaves that
+                             ;; translation on the fb for whoever serves it.  Under the WM
+                             ;; nobody serves this fb directly, so the compositor takes the
+                             ;; hint here and maps it onto the screen — a scroll then goes
+                             ;; out as a CopyRect instead of a whole-window re-encode.
+                             :copy-p (lambda () (glass:fb-take-copy fb))
                              ;; on close, stop weft's render pump (else it re-renders forever)
                              :close-fn (and stop (lambda () (funcall stop app)))))
         (sb-thread:make-thread (lambda () (funcall pump app)) :name "wm-browse-pump")))))
