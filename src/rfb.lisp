@@ -654,28 +654,45 @@
         ((and (plusp (first req)) (= (fb-generation fb) (rc-last-gen client)))
          (wake-wait wake 1/60))
         (t
-         (let ((gen (fb-generation fb)) (incremental (plusp (first req))))
-           ;; Take everything the compositor accumulated since our last update: a unioned
-           ;; DAMAGE box and a COMPOSED COPY (one window move spanning however many frames we
-           ;; fell behind — "CopyRect farther").  An incremental request with a real damage
-           ;; box diffs only that and trusts the copy; a :FULL mark (or full request) is a
-           ;; whole-screen diff with no copy.
-           (multiple-value-bind (frame damage copy mark-time) (fb-take-frame fb)
-             (when (and damage (plusp mark-time)) (note-send-lag mark-time))  ; backlog clock
-             (let* ((region (if (and incremental (consp damage)) damage :full))
-                    (copy   (and incremental (consp damage) copy))
-                    (tx (list 0)) (t0 (get-internal-real-time))
-                    (sent (let ((*tx* tx))
-                            (handler-case (send-update client fb s req region copy)
-                              (error () (setf (rc-running client) nil) nil)))))
-               (when (and sent *perf-on*)
-                 (perf-record-send (- (get-internal-real-time) t0) region copy (car tx))
-                 (when fd (note-send-queue (socket-unsent-bytes fd))))  ; real downstream backlog
-               (setf (rc-last-gen client) gen (rc-last-frame client) frame)
-               (if sent
-                   (sb-thread:with-mutex ((rc-lock client))
-                     (when (eq (rc-want client) req) (setf (rc-want client) nil)))
-                   (wake-wait wake 1/60)))))))))))     ; nothing dirty (gen bumped, pixels same) — park
+         ;; TAKE AND DIFF ARE ONE STEP.  The frame triple and the pixels are two
+         ;; different locks, and the COPY only describes the pixels as they stood at
+         ;; the composite that marked it — so taking the copy and then reading the
+         ;; pixels under a separate lock leaves a window in which another composite
+         ;; can land.  When it does, the copy is one translation behind the pixels,
+         ;; APPLY-SNAPSHOT-COPY moves the client's snapshot to the wrong place, and
+         ;; the diff that follows finds the whole screen changed — the CopyRect saving
+         ;; inverted into a full re-encode.  Holding the pixel lock across both closes
+         ;; it: a composite either lands entirely before the take (and is in the copy)
+         ;; or entirely after (and is in the NEXT take).  The lock is recursive, so
+         ;; SEND-UPDATE's own WITH-FB-LOCKED is a no-op inside this one, and it already
+         ;; held the lock for the whole diff/encode — this only adds the take.
+         (let ((sent
+                 (with-fb-locked (fb)
+                   (let ((gen (fb-generation fb)) (incremental (plusp (first req))))
+                     ;; Take everything the compositor accumulated since our last update: a unioned
+                     ;; DAMAGE box and a COMPOSED COPY (one window move spanning however many frames we
+                     ;; fell behind — "CopyRect farther").  An incremental request with a real damage
+                     ;; box diffs only that and trusts the copy; a :FULL mark (or full request) is a
+                     ;; whole-screen diff with no copy.
+                     (multiple-value-bind (frame damage copy mark-time) (fb-take-frame fb)
+                       (when (and damage (plusp mark-time)) (note-send-lag mark-time))  ; backlog clock
+                       (let* ((region (if (and incremental (consp damage)) damage :full))
+                              (copy   (and incremental (consp damage) copy))
+                              (tx (list 0)) (t0 (get-internal-real-time))
+                              (sent (let ((*tx* tx))
+                                      (handler-case (send-update client fb s req region copy)
+                                        (error () (setf (rc-running client) nil) nil)))))
+                         (when (and sent *perf-on*)
+                           (perf-record-send (- (get-internal-real-time) t0) region copy (car tx))
+                           (when fd (note-send-queue (socket-unsent-bytes fd))))  ; real downstream backlog
+                         (setf (rc-last-gen client) gen (rc-last-frame client) frame)
+                         (when sent
+                           (sb-thread:with-mutex ((rc-lock client))
+                             (when (eq (rc-want client) req) (setf (rc-want client) nil))))
+                         sent))))))
+           ;; parking happens OFF the pixel lock — holding it here would stall every
+           ;; compositor for the whole timeout
+           (unless sent (wake-wait wake 1/60))))))))) ; nothing dirty (gen bumped, pixels same) — park
 
 (defconstant +enc-zrle2+ 24
   "RealVNC's proprietary ZRLE2.  We don't implement it, but a client that lists it
