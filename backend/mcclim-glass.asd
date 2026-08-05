@@ -10,6 +10,7 @@
   :depends-on ("mcclim" "mcclim-render" "glass" "glass/text" "glass/term" "sb-concurrency")
   :serial t
   :components ((:file "package")
+               (:file "render-fix")
                (:file "backend")
                (:file "message-port")
                (:file "wm")
