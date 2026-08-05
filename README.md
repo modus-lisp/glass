@@ -102,6 +102,40 @@ does the interesting work:
 
 See [backend/README](backend/README.md).
 
+## Sound (`:glass/audio`)
+
+A session has a screen and it has a sound, and it can have more than one listener
+for either. The optional `:glass/audio` system is the session **mixer**: sources
+sum into one mix at native 48 kHz on the mixer's **own 20 ms clock**, and every
+listener subscribes for a private cursor and resampler.
+
+```lisp
+(asdf:load-system "glass/audio")
+(defparameter *m* (glass:mixer-start (glass:make-mixer)))
+(glass:mixer-add-source *m* (reed:make-mp3-source "track.mp3" :rate 48000 :frame-samples 960)
+                        :name "music" :finite t)
+(glass:mixer-play *m* (glass:audio-tone 880 0.15))            ; a bell, once
+(defparameter *peer* (glass:mixer-subscribe *m* :rate 8000 :frame-samples 160))
+(glass:sink-source *peer*)   ; -> a thunk giving the next 20 ms frame, or NIL
+```
+
+Why it is here and not in a transport: a mixer inside one transport is a mixer
+only that transport's clients can hear, and the next transport builds a second
+one with its own idea of what the session sounds like. So the clock belongs to
+the mix — if a consumer's pull advanced it, then with two consumers whoever asked
+first would take the audio and the other would get a hole. Consumers pull from a
+ring of recent frames, so a stalled listener drops frames instead of stalling the
+mix or the other listeners, and each converts to its own rate (a WebRTC peer on
+G.711 wants 8 kHz; a local listener should not have to sound like a phone call
+because of it).
+
+Sources are [reed](https://github.com/modus-lisp/reed) source thunks — the next
+frame of mono samples, or `NIL` — so an MP3 player plugs in with no adapter, and
+so does a sink (`sink-source`), which is what a transport is handed. The
+arithmetic (resample / gain / sum) is reed's; this is the session policy on top.
+Gate: `sbcl --non-interactive --load inspect/audio-gate.lisp` (29 checks; the
+load-bearing ones are the ones a single-listener test cannot make).
+
 ## Not yet
 
 ZRLE's run-length subencodings (plain/palette RLE) and the Tight encoding; a

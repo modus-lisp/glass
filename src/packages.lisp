@@ -22,6 +22,14 @@
    #:serve #:serve-one #:*desktop-name* #:tcp-listen #:make-wake #:wake-signal
    ;; VNC authentication (from-scratch DES); *vnc-password* nil = open, string = required
    #:*vnc-password* #:*legacy-vnc-auth* #:vnc-auth-response #:vnc-auth-verify
+   ;; audio (the :glass/audio system; reed-backed) — one session mix, many listeners
+   #:make-mixer #:mixer #:mixer-p #:mixer-start #:mixer-stop #:mixer-tick #:mixer-report
+   #:mixer-rate #:mixer-frame-samples #:mixer-seq #:mixer-level #:mixer-late #:mixer-running
+   #:mixer-add-source #:mixer-remove-source #:mixer-sources #:mixer-play #:audio-tone
+   #:mixer-source #:mixer-source-p #:src-id #:src-name #:src-gain #:src-frames
+   #:mixer-subscribe #:mixer-unsubscribe #:sink #:sink-p #:sink-next-frame #:sink-source
+   #:sink-rate #:sink-frames #:sink-drops #:sink-underruns #:sink-gain
+   #:*mixer-rate* #:*mixer-frame-ms*
    ;; standing perf counters (read a snapshot over the control socket)
    #:*perf-on* #:perf-reset #:perf-report #:perf-record-send #:perf-record-composite
    #:*send-lag* #:*send-queue*))

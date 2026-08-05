@@ -54,6 +54,21 @@ Kept separate so the core framebuffer + RFB server stay dependency-light."
   :serial t
   :components ((:module "src" :serial t :components ((:file "text")))))
 
+(asdf:defsystem :glass/audio
+  :description "The session's sound: one mix, read by however many listeners a
+session has.  Sources are reed source-thunks; the mix runs on its OWN 20 ms clock
+(so no consumer's pull advances it under another consumer's feet) at native
+48 kHz, and each subscriber gets a private cursor + resampler, so a WebRTC peer
+at 8 kHz and a VNC client at 48 kHz hear the same mix.  Deliberately outside the
+transports: a mixer inside one transport is a mixer only that transport's clients
+can hear, and the next transport builds a second one."
+  :version "0.0.1"
+  :author "ynniv"
+  :license "MIT"
+  :depends-on ("glass/fb" "reed")
+  :serial t
+  :components ((:module "src" :serial t :components ((:file "audio")))))
+
 (asdf:defsystem :glass/term
   :description "A terminal emulator on glass: a real PTY + shell, an ANSI/VT
 parser, and a character grid rendered with scribe, served over VNC.  No xterm,
