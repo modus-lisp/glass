@@ -292,7 +292,10 @@ gap.  Trimming resyncs it to the present."
   ;; KEEP is the cushion SINK-NEXT-FRAME primes on, not one less: trimming to a backlog smaller
   ;; than the priming threshold leaves a sink that has plenty of audio reporting an underrun and
   ;; handing back NIL, forever.
-  (let ((maxfill (* (+ (sink-lead s) 4) (sink-frame-samples s))))
+  ;; One frame over the cushion is the trigger, and the correction is exactly one frame: two
+  ;; clocks that are both "20 ms" drift, so this fires occasionally forever, and a listener would
+  ;; rather lose 20 ms now and then than 80 ms in a lump every so often.
+  (let ((maxfill (* (+ (sink-lead s) 2) (sink-frame-samples s))))
     (when (> (sink-fill s) maxfill)
       (let* ((keep (* (1+ (sink-lead s)) (sink-frame-samples s)))
              (drop (- (sink-fill s) keep)))
