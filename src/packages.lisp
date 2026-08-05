@@ -22,6 +22,19 @@
    #:serve #:serve-one #:*desktop-name* #:tcp-listen #:make-wake #:wake-signal
    ;; VNC authentication (from-scratch DES); *vnc-password* nil = open, string = required
    #:*vnc-password* #:*legacy-vnc-auth* #:vnc-auth-response #:vnc-auth-verify
+   ;; clipboard (the :glass/clipboard system) — one session selection, many transports
+   #:make-clipboard #:clipboard #:clipboard-p #:clipboard-own #:clipboard-set #:clipboard-text
+   #:clipboard-disown #:clipboard-clear #:clipboard-owner #:clipboard-owner-name
+   #:clipboard-serial #:clipboard-stamp #:clipboard-report
+   #:clipboard-listen #:clipboard-unlisten
+   #:session-clipboard #:*session-clipboard*
+   #:latin1-bytes #:latin1-string #:clipboard-normalize-newlines
+   #:*latin1-substitute* #:*max-cut-text*
+   ;; paste's fallback consumer: type the selection into whatever has focus
+   #:clipboard-paste #:paste-text #:paste-text-as-keys #:paste-keysyms
+   #:*key-injector* #:*paste-key-delay* #:*paste-max-chars* #:*paste-chord*
+   ;; RFB cut text (the transport half, in :glass)
+   #:send-cut-text #:read-client-cut-text
    ;; audio (the :glass/audio system; reed-backed) — one session mix, many listeners
    #:make-mixer #:mixer #:mixer-p #:mixer-start #:mixer-stop #:mixer-tick #:mixer-report
    #:mixer-rate #:mixer-frame-samples #:mixer-seq #:mixer-level #:mixer-late #:mixer-running

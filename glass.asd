@@ -15,6 +15,25 @@ sb-thread is absent.  This is the piece that drops onto modus on bare metal;
                 :components ((:file "packages")
                              (:file "framebuffer")))))
 
+(asdf:defsystem :glass/clipboard
+  :description "The session's selection: one clipboard, written and read by
+however many transports a session has.  Discrete where the mixer is streamed —
+no clock, no ring of frames, one owned value and a change hook — and modelled on
+X11's ownership rather than a bare string, so a late reader can be answered by
+the owner (a provider thunk), a closing app can retract only ITS OWN selection,
+and a transport can recognise its own writes and not echo them.  Deliberately
+outside the transports, on the mixer's argument: a clipboard inside one transport
+is one only that transport's clients can paste from, and the next transport grows
+a second one that disagrees.  Pure CL, no dependencies; carries the Latin-1
+conversion RFB's cut text needs, and the paste-as-keystrokes fallback that makes
+paste work into apps that do not read a clipboard yet."
+  :version "0.0.1"
+  :author "ynniv"
+  :license "MIT"
+  :depends-on ("glass/fb")
+  :serial t
+  :components ((:module "src" :serial t :components ((:file "clipboard")))))
+
 (asdf:defsystem :glass
   :description "A from-scratch VNC/RFB server in pure Common Lisp: an in-memory
 framebuffer you draw into, exported over the RFB protocol so any VNC client can
@@ -24,7 +43,7 @@ give modus a remote display, developed and tested on SBCL first."
   :version "0.0.1"
   :author "ynniv"
   :license "MIT"
-  :depends-on ("glass/fb" "sb-bsd-sockets" "cram")
+  :depends-on ("glass/fb" "glass/clipboard" "sb-bsd-sockets" "cram")
   :serial t
   :components
   ((:module "src"

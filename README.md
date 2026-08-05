@@ -136,6 +136,60 @@ arithmetic (resample / gain / sum) is reed's; this is the session policy on top.
 Gate: `sbcl --non-interactive --load inspect/audio-gate.lisp` (29 checks; the
 load-bearing ones are the ones a single-listener test cannot make).
 
+## The selection (`:glass/clipboard`)
+
+The third thing a session has exactly one of, after a screen and a sound: what
+was last copied. `:glass/clipboard` is that one clipboard, and the RFB server
+converts it to and from `ClientCutText` / `ServerCutText` — paste into the
+desktop from your viewer, and a copy inside the session reaches every connected
+viewer.
+
+```lisp
+(glass:clipboard-set (glass:session-clipboard) "https://example.com/")
+(glass:clipboard-text (glass:session-clipboard))     ; -> text, serial, owner
+(glass:clipboard-own  (glass:session-clipboard) my-app
+                      :provider (lambda () (serialize-the-big-buffer))
+                      :name "editor")                ; serialized only if pasted
+(glass:clipboard-disown (glass:session-clipboard) my-app)   ; only if it still holds it
+(glass:clipboard-listen (glass:session-clipboard) :me
+                        (lambda (cb serial owner) ...))     ; change notification
+```
+
+It is here rather than in the RFB server for the mixer's reason: a clipboard
+inside one transport is one only that transport's clients can paste from, and the
+next transport grows a second one that disagrees. It is **not** shaped like the
+mixer, because the selection is discrete — no clock, no ring of frames, no pull
+cursor. One owned value and a change hook.
+
+Ownership rather than a bare string is what lets a late reader be answered by the
+owner (a provider thunk, so a big buffer is serialized only if somebody actually
+pastes), lets a closing app retract **its own** selection and not somebody else's,
+and lets a transport recognise its own writes and not echo them back — which is
+also what stops two viewers of one session handing the same string back and forth
+forever.
+
+Cut text is **Latin-1** with LF line endings, per RFC 6143 §7.5.6/§7.6.4;
+`latin1-bytes` / `latin1-string` do that conversion completely (CRLF and lone CR
+fold to LF, characters above U+00FF substitute). UTF-8 needs the extended-clipboard
+pseudo-encoding (-1063), which is not implemented — a `ClientCutText` carrying it
+(a negative length) is consumed and ignored rather than half-decoded.
+
+**Pasting works today via a documented fallback.** No app on the desktop reads a
+clipboard yet, and VNC has no notion of "the focused text field", so
+`glass:clipboard-paste` **types** the selection: it synthesizes key events through
+the same `:on-key` callback a real client keystroke takes, so it inherits the
+window manager's focus rules for free. `Shift+Insert` (the X11 paste convention,
+`glass:*paste-chord*`) triggers it from any viewer. Being keystrokes, it carries
+only what a keysym carries (Latin-1 printables, LF, TAB) and an app that
+interprets keystrokes will interpret the paste — pasting into a shell prompt or a
+text field works; pasting into a full-screen TUI does what those characters mean
+there. An app that later reads the clipboard properly simply stops going through
+this path.
+
+Gate: `sbcl --non-interactive --load inspect/clipboard-gate.lisp` (66 checks; the
+load-bearing ones are the ones a bare stored string cannot make — a foreign
+disown, a re-asserted value, a client's own cut text coming back).
+
 ## Not yet
 
 ZRLE's run-length subencodings (plain/palette RLE) and the Tight encoding; a
