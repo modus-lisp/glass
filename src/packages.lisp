@@ -29,7 +29,13 @@
    #:mixer-source #:mixer-source-p #:src-id #:src-name #:src-gain #:src-frames
    #:mixer-subscribe #:mixer-unsubscribe #:sink #:sink-p #:sink-next-frame #:sink-source
    #:sink-rate #:sink-frames #:sink-drops #:sink-underruns #:sink-gain
-   #:*mixer-rate* #:*mixer-frame-ms*
+   #:*mixer-rate* #:*mixer-frame-ms* #:session-mixer #:*session-mixer* #:mixer-add-file
+   ;; the mix over a socket (the :glass/audio-stream system) — server and listener
+   #:start-audio-stream #:stop-audio-stream #:audio-stream #:audio-stream-p #:audio-stream-report
+   #:audio-stream-port #:audio-stream-mixer #:*audio-stream-port* #:start-session-audio
+   #:make-audio-tap #:audio-tap #:audio-tap-p #:tap-next-frame #:tap-source #:tap-stop
+   #:tap-report #:audio-tap-connected #:audio-tap-rate #:audio-tap-frames #:audio-tap-drops
+   #:audio-tap-underruns #:audio-tap-reconnects
    ;; standing perf counters (read a snapshot over the control socket)
    #:*perf-on* #:perf-reset #:perf-report #:perf-record-send #:perf-record-composite
    #:*send-lag* #:*send-queue*))

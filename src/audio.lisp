@@ -329,6 +329,60 @@ sends silence for that slot and keeps its own clock, which is what its packets' 
 webrtc-media's :source, or anything else that asks for the next frame."
   (lambda () (sink-next-frame s)))
 
+;;; ---- the session's mixer ---------------------------------------------------
+;;;
+;;; A session has ONE sound, so the process running the desktop has one mixer, and the things
+;;; that want to reach it — a control socket eval, a transport, an app that beeps — should not
+;;; each have to be handed it.  This is that one, created on first use.  It is a convenience, not
+;;; a constraint: MAKE-MIXER still makes as many independent mixers as a caller wants (a test
+;;; makes one per case), and nothing in this file consults *SESSION-MIXER*.
+
+(defvar *session-mixer* nil
+  "The mixer for this process's session, or NIL before anything asked for one.")
+
+(defvar *session-mixer-lock* (sb-thread:make-mutex :name "glass-session-mixer"))
+
+(defun session-mixer (&key (start t))
+  "This process's session mixer, started, creating it on first call.  Idempotent — two callers
+racing at startup get the same mix, not one each."
+  (sb-thread:with-mutex (*session-mixer-lock*)
+    (or *session-mixer*
+        (let ((m (make-mixer)))
+          (when start (mixer-start m))
+          (setf *session-mixer* m)))))
+
+(defun %decode-audio-file (path)
+  (let ((type (string-downcase (or (pathname-type path) ""))))
+    (cond ((string= type "mp3") (reed:decode-mp3-file path))
+          ((member type '("aac" "adts" "m4a") :test #'string=) (reed:decode-aac-file path))
+          ((member type '("opus" "ogg") :test #'string=) (reed:decode-opus-file path))
+          (t (error "glass audio: no decoder for ~a" path)))))
+
+(defun mixer-add-file (m path &key loop (gain 1.0d0) name)
+  "Decode PATH (reed: mp3/aac/opus), convert it to the mix's rate once, and register it.
+
+Decoded up front rather than streamed, because the caller that wants this wants a sound to be
+THERE — a notification, a track a listener joining halfway through should already hear playing —
+and a decoder feeding the mix from the clock thread would make the mix's deadline depend on how
+fast a file decodes.  LOOP t wraps forever; without it the source is finite and removes itself
+when the file ends.  GAIN rides on the source (SETF SRC-GAIN adjusts it while it plays) rather
+than being burned into the samples.
+
+Returns (values SOURCE SECONDS)."
+  (let* ((pcm (%decode-audio-file path))
+         (mono (reed:downmix (reed:pcm-samples pcm) (reed:pcm-channels pcm)))
+         (buf (if (= (reed:pcm-sample-rate pcm) (mixer-rate m))
+                  mono
+                  (let ((rs (reed:make-resampler (reed:pcm-sample-rate pcm) (mixer-rate m))))
+                    (concatenate '(simple-array (signed-byte 16) (*))
+                                 (reed:resample rs mono)
+                                 (reed:resample rs (reed:make-pcm16 0) :final t))))))
+    (values (mixer-add-source m (reed:make-buffer-source
+                                 buf :frame-samples (mixer-frame-samples m) :loop loop)
+                              :name (or name (file-namestring path))
+                              :gain gain :finite (not loop))
+            (/ (length buf) (float (mixer-rate m) 1d0)))))
+
 (defun mixer-report (m)
   "A line about the mix, for a control socket."
   (sb-thread:with-mutex ((mixer-lock m))

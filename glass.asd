@@ -69,6 +69,21 @@ can hear, and the next transport builds a second one."
   :serial t
   :components ((:module "src" :serial t :components ((:file "audio")))))
 
+(asdf:defsystem :glass/audio-stream
+  :description "The session mix over a socket, for a listener in another process.  The desktop
+runs the mixer; a WebRTC gateway, a recorder or another box cannot call MIXER-SUBSCRIBE across a
+process boundary, so this serves one subscription per connection: a one-line self-describing
+header, then 20 ms frames of signed 16-bit mono, one per period including silence.  Carries both
+ends — START-AUDIO-STREAM to serve, MAKE-AUDIO-TAP to listen without blocking the consumer's
+clock.  (An RFB QEMU-audio pseudo-encoding would let plain VNC clients hear the same mix; that
+is a bigger change inside the framebuffer session, and this needs none of it.)"
+  :version "0.0.1"
+  :author "ynniv"
+  :license "MIT"
+  :depends-on ("glass" "glass/audio")
+  :serial t
+  :components ((:module "src" :serial t :components ((:file "audio-stream")))))
+
 (asdf:defsystem :glass/term
   :description "A terminal emulator on glass: a real PTY + shell, an ANSI/VT
 parser, and a character grid rendered with scribe, served over VNC.  No xterm,
