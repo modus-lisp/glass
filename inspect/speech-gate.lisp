@@ -36,7 +36,7 @@
   (finish-output))
 
 (unless glass:*speech-voice*
-  (setf glass:*speech-voice* "/mnt/lisp/quill/export/en_US-lessac-medium.graph"))
+  (setf glass:*speech-voice* "/mnt/lisp/chord/export/en_US-lessac-medium.graph"))
 
 (defun rms (pcm)
   (if (zerop (length pcm))
@@ -206,12 +206,12 @@ that waits for audio that is never coming does not hang — it fills the heap."
   (let ((spk (glass:make-speaker :mixer m)))
     ;; force the failure at the engine seam rather than inventing an input that happens to break
     ;; today's G2P — what is under test is the voice's response to a throwing synthesizer.
-    (let ((real (symbol-function (find-symbol "SYNTHESIZE" "QUILL"))))
-      (setf (symbol-function (find-symbol "SYNTHESIZE" "QUILL"))
+    (let ((real (symbol-function (find-symbol "SYNTHESIZE" "CHORD"))))
+      (setf (symbol-function (find-symbol "SYNTHESIZE" "CHORD"))
             (lambda (&rest args) (declare (ignore args)) (error "gate: pretend phoneme")))
       (glass:speak "This one cannot be said." :speaker spk)
       (await (lambda () (plusp (glass::spk-failed spk))) :timeout 30 :what "the failure")
-      (setf (symbol-function (find-symbol "SYNTHESIZE" "QUILL")) real))
+      (setf (symbol-function (find-symbol "SYNTHESIZE" "CHORD")) real))
     (check-that "the failure is counted, with the reason kept"
                 (and (= 1 (glass::spk-failed spk))
                      (search "pretend phoneme" (or (glass::spk-last-error spk) "")))

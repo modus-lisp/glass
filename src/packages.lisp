@@ -49,7 +49,7 @@
    #:make-audio-tap #:audio-tap #:audio-tap-p #:tap-next-frame #:tap-source #:tap-stop
    #:tap-report #:audio-tap-connected #:audio-tap-rate #:audio-tap-frames #:audio-tap-drops
    #:audio-tap-underruns #:audio-tap-reconnects
-   ;; the voice (the :glass/speech system; quill-backed) — one speaker on the session mix
+   ;; the voice (the :glass/speech system; chord-backed) — one speaker on the session mix
    #:speak #:hush #:speaking-p #:make-speaker #:session-speaker #:stop-speaker #:speech-report
    #:speaker #:speaker-p #:*session-speaker* #:*speech-voice* #:*speech-gain* #:*speech-gap-ms*
    ;; standing perf counters (read a snapshot over the control socket)

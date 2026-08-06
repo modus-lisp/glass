@@ -105,7 +105,7 @@ not be what gives a desktop a voice (and a source on its mixer)."
   (or (app-note frame)
       (if glass:*speech-voice*
           (glass:speech-report (%speaker))
-          "set GLASS_VOICE (or glass:*speech-voice*) to a quill .graph")))
+          "set GLASS_VOICE (or glass:*speech-voice*) to a chord .graph")))
 
 (defun %status (frame) (cons (%state) (%detail frame)))
 

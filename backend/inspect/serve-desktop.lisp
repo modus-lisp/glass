@@ -16,7 +16,7 @@
     (ignore-errors (asdf:load-system :loom/glass))            ; the browser (optional)
     (ignore-errors (asdf:load-system :warren))                ; the file browser (optional)
     (ignore-errors (asdf:load-system :glass/audio-stream))    ; the session's sound (optional)
-    (ignore-errors (asdf:load-system :glass/speech))          ; and its voice, via quill (optional)
+    (ignore-errors (asdf:load-system :glass/speech))          ; and its voice, via chord (optional)
     (asdf:load-asd "/home/claude/glass/backend/mcclim-glass.asd")
     (asdf:load-system :mcclim-glass)
     (ignore-errors (asdf:load-system :mcclim-glass/speak))))  ; type-and-say window (optional)
@@ -78,7 +78,7 @@
   ;; box.  GLASS_VOICE still wins; this only fills in the one that lives here, and leaves the
   ;; variable alone — so SPEAK's complaint stays accurate — when the file is missing.
   (let ((var (find-symbol "*SPEECH-VOICE*" :glass))
-        (here "/mnt/lisp/quill/export/en_US-lessac-medium.graph"))
+        (here "/mnt/lisp/chord/export/en_US-lessac-medium.graph"))
     (when (and var (boundp var) (null (symbol-value var)) (probe-file here))
       (setf (symbol-value var) here)))
   (format *error-output* "~&@@ glass desktop :~d serving on 0.0.0.0:~d (~a)~%" *display* *vnc-port* wp)

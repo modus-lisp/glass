@@ -43,7 +43,7 @@
 (defparameter *port* 5947)
 
 (unless glass:*speech-voice*
-  (let ((here "/mnt/lisp/quill/export/en_US-lessac-medium.graph"))
+  (let ((here "/mnt/lisp/chord/export/en_US-lessac-medium.graph"))
     (when (probe-file here) (setf glass:*speech-voice* here))))
 
 ;;; ---- an RFB client with no screen ------------------------------------------

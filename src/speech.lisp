@@ -1,7 +1,7 @@
 ;;;; src/speech.lisp — the desktop's voice.
 ;;;;
 ;;;; src/audio.lisp says a desktop whose applications make no noise is honestly silent.  This
-;;;; is the first application that makes noise: quill, a neural text-to-speech engine that is
+;;;; is the first application that makes noise: chord, a neural text-to-speech engine that is
 ;;;; also pure Common Lisp, wired in as one source in the session mix.  SPEAK from anywhere in
 ;;;; the image — a notification, a long-running job announcing it finished, an app reading a
 ;;;; selection — and every listener on the session hears it, because the mixer is the session's
@@ -9,7 +9,7 @@
 ;;;;
 ;;;; Two things about the shape here are load-bearing, and both come from the mixer's clock.
 ;;;;
-;;;; SYNTHESIS NEVER RUNS ON THE MIXER'S THREAD.  A frame is due every 20 ms and quill takes
+;;;; SYNTHESIS NEVER RUNS ON THE MIXER'S THREAD.  A frame is due every 20 ms and chord takes
 ;;;; most of a second to build a sentence — around 1.2x realtime with all its worker threads.
 ;;;; A source thunk that synthesized would miss its deadline by fifty frames and every listener
 ;;;; would hear the whole desktop stall, not just the speech.  So there are two queues and a
@@ -22,18 +22,18 @@
 ;;;; serializes utterances, which is what having a voice means.
 ;;;;
 ;;;; Latency is therefore honest and visible: about a second of thinking before the first word,
-;;;; then continuous.  Sentences are synthesized one at a time (quill's TEXT-TO-IPA already
+;;;; then continuous.  Sentences are synthesized one at a time (chord's TEXT-TO-IPA already
 ;;;; splits them) so a paragraph starts speaking after its first sentence rather than after its
 ;;;; last.
 ;;;;
-;;;; quill is looked up at run time, not depended on at read time, for the same reason the
+;;;; chord is looked up at run time, not depended on at read time, for the same reason the
 ;;;; desktop looks up START-SESSION-AUDIO by name: a build without a voice must still be a
 ;;;; working desktop.
 
 (in-package #:glass)
 
 (defparameter *speech-voice* (sb-ext:posix-getenv "GLASS_VOICE")
-  "Path to the quill .graph to speak with; GLASS_VOICE by default.  The voice's .bin and
+  "Path to the chord .graph to speak with; GLASS_VOICE by default.  The voice's .bin and
 .config.json are expected beside it.  NIL means the desktop has no voice installed, and SPEAK
 says so rather than guessing at a path.")
 
@@ -49,7 +49,7 @@ run together — the model puts no pause at a boundary it never saw.")
 (defstruct (speaker (:constructor %make-speaker) (:conc-name spk-))
   (mixer nil)
   (source nil)                        ; the MIXER-SOURCE handle, for gain and removal
-  (voice nil)                         ; quill's loaded voice, on first use
+  (voice nil)                         ; chord's loaded voice, on first use
   (lock (sb-thread:make-mutex :name "glass-speech"))
   (wake (sb-thread:make-semaphore :name "glass-speech-wake"))
   (pending '())                       ; text waiting to be synthesized, oldest first
@@ -66,12 +66,12 @@ run together — the model puts no pause at a boundary it never saw.")
 (defvar *session-speaker* nil)
 (defvar *session-speaker-lock* (sb-thread:make-mutex :name "glass-session-speaker"))
 
-(defun %quill (name)
-  "The quill function NAME, or an error saying the engine is not loaded.  Resolved per call so
-that loading quill into a running desktop is enough to give it a voice — no restart."
-  (let ((sym (and (find-package "QUILL") (find-symbol (string name) "QUILL"))))
+(defun %chord (name)
+  "The chord function NAME, or an error saying the engine is not loaded.  Resolved per call so
+that loading chord into a running desktop is enough to give it a voice — no restart."
+  (let ((sym (and (find-package "CHORD") (find-symbol (string name) "CHORD"))))
     (unless (and sym (fboundp sym))
-      (error "glass speech: quill is not loaded (no ~a) — (asdf:load-system :quill)" name))
+      (error "glass speech: chord is not loaded (no ~a) — (asdf:load-system :chord)" name))
     (symbol-function sym)))
 
 (defun %speech-voice (spk)
@@ -80,8 +80,8 @@ lazily keeps a desktop that never speaks from paying for a voice."
   (or (spk-voice spk)
       (let ((path (or *speech-voice*
                       (error "glass speech: no voice — set GLASS_VOICE or glass:*speech-voice* ~
-                              to a quill .graph"))))
-        (setf (spk-voice spk) (funcall (%quill "LOAD-VOICE") path)))))
+                              to a chord .graph"))))
+        (setf (spk-voice spk) (funcall (%chord "LOAD-VOICE") path)))))
 
 ;;; ---- text in ---------------------------------------------------------------
 
@@ -152,7 +152,7 @@ speech."
 ;;; ---- the thread between them -----------------------------------------------
 
 (defun %to-mix-rate (spk samples rate)
-  "SAMPLES (quill's floats in [-1, 1] at RATE) as signed 16-bit at the mixer's rate."
+  "SAMPLES (chord's floats in [-1, 1] at RATE) as signed 16-bit at the mixer's rate."
   (let* ((n (length samples))
          (pcm (reed:make-pcm16 n))
          (mix-rate (mixer-rate (spk-mixer spk))))
@@ -173,9 +173,9 @@ speech."
 as soon as it exists, which is why a paragraph starts speaking after the first one."
   (let ((voice (%speech-voice spk))
         (gen (sb-thread:with-mutex ((spk-lock spk)) (spk-generation spk)))
-        (synthesize (%quill "SYNTHESIZE"))
+        (synthesize (%chord "SYNTHESIZE"))
         (first t))
-    (dolist (sentence (funcall (%quill "TEXT-TO-IPA") text))
+    (dolist (sentence (funcall (%chord "TEXT-TO-IPA") text))
       ;; HUSH while a paragraph is being synthesized must stop the REST of it too
       (when (/= gen (sb-thread:with-mutex ((spk-lock spk)) (spk-generation spk)))
         (return))
@@ -201,7 +201,7 @@ as soon as it exists, which is why a paragraph starts speaking after the first o
                          next))
           while text
           do (handler-case (%say-one spk text)
-               ;; A sentence quill cannot say — an unknown phoneme, a missing voice file — is
+               ;; A sentence chord cannot say — an unknown phoneme, a missing voice file — is
                ;; one sentence lost and recorded as such.  It is not a dead voice, and it is
                ;; certainly not something to paper over with silence and no trace.
                (serious-condition (e)
