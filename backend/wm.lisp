@@ -145,12 +145,14 @@
    (close-fn  :initarg :close-fn  :initform nil        :accessor wm-surface-close-fn)
    ;; (x y w h) saved by Full Size, for Restore Size
    (saved-geom :initarg :saved-geom :initform nil      :accessor wm-surface-saved-geom)
-   ;; The identity this window uses when it takes the session selection — i.e. what
-   ;; GLASS:CLIPBOARD-OWNER reads back while this window is the one holding it.  NIL
-   ;; (the default, and every window that never copies anything) means "I never own
-   ;; the selection", which is what keeps the selection context menu off windows that
-   ;; have nothing to offer it.  See WM-SURFACE-OWNS-SELECTION-P.
-   (clip-owner :initarg :clip-owner :initform nil      :accessor wm-surface-clip-owner)
+   ;; ()->string|nil : the text this window has SELECTED RIGHT NOW — the live
+   ;; highlight, asked for at the moment somebody wants to act on it, and never the
+   ;; clipboard.  A clipboard outlives the highlight by design (that is what makes
+   ;; paste-later work), so reading one to answer "what is selected?" answers a
+   ;; different question and eventually a stale one.  NIL (the default, and every
+   ;; window with no notion of a selection) means "I never have one", which is what
+   ;; keeps the selection context menu off windows with nothing to offer it.
+   (selection-fn :initarg :selection-fn :initform nil  :accessor wm-surface-selection-fn)
    ;; consecutive per-frame poll/draw errors (see WM-NOTE-SURFACE-ERROR)
    (err-count :initarg :err-count :initform 0          :accessor wm-surface-err-count)))
 
@@ -873,7 +875,16 @@
   menu)
 
 (defun wm-open-menu (port x y)
-  (let ((menu (make-wm-menu :x x :y y :hover -1 :items (glass-port-menu-items port))))
+  "Open the workspace root menu at (X,Y): the port's items, plus whatever the SESSION
+   itself can offer from the workspace — today, speaking the clipboard.  Those are
+   appended here rather than registered as apps because they are not apps and because
+   they change: the items are built at every open, so \"Stop speaking\" is on the menu
+   exactly while something is being said.  A port whose menu was overridden still gets
+   them, for the same reason it still gets a window menu — they are the desktop's, not
+   the menu list's."
+  (let ((menu (make-wm-menu :x x :y y :hover -1
+                            :items (append (glass-port-menu-items port)
+                                           (wm-clipboard-menu-items)))))
     (setf (glass-port-menu port) (wm-place-menu menu port x y))))
 
 ;;; ---- the selection menu (right-click ON the thing you selected) --------------
@@ -884,45 +895,61 @@
 ;;; the hand to leave the words behind in order to talk about them.  Here the menu
 ;;; comes up over the selection.
 ;;;
-;;; It lives in the WM for the same reason the clipboard lives in glass: the selection
-;;; is a property of the SESSION, not of whoever happens to be holding it.  Any window
-;;; that ever owns one gets read-aloud without knowing that speech exists — the terminal
-;;; on the day it learns to copy, an editor, the next app nobody has written.  Building
-;;; it inside the browser instead would buy a second menu renderer, a second hit-tester,
-;;; and a menu that could not escape the browser's own window to clamp to the screen.
+;;; It lives in the WM because the ability to act on a selection belongs to the DESKTOP,
+;;; not to whoever happens to have one.  Any window that ever has one gets read-aloud
+;;; without knowing that speech exists — the terminal on the day it learns to select, an
+;;; editor, the next app nobody has written.  Building it inside the browser instead
+;;; would buy a second menu renderer, a second hit-tester, and a menu that could not
+;;; escape the browser's own window to clamp to the screen.
 ;;;
-;;; THE INTERCEPTION RULE.  Button 3 belongs to the application.  The WM takes it only
-;;; when all three of these hold, and otherwise the press falls through untouched:
+;;; THE SELECTION IS NOT THE CLIPBOARD.  This menu asks the window under the pointer
+;;; what it has HIGHLIGHTED right now (WM-SURFACE-SELECTION-FN) and speaks that.  It
+;;; used to read the session clipboard instead, which is a different thing wearing the
+;;; same word: a clipboard deliberately OUTLIVES the highlight — that is what makes
+;;; paste-later work — so the menu would come up over a page with nothing selected and
+;;; cheerfully read out whatever was copied ten minutes ago.  What is on the clipboard
+;;; is a fine question; it is just the ROOT menu's question (WM-CLIPBOARD-MENU-ITEMS),
+;;; where there is no window to ask and "whatever was last copied" is exactly the answer
+;;; wanted.
 ;;;
-;;;   1. the window under the pointer declares a clipboard identity (CLIP-OWNER), and
-;;;   2. the session clipboard is held by exactly that identity, and
-;;;   3. there is actually some text in it.
-;;;
-;;; So a right-click in a window with no selection reaches the app, and a right-click in
-;;; a DIFFERENT window than the one holding the selection also reaches the app: that text
-;;; is not this window's to talk about, and answering for it would be the WM guessing.
-;;; The menu appears exactly where the words are, or not at all.
+;;; THE INTERCEPTION RULE.  Button 3 belongs to the application.  The WM takes it iff
+;;; the surface under the pointer reports a non-empty live selection; everything else —
+;;; every other window, and this one the moment the highlight is dismissed — falls
+;;; through to the app untouched.  The menu appears exactly where the words are, and
+;;; only while they are still words.
 
 (defun wm-speech-fn (name)
   "The bound GLASS symbol NAME, or NIL — speech is an optional system (:glass/speech),
    so the selection menu offers only what this image can actually do."
   (let ((s (find-symbol name '#:glass))) (and s (fboundp s) s)))
 
-(defun wm-surface-owns-selection-p (surf)
-  "Does SURF hold the session selection right now, with text in it?  The (TEXT . OWNER)
-   test behind the interception rule; returns the text so the caller needn't ask twice."
-  (let ((owner (and (wm-surface-p surf) (wm-surface-clip-owner surf))))
-    (when owner
-      (multiple-value-bind (text serial holder)
-          (ignore-errors (glass:clipboard-text (glass:session-clipboard)))
-        (declare (ignore serial))
-        (and (eq holder owner) (stringp text) (plusp (length text)) text)))))
+(defun wm-speaking-p ()
+  "Is the session saying something?  Asked only when there IS a voice to ask, because
+   SPEAKING-P's default speaker is SESSION-SPEAKER, which CREATES one — thread, mixer
+   source and all — merely by being asked.  Opening a menu must not be the thing that
+   gives the desktop a voice, so a session that has never spoken answers NIL here and
+   stays as silent as it was."
+  (let ((busy (wm-speech-fn "SPEAKING-P"))
+        (var (find-symbol "*SESSION-SPEAKER*" '#:glass)))
+    (and busy var (boundp var) (symbol-value var)
+         (ignore-errors (funcall busy (symbol-value var))))))
+
+(defun wm-surface-live-selection (surf)
+  "The text SURF has highlighted RIGHT NOW, or NIL — the test behind the interception
+   rule, returning the text so the caller needn't ask twice.  The window is asked at
+   the instant of the click, so a selection that has been replaced or dismissed cannot
+   answer.  A window that never has a selection has no SELECTION-FN and says NIL
+   without being called; one whose answer signals is treated as no answer, because a
+   busy or broken window must not be able to swallow a button press."
+  (let ((fn (and (wm-surface-p surf) (wm-surface-selection-fn surf))))
+    (when fn
+      (let ((text (ignore-errors (funcall fn))))
+        (and (stringp text) (plusp (length text)) text)))))
 
 (defun wm-selection-menu-items (text)
   "Items for the selection menu over TEXT.  Deliberately two lines long: this is a menu
    about one selection, not a second place to put applications."
-  (let ((speak (wm-speech-fn "SPEAK")) (hush (wm-speech-fn "HUSH"))
-        (busy (wm-speech-fn "SPEAKING-P")))
+  (let ((speak (wm-speech-fn "SPEAK")) (hush (wm-speech-fn "HUSH")))
     (when speak
       (append
        (list (cons "Speak selection"
@@ -931,13 +958,38 @@
                      ;; means "read THIS", not "read it again after the last one".
                      (when hush (ignore-errors (funcall hush)))
                      (ignore-errors (funcall speak text)))))
-       (when (and hush busy (ignore-errors (funcall busy)))
+       (when (and hush (wm-speaking-p))
+         (list (cons "Stop speaking" (lambda () (ignore-errors (funcall hush))))))))))
+
+(defun wm-clipboard-menu-items ()
+  "The session-CLIPBOARD speech items, appended to the workspace root menu (see
+   WM-OPEN-MENU).  The counterpart of the selection menu, and deliberately named for
+   what it does: this reads whatever was last COPIED, which is the session's, outlives
+   any one window's highlight, and is still there to be read from the bare workspace
+   where there is nobody to ask what is selected.  An empty clipboard says so rather
+   than saying nothing — silence is indistinguishable from a broken voice.
+
+   Empty when this image has no speech at all, so the root menu grows nothing it cannot
+   do.  Built fresh on every menu open, which is what lets \"Stop speaking\" appear only
+   while there is something to stop."
+  (let ((speak (wm-speech-fn "SPEAK")) (hush (wm-speech-fn "HUSH")))
+    (when speak
+      (append
+       (list (cons "Speak clipboard"
+                   (lambda ()
+                     (let ((text (ignore-errors (glass:clipboard-text (glass:session-clipboard)))))
+                       (when hush (ignore-errors (funcall hush)))
+                       (ignore-errors
+                        (funcall speak (if (and (stringp text) (plusp (length text)))
+                                           text
+                                           "The clipboard is empty.")))))))
+       (when (and hush (wm-speaking-p))
          (list (cons "Stop speaking" (lambda () (ignore-errors (funcall hush))))))))))
 
 (defun wm-open-selection-menu (port surf x y)
   "Open the selection menu over SURF at (X,Y), or return NIL if there is nothing to
    offer — a NIL return is the caller's signal to let the press through to the app."
-  (when-let* ((text (wm-surface-owns-selection-p surf))
+  (when-let* ((text (wm-surface-live-selection surf))
               (items (wm-selection-menu-items text)))
     (let ((menu (make-wm-menu :x x :y y :hover -1 :title "Selection" :items items)))
       (setf (glass-port-menu port) (wm-place-menu menu port x y)))))
@@ -1134,6 +1186,7 @@
         (onk      (%loom-fn '#:loom.glass "ON-KEY"))
         (onp      (%loom-fn '#:loom.glass "ON-POINTER"))
         (pump     (%loom-fn '#:loom.glass "PUMP-LOOP"))
+        (sel      (%loom-fn '#:loom.glass "SELECTION-TEXT"))
         (stop     (%loom-fn '#:loom.glass "STOP")))
     (unless (and attach-b onk onp pump)
       (error "loom/glass not loaded — (ql:quickload :loom/glass)"))
@@ -1144,10 +1197,12 @@
           (wm-add-surface* port
             (make-wm-surface :fb fb :x (+ 40 c) :y (+ 40 c +wm-titleh+)
                              :title "browser"
-                             ;; loom takes the session selection as APP — this window —
-                             ;; so a right-click here can tell "my text" from the text
-                             ;; some other browser window is holding.
-                             :clip-owner app
+                             ;; What this window has highlighted at the moment somebody
+                             ;; asks — loom reads its live page selection, the same state
+                             ;; the highlight is painted from, so the answer is gone the
+                             ;; instant the highlight is.  An older loom without
+                             ;; SELECTION-TEXT simply has no selection to offer.
+                             :selection-fn (and sel (lambda () (funcall sel app)))
                              :on-key (lambda (down k) (funcall onk app down k))
                              :on-pointer (lambda (mask lx ly) (funcall onp app mask lx ly))
                              ;; loom's pump paints into FB only when the page or the chrome
