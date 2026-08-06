@@ -103,6 +103,21 @@ is a bigger change inside the framebuffer session, and this needs none of it.)"
   :serial t
   :components ((:module "src" :serial t :components ((:file "audio-stream")))))
 
+(asdf:defsystem :glass/speech
+  :description "The desktop's voice: quill (a neural TTS engine, also pure Common Lisp) as one
+long-lived source in the session mix.  SPEAK queues text and returns; a thread behind it
+synthesizes at whatever pace it can and hands 48 kHz samples to a thunk that only copies, because
+a frame is due every 20 ms and a sentence takes about a second to build.  OPTIONAL — like
+:glass/vncauth, a desktop without it is a working desktop, and quill is a dependency only of this
+system.  Every listener on the session hears it, since the source is on the session's mixer and
+not inside one transport."
+  :version "0.0.1"
+  :author "ynniv"
+  :license "MIT"
+  :depends-on ("glass/audio" "quill")
+  :serial t
+  :components ((:module "src" :serial t :components ((:file "speech")))))
+
 (asdf:defsystem :glass/term
   :description "A terminal emulator on glass: a real PTY + shell, an ANSI/VT
 parser, and a character grid rendered with scribe, served over VNC.  No xterm,
