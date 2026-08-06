@@ -15,3 +15,14 @@
                (:file "message-port")
                (:file "wm")
                (:file "compositor")))
+
+(asdf:defsystem "mcclim-glass/speak"
+  :description "A window to type into: the desktop's voice (glass/speech) behind a text box and
+a Speak button, as a McCLIM frame that registers itself in the workspace root menu.  OPTIONAL and
+separate from the backend — it is an application, and it is the only thing here that drags in a
+speech engine, so a desktop without a voice still loads the backend it draws with."
+  :author "ynniv"
+  :license "MIT"
+  :depends-on ("mcclim" "glass/speech")
+  :serial t
+  :components ((:file "speak-app")))

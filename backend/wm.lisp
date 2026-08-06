@@ -1249,10 +1249,17 @@
     (:browse   (apply #'wm-add-browser port (cdr spec)))
     (:image    (apply #'wm-add-image port (cdr spec)))
     (:surface  (apply #'add-surface port (cdr spec)))
-    (t (destructuring-bind (class &key (width 480) (height 320)) spec
-         (wm-run-frame port (make-application-frame class :frame-manager (find-frame-manager :port port)
-                                                    :width width :height height)
-                       (princ-to-string class))))))
+    ;; A McCLIM frame class.  TITLE is the window's name — it goes in as the frame's
+    ;; PRETTY-NAME, which is where WM-SHEET-TITLE reads the title bar from (the third
+    ;; argument below only names the thread).  Default is the class name, which is
+    ;; what the generic apps want and what a registered app rarely does: a person
+    ;; reading a title bar wants "Speak", not SPEAK-BOX.
+    (t (destructuring-bind (class &key (width 480) (height 320) title) spec
+         (wm-run-frame port (apply #'make-application-frame class
+                                   :frame-manager (find-frame-manager :port port)
+                                   :width width :height height
+                                   (when title (list :pretty-name title)))
+                       (or title (princ-to-string class)))))))
 
 (defun wm-menu-run (port action)
   "Run a chosen menu ACTION: a window spec (launch it) or, as an escape hatch, a

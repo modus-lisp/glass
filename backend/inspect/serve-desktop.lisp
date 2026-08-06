@@ -18,7 +18,8 @@
     (ignore-errors (asdf:load-system :glass/audio-stream))    ; the session's sound (optional)
     (ignore-errors (asdf:load-system :glass/speech))          ; and its voice, via quill (optional)
     (asdf:load-asd "/home/claude/glass/backend/mcclim-glass.asd")
-    (asdf:load-system :mcclim-glass)))
+    (asdf:load-system :mcclim-glass)
+    (ignore-errors (asdf:load-system :mcclim-glass/speak))))  ; type-and-say window (optional)
 
 (defparameter *display*
   (or (ignore-errors (parse-integer (or (sb-ext:posix-getenv "GLASS_DISPLAY") "1"))) 1))
@@ -98,6 +99,12 @@
      (clim-glass:register-app "File Browser"
        (list :surface (symbol-function (find-symbol "DESKTOP-SURFACE" :warren))
              :title "Files" :width 1000 :height 640))))
+  ;; And the window that types into the desktop's voice, which registers itself
+  ;; (GLASS-SPEAK:REGISTER looks CLIM-GLASS up by name, so the system also loads in
+  ;; an image with no desktop).  Absent when glass/speech didn't load — the desktop
+  ;; is still a desktop, just a mute one.
+  (when (find-package :glass-speak)
+    (ignore-errors (funcall (find-symbol "REGISTER" :glass-speak))))
   (clim-glass:run-wm '((:terminal :cols 80 :rows 24 :ppem 14))
                      :port *vnc-port* :width 1280 :height 800
                      :background wp :background-mode :cover))
