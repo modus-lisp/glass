@@ -63,7 +63,7 @@
               `(sb-thread:with-mutex ((clipboard-lock ,cb)) ,@body))
 #-sb-thread (defmacro %with-clip-locked ((cb) &body body) `(progn ,cb ,@body))
 
-(defstruct (clipboard (:constructor %make-clipboard))
+(define-record (clipboard (:constructor %make-clipboard))
   (lock (%clip-make-lock))
   (owner nil)                       ; opaque identity of the holder, or NIL = nobody holds it
   (owner-name "" :type string)      ; a label for a report — the owner itself may be anything

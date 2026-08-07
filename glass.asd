@@ -13,6 +13,7 @@ sb-thread is absent.  This is the piece that drops onto modus on bare metal;
   :serial t
   :components ((:module "src" :serial t
                 :components ((:file "packages")
+                             (:file "record")
                              (:file "framebuffer")))))
 
 (asdf:defsystem :glass/clipboard

@@ -46,7 +46,7 @@ run together — the model puts no pause at a boundary it never saw.")
 
 ;;; ---- the speaker -----------------------------------------------------------
 
-(defstruct (speaker (:constructor %make-speaker) (:conc-name spk-))
+(define-record (speaker (:constructor %make-speaker) (:conc-name spk-))
   (mixer nil)
   (source nil)                        ; the MIXER-SOURCE handle, for gain and removal
   (voice nil)                         ; chord's loaded voice, on first use

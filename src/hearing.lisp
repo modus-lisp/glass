@@ -93,7 +93,10 @@ a transcript further and further in the past, which is worse than a gap and a co
 
 ;;; ---- the ear ---------------------------------------------------------------
 
-(defstruct (ears (:constructor %make-ears) (:conc-name ear-))
+;; DEFINE-RECORD and not DEFSTRUCT: the ear is the longest-lived object in the image and the one
+;; that keeps growing slots (LISTENERS was the last), and it is held by two running threads —
+;; exactly the case where a struct redefinition costs a desktop restart.  See src/record.lisp.
+(define-record (ears (:constructor %make-ears) (:conc-name ear-))
   (mixer nil)
   (sink nil)                          ; the MIXER-SINK this hears through, if it made one
   (source nil)                        ; the thunk it pulls frames from

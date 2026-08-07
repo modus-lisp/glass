@@ -44,7 +44,7 @@ frames gets them without rebuffering; nothing here depends on the number.")
 
 ;;; ---- a source in the mix ---------------------------------------------------
 
-(defstruct (mixer-source (:conc-name src-) (:constructor %make-src))
+(define-record (mixer-source (:conc-name src-) (:constructor %make-src))
   (id 0 :type fixnum)
   (name "" :type string)
   thunk
@@ -55,7 +55,10 @@ frames gets them without rebuffering; nothing here depends on the number.")
 
 ;;; ---- the mixer -------------------------------------------------------------
 
-(defstruct (mixer (:constructor %make-mixer))
+;; The mixer, its sources and its sinks are DEFINE-RECORDs and not DEFSTRUCTs — they are held for
+;; the life of the session and their accessors run 50 times a second, not 50 million.  The pixel
+;; path next door (FRAMEBUFFER, PXFMT, RFB-CLIENT) stays DEFSTRUCT for the opposite reason.
+(define-record (mixer (:constructor %make-mixer))
   (rate 48000 :type fixnum)
   (frame-samples 960 :type fixnum)
   (period 0.02d0 :type double-float)
@@ -211,7 +214,7 @@ own clock instead of ours; MIXER-START is the normal way."
 
 ;;; ---- a listener ------------------------------------------------------------
 
-(defstruct (sink (:constructor %make-sink))
+(define-record (sink (:constructor %make-sink))
   mixer
   (name "" :type string)
   (rate 8000 :type fixnum)
