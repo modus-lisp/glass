@@ -54,7 +54,9 @@
    ;; lock) yet marked after it, so the paint hands it forward through the port.
    (frame-copy :initform nil :accessor glass-port-frame-copy)
    (pending  :initform nil :accessor glass-port-pending)      ; :full / (x y w h) / nil
-   (pending-lock :initform (sb-thread:make-mutex :name "glass-pending") :accessor glass-port-pending-lock))
+   (pending-lock :initform (sb-thread:make-mutex :name "glass-pending") :accessor glass-port-pending-lock)
+   ;; A medium kept only to be ASKED things — see the text-measurement section below.
+   (ruler    :initform nil :accessor glass-port-ruler))
   (:default-initargs :pointer (make-instance 'climi::standard-pointer)))
 
 (defun parse-glass-server-path (path) path)     ; plist tail becomes initargs
@@ -357,6 +359,76 @@
 (defmethod medium-force-output :after ((medium glass-medium))
   (when-let ((mirror (medium-drawable medium)))
     (%mirror-force-output (port medium) mirror)))
+
+;;; ---- measuring text on a medium that has no backend -------------------------
+;;;
+;;; McCLIM's output-recording streams do not hand out the backend's medium while
+;;; they record.  SHEET-MEDIUM on a recording stream returns a "faux medium" —
+;;; MAKE-CONTEXT-MEDIUM in Core/extended-output/record-stream.lisp — which is a
+;;; bare CLIMI::BASIC-MEDIUM carrying the right port and no backend class at all
+;;; ("we are not interested in the medium specialized by the backend").  That is
+;;; fine as long as text is measured through the STREAM, which has its own
+;;; methods, and every measurement inside McCLIM goes that way.
+;;;
+;;; ESA's minibuffer does not.  It takes the medium out of WITH-SHEET-MEDIUM and
+;;; asks IT:
+;;;
+;;;     (text-style-height (medium-merged-text-style medium) medium)   ; esa.lisp:151
+;;;
+;;; and TEXT-STYLE-ASCENT has methods for CLX-MEDIUM, TTF-MEDIUM-MIXIN, NULL and
+;;; PostScript — and none for a plain BASIC-MEDIUM.  So COMPOSE-SPACE on the
+;;; minibuffer dies inside ADOPT-FRAME with NO-APPLICABLE-METHOD, and Climacs
+;;; cannot open.  Nothing about that is ours: the faux medium is made the same
+;;; way on every backend, so CLX would land in the same hole.
+;;;
+;;; The measurement itself needs only the PORT — TTF-MEDIUM-MIXIN's methods are
+;;; (font-ascent (text-style-mapping (port medium) text-style)) and nothing more.
+;;; So rather than reimplement them against a font we would then have to keep in
+;;; step, forward the question to a real medium of the same port.  One per port,
+;;; made on demand, never drawn with: a ruler, not a canvas.
+;;;
+;;; The methods are on BASIC-MEDIUM, which is a core class, so they are careful
+;;; to be invisible everywhere else: GLASS-MEDIUM inherits TTF-MEDIUM-MIXIN
+;;; BEFORE BASIC-MEDIUM and so keeps its own methods, other backends' mediums are
+;;; likewise more specific, and a medium whose port is not ours declines by
+;;; CALL-NEXT-METHOD — which is exactly the error it would have signalled anyway.
+
+(defun %port-ruler (medium)
+  "A real GLASS-MEDIUM to answer text questions asked of MEDIUM, or NIL if MEDIUM
+   is not one of ours to answer for."
+  (let ((port (port medium)))
+    (when (typep port 'glass-port)
+      (or (glass-port-ruler port)
+          (setf (glass-port-ruler port) (make-medium port nil))))))
+
+(defmethod text-style-ascent (text-style (medium climi::basic-medium))
+  (let ((ruler (%port-ruler medium)))
+    (if ruler (text-style-ascent text-style ruler) (call-next-method))))
+
+(defmethod text-style-descent (text-style (medium climi::basic-medium))
+  (let ((ruler (%port-ruler medium)))
+    (if ruler (text-style-descent text-style ruler) (call-next-method))))
+
+;;; These two default their text style from the medium they are called on, so the
+;;; forward has to carry MEDIUM's style across explicitly — the ruler's own is a
+;;; different (and arbitrary) one, and letting it answer would silently measure
+;;; the wrong font.
+
+(defmethod text-size ((medium climi::basic-medium) string &rest args
+                      &key (text-style (medium-merged-text-style medium))
+                      &allow-other-keys)
+  (let ((ruler (%port-ruler medium)))
+    (if ruler
+        (apply #'text-size ruler string :text-style text-style args)
+        (call-next-method))))
+
+(defmethod text-bounding-rectangle* ((medium climi::basic-medium) string &rest args
+                                     &key (text-style (medium-merged-text-style medium))
+                                     &allow-other-keys)
+  (let ((ruler (%port-ruler medium)))
+    (if ruler
+        (apply #'text-bounding-rectangle* ruler string :text-style text-style args)
+        (call-next-method))))
 
 ;;; ---- event injection (RFB callbacks -> CLIM events) ------------------------
 

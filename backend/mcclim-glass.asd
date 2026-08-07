@@ -27,6 +27,23 @@ speech engine, so a desktop without a voice still loads the backend it draws wit
   :serial t
   :components ((:file "speak-app")))
 
+(asdf:defsystem "mcclim-glass/climacs"
+  :description "Climacs, with the upstream bugs corrected that kept the root menu's
+\"Editor (Climacs)\" from ever becoming an editor you could type in and open files with.  None of
+them is a glass bug and a CLX desktop would meet all of them: ESA repaints its minibuffer while
+holding the output-history lock its own display loop took, and expires an old message the same
+illegal way a second after putting it up; Climacs' OVERLAYING-PANE lays out its content pane
+without resizing it; DIRECTORY-PATHNAME-P judges a path by its name and never by the disk; and
+ESA's command loop handles two conditions and lets every other one unwind the frame out of
+existence with its window still on the screen.  Loading THIS is how a desktop offers the menu
+entry: it brings in climacs and the corrections together, so there is no way to get the editor
+without them."
+  :author "ynniv"
+  :license "MIT"
+  :depends-on ("mcclim-glass" "climacs")
+  :serial t
+  :components ((:file "climacs-compat")))
+
 (asdf:defsystem "mcclim-glass/listen"
   :description "The window speak is the mirror of: press Listen and the box fills up with what
 the session is saying.  The desktop's ear (glass/hearing) behind a text box and three buttons, as
