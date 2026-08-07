@@ -26,3 +26,15 @@ speech engine, so a desktop without a voice still loads the backend it draws wit
   :depends-on ("mcclim" "glass/speech")
   :serial t
   :components ((:file "speak-app")))
+
+(asdf:defsystem "mcclim-glass/listen"
+  :description "The window speak is the mirror of: press Listen and the box fills up with what
+the session is saying.  The desktop's ear (glass/hearing) behind a text box and three buttons, as
+a McCLIM frame that registers itself in the workspace root menu.  OPTIONAL and separate from the
+backend for the same reason speak is — it is an application, and the only thing here that drags
+in a recognizer."
+  :author "ynniv"
+  :license "MIT"
+  :depends-on ("mcclim" "glass/hearing")
+  :serial t
+  :components ((:file "listen-app")))

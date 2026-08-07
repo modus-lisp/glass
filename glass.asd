@@ -103,6 +103,22 @@ is a bigger change inside the framebuffer session, and this needs none of it.)"
   :serial t
   :components ((:module "src" :serial t :components ((:file "audio-stream")))))
 
+(asdf:defsystem :glass/mic-stream
+  :description "A peer's microphone over a socket, the other direction of :glass/audio-stream's
+relationship and on its own port beside it: the desktop listens, whatever holds the peer (the
+WebRTC gateway does) connects and pushes 20 ms frames, and the desktop converts them once — by
+reed, per connection — to the rate its consumer wants.  Deliberately NOT on the session mixer: a
+microphone in the mix would be played back out of the desktop's own audio and down the outbound
+stream to the peer that said it.  Carries both ends — START-MIC-STREAM to receive, MAKE-MIC-SENDER
+to push without ever blocking the caller's receive path — and depends on no recognizer, so a
+desktop that cannot transcribe can still carry a microphone."
+  :version "0.0.1"
+  :author "ynniv"
+  :license "MIT"
+  :depends-on ("glass" "glass/audio-stream")
+  :serial t
+  :components ((:module "src" :serial t :components ((:file "mic-stream")))))
+
 (asdf:defsystem :glass/speech
   :description "The desktop's voice: chord (a neural TTS engine, also pure Common Lisp) as one
 long-lived source in the session mix.  SPEAK queues text and returns; a thread behind it
@@ -117,6 +133,21 @@ not inside one transport."
   :depends-on ("glass/audio" "chord")
   :serial t
   :components ((:module "src" :serial t :components ((:file "speech")))))
+
+(asdf:defsystem :glass/hearing
+  :description "The desktop's ear: stave (a streaming Zipformer recognizer, also pure Common
+Lisp) as one sink on the session mix.  A thread pulls 16 kHz frames off the mixer, gates them on
+level so silence costs nothing, and transcribes what is left; HEARING-TEXT is the running
+transcript.  The mirror image of :glass/speech, wired to the same mixer from the other end —
+which is why the desktop can hear its own voice, and why that is the demonstration rather than a
+mistake, on a box whose only audio hardware is four HDMI playbacks.  OPTIONAL: stave is a
+dependency only of this system."
+  :version "0.0.1"
+  :author "ynniv"
+  :license "MIT"
+  :depends-on ("glass/audio" "stave")
+  :serial t
+  :components ((:module "src" :serial t :components ((:file "hearing")))))
 
 (asdf:defsystem :glass/term
   :description "A terminal emulator on glass: a real PTY + shell, an ANSI/VT

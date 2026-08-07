@@ -49,9 +49,25 @@
    #:make-audio-tap #:audio-tap #:audio-tap-p #:tap-next-frame #:tap-source #:tap-stop
    #:tap-report #:audio-tap-connected #:audio-tap-rate #:audio-tap-frames #:audio-tap-drops
    #:audio-tap-underruns #:audio-tap-reconnects
+   ;; a peer's microphone, inbound (the :glass/mic-stream system) — receiver and sender
+   #:start-mic-stream #:stop-mic-stream #:start-session-mic #:mic-stream #:mic-stream-p
+   #:mic-stream-port #:mic-stream-report #:*mic-stream-port* #:*mic-rate* #:*mic-live-seconds*
+   #:*mic-gap-frames* #:session-mic #:*session-mic-stream*
+   #:mic #:mic-p #:mic-next-frame #:mic-source #:mic-live-p #:mic-report #:mic-name #:mic-rate
+   #:mic-frames #:mic-received #:mic-drops #:mic-underruns
+   #:make-mic-sender #:mic-send #:mic-feed #:mic-sender-stop #:mic-sender-report
+   #:mic-sender #:mic-sender-p #:mic-sender-connected #:mic-sender-sent #:mic-sender-dropped
+   #:mic-sender-offered #:mic-sender-reconnects
    ;; the voice (the :glass/speech system; chord-backed) — one speaker on the session mix
    #:speak #:hush #:speaking-p #:make-speaker #:session-speaker #:stop-speaker #:speech-report
    #:speaker #:speaker-p #:*session-speaker* #:*speech-voice* #:*speech-gain* #:*speech-gap-ms*
+   ;; the ear (the :glass/hearing system; stave-backed) — one sink on the same mix
+   #:start-listening #:stop-listening #:listening-p #:make-ears #:ears #:ears-p
+   #:hearing-text #:hearing-partial #:hearing-heard #:hearing-clear #:hearing-level
+   #:hearing-ready-p
+   #:hearing-report #:*session-ears* #:*hearing-models* #:*hearing-rate* #:*hearing-threshold*
+   #:*hearing-gap-seconds* #:*hearing-max-seconds* #:*hearing-preroll-seconds*
+   #:*hearing-prefer-mic*
    ;; standing perf counters (read a snapshot over the control socket)
    #:*perf-on* #:perf-reset #:perf-report #:perf-record-send #:perf-record-composite
    #:*send-lag* #:*send-queue*))
