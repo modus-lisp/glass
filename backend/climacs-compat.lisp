@@ -205,3 +205,57 @@
         (window-clear pane))
     (setf (esa::message pane) nil))
   (call-next-method))
+
+;;; ---- 6. Clicking in the text does nothing, because "window" is the event ---
+;;;
+;;; Climacs DOES have click-to-move-point, and it is the only layer that does:
+;;; Drei has no pointer hit-testing at all (its one pointer method is shift-
+;;; middle paste on the gadget), and ESA only routes.  Climacs defines
+;;; COM-SWITCH-TO-THIS-WINDOW (window-commands.lisp) plus a translator from the
+;;; BLANK-AREA presentation type, and CLICK-TO-OFFSET to turn (x, y) into a
+;;; buffer offset by counting lines from the view's TOP mark.
+;;;
+;;; The translator is written:
+;;;
+;;;   (define-presentation-to-command-translator blank-area-to-switch-to-this-window
+;;;       (blank-area com-switch-to-this-window window-table :echo nil)
+;;;       (window x y)
+;;;     (list window x y))
+;;;
+;;; but a translator arglist is (OBJECT &key presentation context-type frame
+;;; event window x y) — only the FIRST name is positional, and it always gets
+;;; the presentation's object no matter what it is called.  MAKE-TRANSLATOR-FUN
+;;; builds exactly (lambda (window &key x y &allow-other-keys) ...), so X and Y
+;;; arrive correctly by keyword and WINDOW is the object.
+;;;
+;;; And the object of a blank-area presentation is the POINTER EVENT
+;;; (MAKE-BLANK-AREA-PRESENTATION, standard-presentations.lisp: :object event).
+;;; So COM-SWITCH-TO-THIS-WINDOW is handed a POINTER-BUTTON-PRESS-EVENT where it
+;;; wants the pane, (buffer-pane-p window) is NIL, its WHEN never fires, and the
+;;; click is silently a no-op.  Nothing errors; point simply never moves — which
+;;; is why this one has no symptom other than "clicking doesn't do anything".
+;;;
+;;; Ask for the window by its keyword.  All three of Climacs' blank-area
+;;; translators have the same shape and the same bug, so all three are restated:
+;;; left click moves point, right click sets the mark and copies, middle click
+;;; yanks where you pointed.
+(define-presentation-to-command-translator
+    climacs-commands::blank-area-to-switch-to-this-window
+    (blank-area climacs-commands::com-switch-to-this-window climacs-gui::window-table
+     :echo nil)
+    (event window x y)
+  (list window x y))
+
+(define-presentation-to-command-translator
+    climacs-commands::blank-area-to-mouse-save
+    (blank-area climacs-commands::com-mouse-save climacs-gui::window-table
+     :echo nil :gesture :select-other)
+    (event window x y)
+  (list window x y))
+
+(define-presentation-to-command-translator
+    climacs-commands::blank-area-to-yank-here
+    (blank-area climacs-commands::com-yank-here climacs-gui::window-table
+     :echo nil :gesture :middle-button)
+    (event window x y)
+  (list window x y))

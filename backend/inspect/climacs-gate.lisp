@@ -5,8 +5,8 @@
 ;;;;
 ;;;; The root menu has offered "Editor (Climacs)" all along and it has never once
 ;;;; opened.  Five reasons, stacked one behind the other, each invisible until the
-;;;; one in front of it was gone — and then, once it opened, three more that made
-;;;; it die again a minute into being used:
+;;;; one in front of it was gone — and then, once it opened, four more that made
+;;;; it die again a minute into being used, or quietly not do what you asked:
 ;;;;
 ;;;;   1. Nobody loaded Climacs.  WM-EDIT resolves it by name at click time, so a
 ;;;;      missing system is not a missing menu item — it is a menu item that does
@@ -57,7 +57,14 @@
 ;;;;      thread for good, leaving the window drawn and unattended.  That is what
 ;;;;      "it locked up" was: not a hang, a corpse.
 ;;;;
-;;;;   3, 4, 6, 7 and 8 are fixed in backend/climacs-compat.lisp (system
+;;;;   9. Clicking in the text never moved the cursor.  Climacs' blank-area
+;;;;      translator names its first parameter WINDOW, but a translator's first
+;;;;      parameter is the presentation's OBJECT — and a blank-area presentation's
+;;;;      object is the pointer EVENT.  COM-SWITCH-TO-THIS-WINDOW got an event
+;;;;      where it wanted a pane, its guard failed, and the click was a silent
+;;;;      no-op.  All three of Climacs' mouse translators have it.
+;;;;
+;;;;   3, 4, 6, 7, 8 and 9 are fixed in backend/climacs-compat.lisp (system
 ;;;;   MCCLIM-GLASS/CLIMACS), which is what this gate loads and what a desktop
 ;;;;   should load.
 ;;;;
@@ -65,9 +72,10 @@
 ;;;; one, a medium that is not ours is still refused, and — the load-bearing ones —
 ;;;; a real Climacs reaches a real window on a real glass screen, is laid out to
 ;;;; the size of that window, takes the keyboard when raised, puts what is typed
-;;;; at it into its buffer, and is STILL doing all of that after an abort and
-;;;; after a C-x C-f onto a directory.  The frame runs in a thread whose condition
-;;;; is captured rather than left to take the image down.
+;;;; at it into its buffer, is STILL doing all of that after an abort and after a
+;;;; C-x C-f onto a directory, and moves point to the character you click on.
+;;;; The frame runs in a thread whose condition is captured rather than left to
+;;;; take the image down.
 (require :asdf)
 (load "~/quicklisp/setup.lisp")
 (defparameter *climacs-loaded*
@@ -123,6 +131,25 @@
      (coerce (funcall (find-symbol "BUFFER-SEQUENCE" "DREI-BUFFER") buf 0
                       (funcall (find-symbol "SIZE" "DREI-BUFFER") buf))
              'string))))
+
+(defun climacs-point (port)
+  "The offset of point in Climacs' current view, or NIL."
+  (ignore-errors
+   (funcall (find-symbol "OFFSET" "DREI-BUFFER")
+            (funcall (find-symbol "POINT" "DREI")
+                     (funcall (find-symbol "VIEW" "CLIM")
+                              (funcall (find-symbol "ESA-CURRENT-WINDOW" "ESA")
+                                       (climacs-frame port)))))))
+
+(defun click-at (port sheet mirror dx dy)
+  "A full left click DX,DY pixels into SHEET's own area, addressed the way the RFB
+   client does: screen coordinates, through GLASS-ON-POINTER."
+  (let* ((reg (sheet-native-region sheet))
+         (sx (round (+ (glass-mirror-x mirror) (bounding-rectangle-min-x reg) dx)))
+         (sy (round (+ (glass-mirror-y mirror) (bounding-rectangle-min-y reg) dy))))
+    (glass-on-pointer port 0 sx sy) (sleep 1/5)   ; move there
+    (glass-on-pointer port 1 sx sy) (sleep 1/5)   ; press
+    (glass-on-pointer port 0 sx sy) (sleep 1/2))) ; release
 
 (defun sheet-under-p (sheet ancestor)
   (loop for s = sheet then (sheet-parent s)
@@ -371,7 +398,41 @@
                          (glass-on-key port nil (char-code c)) (sleep 1/40))
                 (wait-until (lambda () (search probe (or (climacs-text port) ""))) 10)
                 (check (search probe (or (climacs-text port) ""))
-                       "C-x C-f on a directory name leaves an editor that still types"))))
+                       "C-x C-f on a directory name leaves an editor that still types"))
+
+              ;; --- 12. clicking in the text moves point ------------------------
+              ;; Climacs is the only layer that has click-to-move-point at all:
+              ;; Drei has no pointer hit-testing and ESA only routes.  Its
+              ;; translator names the first (positional) parameter WINDOW, but a
+              ;; translator's first parameter is always the presentation's OBJECT,
+              ;; and a blank-area presentation's object is the pointer EVENT.  So
+              ;; COM-SWITCH-TO-THIS-WINDOW was handed an event where it wanted the
+              ;; pane, BUFFER-PANE-P said no, and the click did nothing at all —
+              ;; no error, no message, just a cursor that stays where it was.
+              ;;
+              ;; Everything typed above went onto one line, so a column is an
+              ;; offset and we can ask for a specific one.  Addressed in SCREEN
+              ;; coordinates through GLASS-ON-POINTER, which is the same entry
+              ;; the RFB client uses.
+              (let* ((frame (climacs-frame port))
+                     (win (and frame (funcall (find-symbol "ESA-CURRENT-WINDOW" "ESA") frame)))
+                     (cw (and win (ignore-errors (stream-character-width win #\m))))
+                     (before (climacs-point port)))
+                (if (not (and win cw (plusp cw) before (plusp before)))
+                    (check nil "a buffer pane with text in it to click into (point ~a, char width ~a)"
+                           before cw)
+                    (progn
+                      (click-at port win m 2 4)
+                      (let ((after (climacs-point port)))
+                        (check (eql after 0)
+                               "clicking the first column moves point there (~a -> ~a)"
+                               before after))
+                      ;; ...and to WHERE you clicked, not merely somewhere
+                      (click-at port win m (+ (* 5 cw) 2) 4)
+                      (let ((after (climacs-point port)))
+                        (check (eql after 5)
+                               "clicking five characters in puts point at offset 5 (got ~a)"
+                               after)))))))
           ;; Last, because it is the only check whose answer arrives late: either
           ;; branch above has already spent its 20 seconds, so by here the frame has
           ;; either come up or died trying.

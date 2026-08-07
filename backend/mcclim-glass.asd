@@ -33,9 +33,12 @@ speech engine, so a desktop without a voice still loads the backend it draws wit
 them is a glass bug and a CLX desktop would meet all of them: ESA repaints its minibuffer while
 holding the output-history lock its own display loop took, and expires an old message the same
 illegal way a second after putting it up; Climacs' OVERLAYING-PANE lays out its content pane
-without resizing it; DIRECTORY-PATHNAME-P judges a path by its name and never by the disk; and
-ESA's command loop handles two conditions and lets every other one unwind the frame out of
-existence with its window still on the screen.  Loading THIS is how a desktop offers the menu
+without resizing it; DIRECTORY-PATHNAME-P judges a path by its name and never by the disk; ESA's
+command loop handles two conditions and lets every other one unwind the frame out of existence
+with its window still on the screen; and every one of Climacs' three mouse translators asks for
+the window in the parameter that a translator always fills with the presentation's object — which
+for a blank area is the pointer event — so clicking in the text moved nothing at all.  Loading
+THIS is how a desktop offers the menu
 entry: it brings in climacs and the corrections together, so there is no way to get the editor
 without them."
   :author "ynniv"
