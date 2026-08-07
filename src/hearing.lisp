@@ -125,6 +125,7 @@ a transcript further and further in the past, which is worse than a gap and a co
   (seconds 0d0 :type double-float)    ; audio actually decoded, not audio seen
   (loading nil)
   (ready nil)                         ; the model is loaded; the pull thread may start
+  (listeners '())                     ; (KEY . FN) run with the text of each finished utterance
   (last-error nil))
 
 (defvar *session-ears* nil)
@@ -385,7 +386,49 @@ encoder's lookahead, so an utterance that was never ended is an utterance missin
         (when (plusp (length text))
           (push text (ear-heard ear))
           (incf (ear-utterances ear))))
-      (setf (ear-listener ear) nil))))
+      (setf (ear-listener ear) nil)
+      (when (plusp (length text)) (%hearing-announce ear text)))))
+
+(defun %hearing-announce (ear text)
+  "Tell the ear's listener that an utterance FINISHED, with its final text.
+
+Only ever called with a flushed utterance, never a partial: a partial revises itself as more
+audio arrives (`AFTER EARLY NIGHT' becomes `AFTER EARLY NIGHTFALL'), and a consumer that TYPES
+what it is told — which is the one this exists for — cannot take a keystroke back.
+
+Called on the decode thread, outside the lock, so a listener may call back into the ear.  Each
+listener's errors are caught and recorded rather than raised, and caught PER LISTENER so one bad
+consumer costs neither the ear nor the listener after it: under --disable-debugger an unhandled
+condition on this thread would take the whole desktop down with it."
+  (dolist (l (sb-thread:with-mutex ((ear-lock ear)) (copy-list (ear-listeners ear))))
+    (handler-case (funcall (cdr l) text)
+      (serious-condition (e)
+        (setf (ear-last-error ear) (princ-to-string e))
+        (ignore-errors
+         (format *error-output* "~&glass hearing: listener ~a failed: ~a~%" (car l) e)
+         (force-output *error-output*))))))
+
+(defun hearing-listen (key fn &optional (ear *session-ears*))
+  "Call FN with the text of every utterance the ear FINISHES.  KEY identifies the listener for
+removal, and re-registering the same KEY replaces it — so a window that is opened twice, or a
+dictation mode switched on twice, cannot accumulate duplicates and type everything twice.
+
+Registered on the EAR rather than passed to MAKE-EARS because the ear is session-wide and shared:
+by the time a second consumer wants to hear utterances, the ear it must attach to already exists."
+  (when ear
+    (sb-thread:with-mutex ((ear-lock ear))
+      (setf (ear-listeners ear)
+            (cons (cons key fn) (remove key (ear-listeners ear) :key #'car :test #'equal))))
+    key))
+
+(defun hearing-unlisten (key &optional (ear *session-ears*))
+  "Drop the utterance listener registered under KEY.  Returns T if it was there."
+  (when ear
+    (sb-thread:with-mutex ((ear-lock ear))
+      (let ((hit (assoc key (ear-listeners ear) :test #'equal)))
+        (when hit
+          (setf (ear-listeners ear) (remove hit (ear-listeners ear)))
+          t)))))
 
 (defun %hearing-take (ear)
   "Everything queued, oldest first, in one go.  Batching is what lets the decoder catch up after
@@ -443,7 +486,10 @@ sink with an empty cushion, which is a hole in the audio exactly where the micro
 The decoder starts first and the puller waits for it to say READY.  Reading a quarter of a
 gigabyte of weights takes the better part of a minute, and audio pulled during it is audio that
 goes stale in the queue or — past the queue's bound — is dropped.  An ear that is not ready yet
-has heard nothing, which is the truth and is cheap to say."
+has heard nothing, which is the truth and is cheap to say.
+
+For the push half of the transcript — a consumer that must ACT on speech rather than display it,
+as dictation does — see HEARING-LISTEN."
   (let* ((frame (max 1 (round (* rate (mixer-period mixer)))))
          (sink (unless source
                  (mixer-subscribe mixer :name "ears" :rate rate :frame-samples frame :gain gain)))

@@ -149,6 +149,25 @@ dependency only of this system."
   :serial t
   :components ((:module "src" :serial t :components ((:file "hearing")))))
 
+(asdf:defsystem :glass/dictation
+  :description "The ear as a keyboard: what the desktop hears, TYPED into whatever window has
+focus.  Adds no input path — glass already has one in *KEY-INJECTOR*, which the RFB server fills
+with its own key callback, so an injected key takes the identical route a client's keypress takes
+(the WM's focused-surface rule, the terminal's pty write, the CLIM event queue) and nothing
+downstream can tell the difference.  This is the wiring between that and the ear, and it is three
+decisions: type only FINISHED utterances (a partial revises itself as audio arrives, and a
+keystroke cannot be taken back), sentence-case on the way out (the recognizer emits bare
+uppercase — HEARING-TEXT goes on saying what it really said, and only the typed copy is prettied
+up), and go deaf while the desktop's own voice is talking.  That last one is why this is a system
+and not three lines: an ear on the session mix hears the session's speaker, which is a
+demonstration right up until it is typing, and then it is a loop."
+  :version "0.0.1"
+  :author "ynniv"
+  :license "MIT"
+  :depends-on ("glass/hearing" "glass/clipboard")
+  :serial t
+  :components ((:module "src" :serial t :components ((:file "dictation")))))
+
 (asdf:defsystem :glass/term
   :description "A terminal emulator on glass: a real PTY + shell, an ANSI/VT
 parser, and a character grid rendered with scribe, served over VNC.  No xterm,

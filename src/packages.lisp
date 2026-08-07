@@ -64,10 +64,15 @@
    ;; the ear (the :glass/hearing system; stave-backed) — one sink on the same mix
    #:start-listening #:stop-listening #:listening-p #:make-ears #:ears #:ears-p
    #:hearing-text #:hearing-partial #:hearing-heard #:hearing-clear #:hearing-level
-   #:hearing-ready-p
+   #:hearing-ready-p #:hearing-listen #:hearing-unlisten
    #:hearing-report #:*session-ears* #:*hearing-models* #:*hearing-rate* #:*hearing-threshold*
    #:*hearing-gap-seconds* #:*hearing-max-seconds* #:*hearing-preroll-seconds*
    #:*hearing-prefer-mic*
+   ;; dictation (the :glass/dictation system) — the ear as a keyboard: finished utterances typed
+   ;; into the focused window through the same *KEY-INJECTOR* a clipboard paste goes through
+   #:start-dictation #:stop-dictation #:dictating-p #:dictation-text #:dictation-report
+   #:*dictating* #:*dictation-tail-seconds* #:*dictation-typed* #:*dictation-muted*
+   #:*dictation-last*
    ;; standing perf counters (read a snapshot over the control socket)
    #:*perf-on* #:perf-reset #:perf-report #:perf-record-send #:perf-record-composite
    #:*send-lag* #:*send-queue*))

@@ -32,9 +32,12 @@ speech engine, so a desktop without a voice still loads the backend it draws wit
 the session is saying.  The desktop's ear (glass/hearing) behind a text box and three buttons, as
 a McCLIM frame that registers itself in the workspace root menu.  OPTIONAL and separate from the
 backend for the same reason speak is — it is an application, and the only thing here that drags
-in a recognizer."
+in a recognizer.
+
+Carries the Dictate toggle, which is why it also depends on glass/dictation: the same ear, with
+its words going to the FOCUSED WINDOW as keystrokes instead of into this window's box."
   :author "ynniv"
   :license "MIT"
-  :depends-on ("mcclim" "glass/hearing")
+  :depends-on ("mcclim" "glass/hearing" "glass/dictation")
   :serial t
   :components ((:file "listen-app")))

@@ -53,6 +53,10 @@ and for one more: writing the box on every tick would fight the person editing i
    (listen :push-button :label "Listen" :text-style (ui-bold 14) :activate-callback 'on-listen)
    (stop   :push-button :label "Stop"   :text-style (ui-bold 14) :activate-callback 'on-stop)
    (clear  :push-button :label "Clear"  :text-style (ui-bold 14) :activate-callback 'on-clear)
+   ;; A TOGGLE and not a push-button, on its own row, because it is not an action on this window —
+   ;; it is a mode the whole desktop is in, and one whose effects land somewhere else entirely.
+   (dictate :toggle-button :label "Dictate into the focused window" :value nil
+            :text-style (ui-font 13) :value-changed-callback 'on-dictate)
    ;; :WIDTH and :MAX-WIDTH are not decoration.  An application pane asks for as much room as the
    ;; last thing drawn into it needed, and what is drawn here is the ear's own report — which
    ;; grows the moment there is anything to report.  Unpinned, the pane demands 680 px in a 560 px
@@ -67,6 +71,7 @@ and for one more: writing the box on every tick would fight the person editing i
     (clim:vertically (:spacing 6)
       (:fill transcript)
       (clim:horizontally (:spacing 8) listen stop clear)
+      dictate
       status))))
 
 ;;; ---- what the buttons do ---------------------------------------------------
@@ -102,6 +107,36 @@ on the next tick, which reads as a window that ignores its own button."
           (app-written frame) ""
           (clim:gadget-value (clim:find-pane-named frame 'transcript)) "")))
 
+(defun on-dictate (gadget value)
+  "Switch the desktop between watching what it hears and TYPING it.
+
+Starts the ear if there is not one, because a Dictate that quietly did nothing until you also
+pressed Listen would be a switch that lies.  Off is the reverse ONLY as far as dictation goes —
+it leaves the ear running, since the transcript is still worth having and stopping it is what the
+Stop button is for.
+
+The note is the important part of this callback.  Dictation types into whatever has focus, and
+what has focus at the moment you press this is almost certainly THIS window, whose box is already
+being written by the ticker.  So it says where to click."
+  (let ((frame (clim:pane-frame gadget)))
+    (cond
+      ((not value)
+       (glass:stop-dictation)
+       (setf (app-note frame) nil))
+      ((null glass:*hearing-models*)
+       (setf (clim:gadget-value gadget :invoke-callback nil) nil
+             (app-note frame) "No ear installed — set GLASS_EARS to a directory of stave graphs."))
+      ((null glass:*key-injector*)
+       ;; a desktop with no server has nothing to type into, and dictation would look like it
+       ;; worked while every word went nowhere
+       (setf (clim:gadget-value gadget :invoke-callback nil) nil
+             (app-note frame) "Nothing to type into — no VNC server is running on this session."))
+      (t
+       (glass:start-listening)
+       (glass:start-dictation)
+       (setf (app-note frame)
+             "Dictating — click the window the words should go into.")))))
+
 ;;; ---- the status line -------------------------------------------------------
 
 (defun %ear ()
@@ -115,6 +150,12 @@ what puts a sink on the mixer and reads a quarter of a gigabyte of weights."
         ((null (%ear)) "Idle")
         ((not (glass:listening-p (%ear))) "Stopped")
         ((not (glass:hearing-ready-p (%ear))) "Loading model...")
+        ;; dictation outranks `Hearing...' deliberately: where the words are GOING is the more
+        ;; surprising fact about the desktop, and the one you want to see at a glance before you
+        ;; start talking near it
+        ((glass:dictating-p) (if (plusp (length (glass:hearing-partial (%ear))))
+                                 "Dictating..."
+                                 "Dictating"))
         ((plusp (length (glass:hearing-partial (%ear)))) "Hearing...")
         (t "Listening")))
 
@@ -150,11 +191,13 @@ not going to be clipped anyway; what is gained is a pane that does not ask the l
 (defun draw-status (frame stream)
   (let* ((status (%status frame))
          (state (first status))
-         (hot (member state '("Hearing..." "Listening") :test #'string=)))
+         (hot (member state '("Hearing..." "Listening" "Dictating" "Dictating...")
+                      :test #'string=)))
     (setf (app-shown frame) status)
     (clim:draw-text* stream state 4 16
                      :text-style (ui-bold 14)
                      :ink (cond ((null glass:*hearing-models*) clim:+dark-red+)
+                                ((glass:dictating-p) (clim:make-rgb-color 0.75 0.35 0.0))
                                 ((string= state "Hearing...") clim:+dark-green+)
                                 (t clim:+black+)))
     ;; the meter, right of the headline: a track, the level, and a tick at the threshold the gate
@@ -270,7 +313,7 @@ for a window saying `Listening' about a silent room."
   "Run the window standalone (its own top level), for testing outside the desktop."
   (clim:run-frame-top-level (clim:make-application-frame 'listen-box :width width :height height)))
 
-(defun register (&key (label "Listen") (width 560) (height 360))
+(defun register (&key (label "Listen") (width 560) (height 400))
   "Put the window in the glass desktop's root menu.  Found by name, so loading this system in an
 image without the glass backend is not an error — the window is still usable through RUN."
   (let ((fn (and (find-package "CLIM-GLASS") (find-symbol "REGISTER-APP" "CLIM-GLASS"))))

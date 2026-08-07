@@ -117,7 +117,7 @@ click it by coordinate and a person cannot reach it at all."
            (multiple-value-bind (x y) (pane-point frame name)
              (declare (ignore y))
              (< 0 x width)))
-         '(listen stop clear)))
+         '(listen stop clear dictate)))
 
 (defun await (test &key (timeout 90))
   (let ((start (get-internal-real-time)))
@@ -171,9 +171,9 @@ click it by coordinate and a person cannot reach it at all."
 (check-that "and it says so" (string= "Idle" (glass-listen::%state))
             (glass-listen::%state))
 (check-that "every button is on the window" (buttons-inside-p *frame* 560)
-            (format nil "Listen ~d, Stop ~d, Clear ~d"
+            (format nil "Listen ~d, Stop ~d, Clear ~d, Dictate ~d"
                     (round (pane-point *frame* 'listen)) (round (pane-point *frame* 'stop))
-                    (round (pane-point *frame* 'clear))))
+                    (round (pane-point *frame* 'clear)) (round (pane-point *frame* 'dictate))))
 
 (cond
   ((null glass:*hearing-models*)
@@ -203,9 +203,9 @@ click it by coordinate and a person cannot reach it at all."
    ;; window spends its life in, and it is the one that used to push Clear off the edge
    (check-that "every button is STILL on the window with the ear reporting"
                (buttons-inside-p *frame* 560)
-               (format nil "Listen ~d, Stop ~d, Clear ~d"
+               (format nil "Listen ~d, Stop ~d, Clear ~d, Dictate ~d"
                        (round (pane-point *frame* 'listen)) (round (pane-point *frame* 'stop))
-                       (round (pane-point *frame* 'clear))))
+                       (round (pane-point *frame* 'clear)) (round (pane-point *frame* 'dictate))))
 
    (format t "~&-- 3. the box fills up -------------------------------------------------~%")
 
@@ -244,7 +244,30 @@ click it by coordinate and a person cannot reach it at all."
                (zerop (length (glass:hearing-text)))
                (format nil "the ear still holds ~s" (glass:hearing-text)))
 
-   (format t "~&-- 5. Stop -------------------------------------------------------------~%")
+   ;; The toggle only, not what it switches on — where the words GO is dictation-gate's job, and
+   ;; it takes a whole second window to answer honestly.  What is checked here is the half that
+   ;; belongs to this window: that a click reaches the mode, and that clicking it again leaves.
+   (format t "~&-- 5. Dictate ----------------------------------------------------------~%")
+
+   (multiple-value-bind (x y) (pane-point *frame* 'dictate)
+     (format t "     (Dictate at ~d,~d)~%" (round x) (round y))
+     (check-that "the desktop is not dictating until asked" (not (glass:dictating-p))
+                 (glass:dictation-report))
+     (click *client* x y)
+     (check-that "clicking Dictate puts the desktop in dictation mode"
+                 (await #'glass:dictating-p :timeout 20)
+                 (glass:dictation-report))
+     (check-that "and the window says where the words are going"
+                 (member (glass-listen::%state) '("Dictating" "Dictating...") :test #'string=)
+                 (format nil "~a — ~a" (glass-listen::%state) (glass-listen::%detail *frame*)))
+     (click *client* x y)
+     (check-that "clicking it again stops dictating, leaving the ear listening"
+                 (and (await (lambda () (not (glass:dictating-p))) :timeout 20)
+                      glass:*session-ears*
+                      (glass:listening-p))
+                 (format nil "~a | ~a" (glass:dictation-report) (glass:hearing-report))))
+
+   (format t "~&-- 6. Stop -------------------------------------------------------------~%")
 
    (let ((mixer (glass:session-mixer)))
      (multiple-value-bind (x y) (pane-point *frame* 'stop)
