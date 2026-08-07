@@ -255,6 +255,14 @@ one kind of text it is safe to break anywhere there is a space."
   ;; the wrapped one would make every resize look like new speech.
   (let* ((frame clim:*application-frame*)
          (text (glass:hearing-text)))
+    ;; The Dictate button is a view of a DESKTOP-WIDE mode, not a thing this window owns, and the
+    ;; mode can go off without anyone touching the button — pressing Stop takes the ear away, and
+    ;; dictation goes with it.  So the toggle follows the desktop here rather than remembering
+    ;; what it was last clicked to.  :INVOKE-CALLBACK NIL because this is the button catching up
+    ;; with the truth, not a person asking for something.
+    (let ((toggle (clim:find-pane-named frame 'dictate)))
+      (unless (eq (and (clim:gadget-value toggle) t) glass:*dictating*)
+        (setf (clim:gadget-value toggle :invoke-callback nil) glass:*dictating*)))
     (unless (equal text (app-written frame))
       (let ((pane (clim:find-pane-named frame 'transcript)))
         (setf (app-written frame) text

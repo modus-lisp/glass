@@ -32,10 +32,17 @@
 
 (in-package #:glass)
 
-(defparameter *speech-voice* (sb-ext:posix-getenv "GLASS_VOICE")
+(defvar *speech-voice* (sb-ext:posix-getenv "GLASS_VOICE")
   "Path to the chord .graph to speak with; GLASS_VOICE by default.  The voice's .bin and
 .config.json are expected beside it.  NIL means the desktop has no voice installed, and SPEAK
-says so rather than guessing at a path.")
+says so rather than guessing at a path.
+
+DEFVAR and not DEFPARAMETER, which is the difference between a knob and a tunable: a launcher
+sets this AFTER loading us (desktop-5903.lisp does, because the path is the machine's and not the
+environment's), and DEFPARAMETER would quietly hand it back its default every time this file was
+hot-loaded.  The desktop would then report no voice installed while the voice sat on disk where
+it always was — a failure that reads as the feature being broken rather than a variable being
+reset.  Nothing here ever wants a reload to change a running desktop's deployment.")
 
 (defparameter *speech-gap-ms* 220
   "Silence inserted between sentences.  Each is synthesized on its own, so without this they

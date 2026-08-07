@@ -50,9 +50,13 @@
 
 (in-package #:glass)
 
-(defparameter *hearing-models* (sb-ext:posix-getenv "GLASS_EARS")
+(defvar *hearing-models* (sb-ext:posix-getenv "GLASS_EARS")
   "Directory holding stave's three .graph files and tokens.txt; GLASS_EARS by default.  NIL
-means the desktop has no ear installed, and LISTEN says so rather than guessing at a path.")
+means the desktop has no ear installed, and LISTEN says so rather than guessing at a path.
+
+DEFVAR and not DEFPARAMETER, for the reason given at *SPEECH-VOICE*: a launcher fills this in
+after load, and a hot-load of this file used to reset it, so the desktop lost its ear to a
+recompile and the Listen window said `no ear installed' with the models still on disk.")
 
 (defparameter *hearing-rate* 16000
   "The rate the recognizer is fed at.  Not a preference: it is the rate the model's filterbank
@@ -514,9 +518,25 @@ than loading a second quarter-gigabyte of weights and putting a second sink on t
   (sb-thread:with-mutex (*session-ears-lock*)
     (or *session-ears* (setf *session-ears* (make-ears :source source)))))
 
+(defun %stop-dictation-if-any ()
+  "Switch dictation off, IF this image has dictation at all.
+
+By FIND-SYMBOL, like %STAVE and %PEER-MIC and for the same reason: :glass/dictation sits above
+this file and must not be a dependency of it.  A desktop with no dictation has nothing to switch
+off and pays a failed symbol lookup for the privilege."
+  (let ((sym (find-symbol "STOP-DICTATION" "GLASS")))
+    (when (and sym (fboundp sym)) (ignore-errors (funcall sym)) t)))
+
 (defun stop-listening (&optional (ear *session-ears*))
   "Stop transcribing, keeping what was heard.  The sink goes with it — an ear that is not
-listening should not be one of the mix's consumers."
+listening should not be one of the mix's consumers.
+
+Dictation goes with it too, when the ear being stopped is the session's.  Dictation is a listener
+ON AN EAR: with the ear gone there is nothing to listen to, and *DICTATING* left true is a switch
+that reads as on while no word can reach it — the Listen window went on showing `Dictating' at a
+desktop that had no ear at all.  Worse, the next START-LISTENING is a DIFFERENT ear, with no
+dictation listener registered on it, so the lie would survive the fix for it."
+  (when (and ear (eq ear *session-ears*)) (%stop-dictation-if-any))
   (when ear
     (setf (ear-running ear) nil)
     ;; the puller first: it owes the decoder a final :END for whatever was being said, and the
