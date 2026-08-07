@@ -154,7 +154,11 @@
    ;; keeps the selection context menu off windows with nothing to offer it.
    (selection-fn :initarg :selection-fn :initform nil  :accessor wm-surface-selection-fn)
    ;; consecutive per-frame poll/draw errors (see WM-NOTE-SURFACE-ERROR)
-   (err-count :initarg :err-count :initform 0          :accessor wm-surface-err-count)))
+   (err-count :initarg :err-count :initform 0          :accessor wm-surface-err-count)
+   ;; Place in the ONE stacking order shared with McCLIM windows.  Same slot, same
+   ;; accessor name as GLASS-MIRROR's, so WM-STACKING-ORDER can order a list holding
+   ;; both kinds without a single type test.
+   (z         :initarg :z         :initform 0          :accessor wm-window-z)))
 
 (defun make-wm-surface (&rest initargs)
   "Make a surface window.  Keyword-for-keyword what the DEFSTRUCT constructor took,
@@ -307,17 +311,53 @@
   "Is box INNER entirely within box OUTER?"
   (and inner outer (equal inner (wm-box-intersect inner outer))))
 
-(defun wm-boxes-above-surface (port surf)
-  "The (x y w h) boxes of everything WM-COMPOSITE draws AFTER SURF — i.e. everything
-   whose pixels can sit on top of SURF's on the screen.  The surface list is composited
-   in REVERSE, so the surfaces listed BEFORE SURF are the ones above it; every McCLIM
-   window is drawn before any surface, so none is ever above one; and the drag
-   wireframe and the open menu chain go on last of all.  A surface that somehow isn't
-   in the list yields the whole list, which errs towards refusing."
+;;; ---- one z-order ------------------------------------------------------------
+;;;
+;;; There used to be two: the McCLIM mirrors were composited, and then the surface
+;;; windows were composited on top of them, unconditionally.  Two stacks is not a
+;;; z-order — it is two z-orders plus a rule about which one wins, and no amount of
+;;; clicking can argue with the rule.  A McCLIM window could not be raised above a
+;;; terminal, however recently you had touched it, because "above" was decided by what
+;;; kind of window it was.  Both kinds now carry a Z and there is one order.
+
+(defun wm-stacking-order (port)
+  "Every window on the screen, topmost first.  THE answer to what is above what — asked
+   by the compositor, the pointer, and the occlusion guards, so that the pixels, the
+   clicks and the CopyRect refusals cannot disagree about the stack.
+
+   Unmanaged McCLIM mirrors — pull-down menus, submenus, tooltips — are not in the
+   shared order at all: they sit above it, always.  They are transient parts of the
+   window that opened them and are dismissed by the next click, and a menu that can be
+   covered is not a menu.  Under the old two-stack rule they were the same bug in a
+   worse form, since a pull-down opened over a terminal rendered UNDER the terminal."
+  (let ((mirrors (glass-port-mirrors port)))
+    (append (remove-if #'glass-mirror-managed mirrors)               ; pop-up tier, on top
+            (sort (append (remove-if-not #'glass-mirror-managed mirrors)
+                          (copy-list (glass-port-surfaces port)))
+                  #'> :key #'wm-window-z))))
+
+(defun wm-topmost (port)
+  "The frontmost window a click can raise: the top of the shared order, skipping the
+   pop-up tier, which nobody raises and which is gone by the time the click lands."
+  (find-if (lambda (w) (or (wm-surface-p w) (glass-mirror-managed w)))
+           (wm-stacking-order port)))
+
+(defun wm-boxes-above (port obj)
+  "The (x y w h) boxes of everything WM-COMPOSITE draws AFTER OBJ — i.e. everything
+   whose pixels can sit on top of OBJ's on the screen.  WM-STACKING-ORDER is topmost
+   first, so the windows listed BEFORE OBJ are the ones above it, of either kind; the
+   drag wireframe and the open menu chain go on last of all.  A window that somehow
+   isn't in the order yields the whole list, which errs towards refusing.
+
+   This used to be WM-BOXES-ABOVE-SURFACE and used to say `every McCLIM window is drawn
+   before any surface, so none is ever above one'.  That was true, and it was the bug:
+   it is what made a McCLIM window unable to come to the front.  Now that a mirror CAN
+   be above a surface, it has to be counted here, or a terminal scrolling under a text
+   window would CopyRect the window's pixels along with its own."
   (let ((boxes '()))
-    (loop for s in (glass-port-surfaces port)
-          until (eq s surf)
-          do (when-let ((b (wm-window-box s))) (push b boxes)))
+    (loop for w in (wm-stacking-order port)
+          until (eq w obj)
+          do (when-let ((b (wm-window-box w))) (push b boxes)))
     (when (glass-port-drag-wire port)
       (when-let ((b (glass-port-drag-wire-box port))) (push b boxes)))
     (when-let ((menu (glass-port-menu port)))
@@ -333,7 +373,7 @@
    and answered in one place: both the wire CopyRect and the in-RAM screen translation
    ask it, of different rectangles, so that the two verdicts can differ in strictness
    without ever differing in what 'above' means."
-  (let ((above (wm-boxes-above-surface port surf)))
+  (let ((above (wm-boxes-above port surf)))
     (and above
          (some (lambda (b) (some (lambda (a) (wm-boxes-overlap-p a b)) above))
                (remove nil boxes))
@@ -547,9 +587,10 @@
    candidate.  What is left is whatever is stacked ABOVE this surface, which is exactly
    what the occlusion verdict rules on."
   (when box
-    (find-if (lambda (s) (and (wm-surface-copy-p s)
-                              (wm-box-inside-p box (wm-window-box s))))
-             (glass-port-surfaces port))))
+    (find-if (lambda (w) (and (wm-surface-p w)
+                              (wm-surface-copy-p w)
+                              (wm-box-inside-p box (wm-window-box w))))
+             (wm-stacking-order port))))
 
 (defun wm-paint-strip (surf fb copy allowed)
   "Paint SURF's window as the translation COPY (sx sy dx dy w h) of what FB already
@@ -598,12 +639,12 @@
     (if (glass-port-bg port)
         (blit-fb (glass-port-bg port) 0 0 fb)                  ; desktop wallpaper
         (glass:fb-fill fb +wm-teal+)))
-  (dolist (mirror (reverse (glass-port-mirrors port)))        ; McCLIM windows (bottom-to-top)
-    (ignore-errors                                            ; a bad window draws nothing, not a crash
-     (if (glass-mirror-managed mirror) (wm-draw-window mirror fb) (blit-mirror mirror fb))))
-  (dolist (surf (reverse (glass-port-surfaces port)))         ; surface windows, on top
-    (handler-case (wm-draw-surface surf fb port)              ; isolate each surface's draw
-      (error (e) (wm-note-surface-error port surf e))))       ; skip it this frame; cull if persistent
+  (dolist (w (reverse (wm-stacking-order port)))              ; every window, bottom-to-top
+    (if (wm-surface-p w)
+        (handler-case (wm-draw-surface w fb port)             ; isolate each surface's draw
+          (error (e) (wm-note-surface-error port w e)))       ; skip it this frame; cull if persistent
+        (ignore-errors                                        ; a bad window draws nothing, not a crash
+         (if (glass-mirror-managed w) (wm-draw-window w fb) (blit-mirror w fb)))))
   (when-let ((b (and (glass-port-drag-wire port) (glass-port-drag-wire-box port))))  ; wireframe outline
     (destructuring-bind (x y w h) b
       (glass:fb-frame fb x y w h glass:+white+ 2)             ; white + inner black = visible on any bg
@@ -727,10 +768,17 @@
                         (climi::update-mirror-geometry sheet)))))))
 
 (defun wm-hit (port x y)
-  "Topmost window (surfaces are above mirrors) whose decoration or content contains
-   (X,Y): (values obj REGION cx cy cw ch), REGION one of :winmenu (title-bar menu
-   button) / :resize (bottom-right corner grab) / :title / :content; NIL over the
-   workspace."
+  "Topmost window whose decoration or content contains (X,Y): (values obj REGION cx cy
+   cw ch), REGION one of :winmenu (title-bar menu button) / :resize (bottom-right corner
+   grab) / :title / :content; NIL over the workspace.
+
+   Walks WM-STACKING-ORDER, the same order the compositor draws in, so the window you
+   click is the window you can see.  It walked surfaces first and mirrors second when
+   the compositor drew them that way; the two had to change together, since a pointer
+   that disagrees with the pixels sends clicks to a window that is not there.
+
+   Unmanaged mirrors are skipped, as they always were: a CLIM pull-down gets its events
+   through the grab-sheet path, not through the WM's hit test."
   (flet ((test (cx cy cw ch obj)
            (let ((ty (- cy +wm-titleh+)) (rz 16))
              (cond
@@ -740,22 +788,42 @@
                 (list obj :resize cx cy cw ch))
                ((and (<= cx x (+ cx cw)) (<= cy y (+ cy ch))) (list obj :content cx cy cw ch))
                ((and (<= cx x (+ cx cw)) (<= ty y cy)) (list obj :title cx cy cw ch))))))
-    (dolist (surf (glass-port-surfaces port))
-      (let ((hit (test (wm-surface-x surf) (wm-surface-y surf)
-                       (glass:fb-width (wm-surface-fb surf)) (glass:fb-height (wm-surface-fb surf)) surf)))
-        (when hit (return-from wm-hit (values-list hit)))))
-    (dolist (mirror (glass-port-mirrors port))
-      (when (glass-mirror-managed mirror)
-        (when-let ((image (mcclim-render::image-mirror-image mirror)))
-          (multiple-value-bind (cw ch) (image-wh image)
-            (let ((hit (test (glass-mirror-x mirror) (glass-mirror-y mirror) cw ch mirror)))
-              (when hit (return-from wm-hit (values-list hit))))))))))
+    (dolist (w (wm-stacking-order port))
+      (let ((hit (cond
+                   ((wm-surface-p w)
+                    (test (wm-surface-x w) (wm-surface-y w)
+                          (glass:fb-width (wm-surface-fb w)) (glass:fb-height (wm-surface-fb w)) w))
+                   ((glass-mirror-managed w)
+                    (when-let ((image (mcclim-render::image-mirror-image w)))
+                      (multiple-value-bind (cw ch) (image-wh image)
+                        (test (glass-mirror-x w) (glass-mirror-y w) cw ch w)))))))
+        (when hit (return-from wm-hit (values-list hit)))))))
 
 (defun wm-raise (port obj)
-  "Move OBJ to the top of its z-order (surfaces and mirrors are separate stacks)."
-  (if (wm-surface-p obj)
-      (setf (glass-port-surfaces port) (cons obj (remove obj (glass-port-surfaces port))))
-      (setf (glass-port-mirrors port) (cons obj (remove obj (glass-port-mirrors port))))))
+  "Move OBJ to the front of the one stacking order, whichever kind of window it is,
+   and — for a McCLIM window — give it the keyboard.
+
+   The second half is the window manager's job and there was nobody else to do it.
+   McCLIM routes keyboard events by PORT-KEYBOARD-INPUT-FOCUS, ignoring the sheet on
+   the event whenever that is set (Core/windowing/ports.lisp), and the only thing
+   that ever set it was an application grabbing focus for itself.  On CLX the X
+   server is what tells CLIM the focus moved; here there is no X server, so a second
+   application could come up, draw, and never receive a key — the first one to grab
+   focus kept it for the session.  Climacs is what made that plain, having the manners
+   to grab focus onto its minibuffer the moment it started reading.
+
+   A WINDOW-MANAGER-FOCUS-EVENT is the sanctioned way to say it: TOP-LEVEL-SHEET-MIXIN
+   handles it by setting the port focus, and it does so on the CLIM thread rather than
+   from whatever thread noticed the click.  We post it rather than setting the focus
+   here for exactly that reason.
+
+   Surfaces are not McCLIM windows and take the keyboard the other way, through
+   GLASS-PORT-FOCUS-SURFACE, which the caller sets."
+  (setf (wm-window-z obj) (incf (glass-port-zclock port)))
+  (unless (wm-surface-p obj)
+    (when-let ((sheet (glass-mirror-sheet obj)))
+      (when (typep sheet 'climi::top-level-sheet-mixin)
+        (enqueue port (make-instance 'climi::window-manager-focus-event :sheet sheet))))))
 
 (defun wm-close (port obj)
   "Close window OBJ: tear down a surface's content (kill its shell) and drop it, or
@@ -784,10 +852,14 @@
 ;;; the mouseless Move/Resize are out of scope (no icon strip; we drag/corner).
 
 (defun wm-lower (port obj)
-  "Back: send OBJ behind all other windows in its stack."
-  (if (wm-surface-p obj)
-      (setf (glass-port-surfaces port) (append (remove obj (glass-port-surfaces port)) (list obj)))
-      (setf (glass-port-mirrors port) (append (remove obj (glass-port-mirrors port)) (list obj))))
+  "Back: send OBJ behind every other window — of either kind, now that there is only
+   one stack for it to go to the back of.
+
+   One below the current minimum rather than a counter of its own: Back is rare, the
+   windows are few, and a second counter is a second thing that can drift out of step
+   with the first."
+  (setf (wm-window-z obj)
+        (1- (reduce #'min (wm-stacking-order port) :key #'wm-window-z :initial-value 0)))
   (composite-all port))
 
 (defun wm-fullsize (port obj)
@@ -1096,7 +1168,12 @@
             (when (wm-surface-on-pointer obj) (funcall (wm-surface-on-pointer obj) mask (- x cx) (- y cy))))
            (t                                                 ; content of a McCLIM window
             (when down (setf (glass-port-focus-surface port) nil))   ; keyboard back to CLIM
-            (when (and down (not (eq obj (first (glass-port-mirrors port)))))
+            ;; Raise unless it is already the frontmost window — which now means
+            ;; frontmost of ALL windows, not merely of the McCLIM ones.  Against the
+            ;; old mirrors-only test, clicking a McCLIM window that sat under a
+            ;; terminal did nothing: it was already first among mirrors, so no raise
+            ;; and no composite, and the window stayed buried.
+            (when (and down (not (eq obj (wm-topmost port))))
               (wm-raise port obj) (composite-all port))
             (emit-pointer-events port (glass-mirror-sheet obj) mask (- x cx) (- y cy)))))))))
 
@@ -1105,6 +1182,7 @@
 (defun wm-add-surface* (port surf)
   (setf (glass-port-cascade port) (mod (+ (glass-port-cascade port) 28) 200))
   (push surf (glass-port-surfaces port))
+  (wm-raise port surf)                   ; a new window opens on top of everything
   (setf (glass-port-focus-surface port) surf)
   surf)
 

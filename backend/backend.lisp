@@ -34,6 +34,10 @@
    (drag-wire-box :initform nil :accessor glass-port-drag-wire-box)  ; the moving outline's (x y w h)
    (cascade  :initform 0   :accessor glass-port-cascade)      ; next window placement offset
    (surfaces :initform '() :accessor glass-port-surfaces)     ; non-McCLIM windows (e.g. terminals)
+   ;; Hands out the next z.  MIRRORS and SURFACES record MEMBERSHIP; neither records
+   ;; stacking any more, because where a window sits in the stack is not a property of
+   ;; which kind of window it is.  See WM-STACKING-ORDER.
+   (zclock   :initform 0   :accessor glass-port-zclock)
    (focus-surface :initform nil :accessor glass-port-focus-surface)  ; surface grabbing the keyboard
    (grab-sheet :initform nil :accessor glass-port-grab-sheet)  ; McCLIM sheet grabbing the pointer (menu tracking)
    (menu     :initform nil :accessor glass-port-menu)         ; open workspace root menu, or nil
@@ -108,7 +112,12 @@
    (title   :initform "" :accessor glass-mirror-title)
    (sheet   :initform nil :accessor glass-mirror-sheet)      ; backref (WM pointer routing)
    (deco    :initform nil :accessor glass-mirror-deco)       ; cached (image . width) title bar
-   (deco-w  :initform -1 :accessor glass-mirror-deco-w)))
+   (deco-w  :initform -1 :accessor glass-mirror-deco-w)
+   ;; Place in the ONE stacking order shared with surface windows.  The accessor is
+   ;; named for a window and not for a mirror on purpose: WM-SURFACE carries the same
+   ;; slot under the same name, which is what lets the compositor order both kinds
+   ;; together without asking either one what it is.
+   (z       :initform 0   :accessor wm-window-z)))
 
 (defconstant +wm-titleh+ 22 "OPEN LOOK title-bar height (px).")
 (defconstant +wm-border+ 1  "Window border thickness (px).")
@@ -121,6 +130,11 @@
       (when (null (glass-port-top port))                     ; first top-level = the main frame
         (setf (glass-port-top port) sheet (glass-mirror-main mirror) t))
       (push mirror (glass-port-mirrors port))
+      ;; A new window opens on top, which is where the shared z-order gets its first
+      ;; value.  It matters that this is here and not in the WM clause below: an
+      ;; UNMANAGED mirror (a pull-down, a tooltip) never reaches that clause, and a
+      ;; window with no z would sort as though it opened before everything.
+      (setf (wm-window-z mirror) (incf (glass-port-zclock port)))
       ;; window-manager mode: decorate managed frames + give them a cascaded slot
       (when (and (glass-port-wm-p port)
                  (not (typep sheet 'climi::unmanaged-sheet-mixin)))
@@ -377,27 +391,60 @@
      (error (e) (format *trace-output* "~&[glass] event error: ~a: ~a~%" (type-of e) e)
        (force-output *trace-output*))))
 
+(defun glass-key-sheet (port)
+  "The sheet a keystroke is addressed to when nothing has claimed the keyboard.
+
+   Mostly nothing reads this.  DISTRIBUTE-EVENT ignores a keyboard event's sheet
+   whenever PORT-KEYBOARD-INPUT-FOCUS is set (Core/windowing/ports.lisp), and on a
+   desktop something has focus almost always — WM-RAISE gives it to whatever window
+   you brought to the front.  This is the answer before the first raise: at startup,
+   and after the focused window goes away.
+
+   It used to be GLASS-PORT-TOP, the FIRST top-level sheet the port ever realized,
+   which is a reasonable default only for a session that has one window.  The front
+   window is the better guess for the same reason it is the right answer after a
+   raise.  The pop-up tier (pull-downs, tooltips) is skipped: those are transient
+   parts of the window that opened them and they are driven by the pointer.  With no
+   managed window, or with no window manager at all, this is GLASS-PORT-TOP exactly
+   as before."
+  (or (and (glass-port-wm-p port)
+           (let ((front (first (sort (remove-if-not #'glass-mirror-managed
+                                                    (copy-list (glass-port-mirrors port)))
+                                     #'> :key #'wm-window-z))))
+             (and front (glass-mirror-sheet front))))
+      (glass-port-top port)))
+
 (defun glass-on-key (port down-p keysym)
   (with-reported-errors
   ;; a focused surface window (e.g. a terminal) grabs the keyboard entirely
   (when (and (glass-port-wm-p port) (glass-port-focus-surface port))
     (funcall (wm-surface-on-key (glass-port-focus-surface port)) down-p keysym)
     (return-from glass-on-key))
-  (let ((mod (cdr (assoc keysym *modifier-keysyms*))))
+  (let ((mod (cdr (assoc keysym *modifier-keysyms*)))
+        (sheet (glass-key-sheet port)))
     (cond
       (mod (setf (glass-port-mods port)
                  (if down-p (logior (glass-port-mods port) mod)
                      (logandc2 (glass-port-mods port) mod))))
-      ((glass-port-top port)
+      (sheet
        (multiple-value-bind (name char) (keysym->clim keysym)
-         (enqueue port
-                  (make-instance (if down-p 'key-press-event 'key-release-event)
-                                 :key-name name
-                                 :key-character (and down-p char)
-                                 :sheet (glass-port-top port)
-                                 :x (glass-port-px port) :y (glass-port-py port)
-                                 :modifier-state (glass-port-mods port)
-                                 :timestamp (next-timestamp port)))))))))
+         ;; A keysym we have no CLIM name and no character for is not a key
+         ;; press as far as anything upstream is concerned — it is an event
+         ;; whose only two interesting slots are both NIL.  A VNC client sends
+         ;; these for keys we do not model (Mode_switch, vendor keysyms a
+         ;; particular keyboard emits alongside the real one), and passing them
+         ;; on makes every gesture-matching loop in McCLIM and ESA consider a
+         ;; keystroke that did not happen.  Modifiers went the other way above
+         ;; and are already handled; drop the rest.
+         (when (or name char)
+           (enqueue port
+                    (make-instance (if down-p 'key-press-event 'key-release-event)
+                                   :key-name name
+                                   :key-character (and down-p char)
+                                   :sheet sheet
+                                   :x (glass-port-px port) :y (glass-port-py port)
+                                   :modifier-state (glass-port-mods port)
+                                   :timestamp (next-timestamp port))))))))))
 
 (defparameter *button-bits*
   `((1 . ,+pointer-left-button+) (2 . ,+pointer-middle-button+) (4 . ,+pointer-right-button+)))
