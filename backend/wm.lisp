@@ -1191,7 +1191,18 @@
                  (wm-open-selection-menu port obj x y))
             (composite-all port))
            ((wm-surface-p obj)                                ; content of a surface window
-            (when down (setf (glass-port-focus-surface port) obj) (wm-raise port obj) (composite-all port))
+            (when down
+              (setf (glass-port-focus-surface port) obj)
+              ;; Raise only if it is not already the frontmost window — the same guard
+              ;; the McCLIM branch below has, and for a bigger reason.  DOWN is true of
+              ;; every motion event with a button held, so a drag or a text selection
+              ;; INSIDE this window used to run a full-screen COMPOSITE-ALL per event:
+              ;; a whole-desktop repaint, marked as :FULL damage, which then makes the
+              ;; RFB sender diff the entire screen instead of the box that changed.  It
+              ;; painted the pixels that were already there, every time.  A window that
+              ;; is already on top has nothing to raise and nothing to repaint.
+              (unless (eq obj (wm-topmost port))
+                (wm-raise port obj) (composite-all port)))
             (when (wm-surface-on-pointer obj) (funcall (wm-surface-on-pointer obj) mask (- x cx) (- y cy))))
            (t                                                 ; content of a McCLIM window
             (when down (setf (glass-port-focus-surface port) nil))   ; keyboard back to CLIM
