@@ -15,9 +15,16 @@
 
 (defparameter *vnc* 5931)
 (defparameter *control* 4031)
+;; The browser window's size.  1100x700 fills a 1280x800 desktop, which is what a
+;; scroll measurement wants (the biggest possible moved block); a DRAG measurement
+;; needs the window to have somewhere to go, so it asks for a smaller one.
+(defparameter *win-w* 1100)
+(defparameter *win-h* 700)
 (let ((tail (cdr (member "--" sb-ext:*posix-argv* :test #'string=))))
   (when (first tail) (setf *vnc* (parse-integer (first tail))))
-  (when (second tail) (setf *control* (parse-integer (second tail)))))
+  (when (second tail) (setf *control* (parse-integer (second tail))))
+  (when (third tail) (setf *win-w* (parse-integer (third tail))))
+  (when (fourth tail) (setf *win-h* (parse-integer (fourth tail)))))
 
 (handler-bind ((warning #'muffle-warning))
   (let ((*standard-output* (make-broadcast-stream)))
@@ -86,5 +93,6 @@
 (finish-output *error-output*)
 
 (run-wm (list (list :browse (format nil "file://~a" (symbol-value 'cl-user::*page*))
-                    :width 1100 :height 700))
+                    :width (symbol-value 'cl-user::*win-w*)
+                    :height (symbol-value 'cl-user::*win-h*)))
         :port (symbol-value 'cl-user::*vnc*) :width 1280 :height 800)

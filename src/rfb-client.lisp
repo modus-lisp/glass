@@ -192,6 +192,13 @@
   ;; standing counters (REMOTE-REPORT)
   (frames 0) (bytes 0) (rects 0) (raw 0) (zrle 0) (copyrects 0)
   (hints 0) (hints-trimmed 0) (hints-refused 0) (connects 0) (drops 0)
+  ;; area accounting for the hints, in pixels: how much translation ARRIVED
+  ;; (COPY-PX), how much a later rectangle in the same update forced off it
+  ;; (TRIM-PX) or killed outright (REFUSE-PX), and how much the compositor
+  ;; actually got to move (TAKEN-PX over TAKEN takes).  The counts alone say a
+  ;; hint survived; only the areas say how much of it did — which is the whole
+  ;; question for a gesture whose exposed region is an L rather than a strip.
+  (copy-px 0) (trim-px 0) (refuse-px 0) (taken 0) (taken-px 0)
   (last-error nil)
   (last-frame 0)                            ; when the last update landed (stall clock)
   (t0 (get-internal-real-time)))
@@ -249,7 +256,11 @@
 (defun remote-take-copy (r)
   "The pending content translation, consumed — the wm-surface COPY-P.  See
    %NOTE-COPY for what makes a hint survive to be offered here."
-  (glass:fb-take-copy (remote-fb r)))
+  (let ((c (glass:fb-take-copy (remote-fb r))))
+    (when c
+      (incf (remote-taken r))
+      (incf (remote-taken-px r) (* (fifth c) (sixth c))))
+    c))
 
 (defun %box-overlap-p (a b)
   (destructuring-bind (ax ay aw ah) a
@@ -302,6 +313,7 @@
 
 (defun %note-copy (r copy)
   (when *pass-copyrect*
+    (incf (remote-copy-px r) (* (fifth copy) (sixth copy)))
     (let ((fb (remote-fb r)))
       (setf (glass:fb-copy fb) (%compose-copy (glass:fb-copy fb) copy)))))
 
@@ -346,9 +358,11 @@
                 (destructuring-bind (kx ky kw kh) keep
                   (setf (glass:fb-copy fb)
                         (list (+ sx (- kx dx)) (+ sy (- ky dy)) kx ky kw kh))
-                  (incf (remote-hints-trimmed r)))
+                  (incf (remote-hints-trimmed r))
+                  (incf (remote-trim-px r) (- (* w h) (* kw kh))))
                 (progn (setf (glass:fb-copy fb) nil)
-                       (incf (remote-hints-refused r))))))))))
+                       (incf (remote-hints-refused r))
+                       (incf (remote-refuse-px r) (* w h))))))))))
 
 ;;; ---- pixel decoding ---------------------------------------------------------
 ;;; We SetPixelFormat to glass's native 32bpp little-endian 0x00RRGGBB straight
@@ -773,6 +787,9 @@
         :copyrects (remote-copyrects r)
         :hints (remote-hints r) :hints-trimmed (remote-hints-trimmed r)
         :hints-refused (remote-hints-refused r)
+        :copy-px (remote-copy-px r) :trim-px (remote-trim-px r)
+        :refuse-px (remote-refuse-px r)
+        :taken (remote-taken r) :taken-px (remote-taken-px r)
         :connects (remote-connects r) :drops (remote-drops r)
         :queued (remote-qlen r) :last-error (remote-last-error r)
         :since-frame (if (plusp (remote-last-frame r))

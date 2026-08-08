@@ -379,6 +379,24 @@
                (remove nil boxes))
          t)))
 
+(defvar *wm-copy-tally* nil
+  "NIL, or a plist WM-SURFACE-SCREEN-COPY tallies its verdicts into — the only way to
+   tell a hint that was never offered from one the occlusion guard refused, which the
+   byte counters cannot distinguish.  Off by default and one test when off; a
+   measurement turns it on over the control socket (SETF it to a fresh list).  Keys:
+   :offered a hint arrived; :stale the window moved or resized under it so the screen
+   is no longer a base to translate; :empty it clipped away to nothing; :wire /
+   :wire-px it went on the RFB update; :wire-obstructed the guard refused it because
+   something is stacked over an end of the move; :screen / :screen-obstructed the same
+   verdict for the in-RAM strip path, which refuses more often.")
+
+(defun wm-copy-tally (key &optional (n 1))
+  "Add N to KEY's count, and return NIL always — this is called in tail position of a
+   branch that must answer 'no hint'."
+  (when *wm-copy-tally*
+    (incf (getf *wm-copy-tally* key 0) n))
+  nil)
+
 (defun wm-surface-screen-copy (port surf fb)
   "Take SURF's pending content translation and return it as a screen-space CopyRect
    hint (sx sy dx dy w h) for framebuffer FB — or NIL to refuse it.
@@ -433,6 +451,9 @@
     ;; that — and only that — makes the screen a base the next translation can read.
     (setf (wm-surface-copy-base surf)
           (and (equal content (wm-box-intersect content clip-box)) content))
+    (when hint
+      (wm-copy-tally :offered)
+      (unless (equal base content) (wm-copy-tally :stale)))
     (when (and hint *wm-scroll-copyrect* (equal base content))
       (destructuring-bind (hsx hsy hdx hdy hw hh) hint
         (let* ((ddx (- hdx hsx)) (ddy (- hdy hsy))
@@ -449,20 +470,26 @@
                            allowed)
                           (destructuring-bind (ax ay aw ah) allowed
                             (list (+ ax ddx) (+ ay ddy) aw ah))))))
-          (when (and dst (or (/= ddx 0) (/= ddy 0)))
-            (destructuring-bind (dx dy dw dh) dst
-              (let* ((src (list (- dx ddx) (- dy ddy) dw dh))
-                     (copy (list (first src) (second src) dx dy dw dh)))
-                (values
-                 ;; wire: refused only while the guard holds and something above sits on
-                 ;; one end of the move — the diff repairs it either way
-                 (unless (and *wm-copyrect-occlusion-guard*
-                              (wm-obstructed-p port surf src dst))
-                   copy)
-                 ;; screen: refused whenever anything above touches the region the strip
-                 ;; path writes, guard or no guard — nothing would repair it
-                 (unless (wm-obstructed-p port surf allowed) copy)
-                 allowed)))))))))
+          (if (and dst (or (/= ddx 0) (/= ddy 0)))
+              (destructuring-bind (dx dy dw dh) dst
+                (let* ((src (list (- dx ddx) (- dy ddy) dw dh))
+                       (copy (list (first src) (second src) dx dy dw dh))
+                       ;; wire: refused only while the guard holds and something above
+                       ;; sits on one end of the move — the diff repairs it either way
+                       (wire (unless (and *wm-copyrect-occlusion-guard*
+                                          (wm-obstructed-p port surf src dst))
+                               copy))
+                       ;; screen: refused whenever anything above touches the region the
+                       ;; strip path writes, guard or no guard — nothing repairs that
+                       (screen (unless (wm-obstructed-p port surf allowed) copy)))
+                  (when *wm-copy-tally*
+                    (wm-copy-tally :clipped-px (- (* hw hh) (* dw dh)))
+                    (if wire
+                        (progn (wm-copy-tally :wire) (wm-copy-tally :wire-px (* dw dh)))
+                        (wm-copy-tally :wire-obstructed))
+                    (if screen (wm-copy-tally :screen) (wm-copy-tally :screen-obstructed)))
+                  (values wire screen allowed)))
+              (wm-copy-tally :empty)))))))               ; clipped to nothing / a null move
 
 (defun wm-draw-surface (surf fb &optional port)
   "Draw SURF's decorated window into the screen framebuffer FB.  Given a PORT, also
