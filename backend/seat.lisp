@@ -43,11 +43,21 @@
 ;;;; which is what makes the one-seat case not merely equivalent to the old code but
 ;;;; the same code path.
 ;;;;
-;;;; One seat is PRIMARY and writes THROUGH to those slots instead of shadowing them.
-;;;; That is not a special case bolted on: McCLIM's sheet geometry is single-valued —
-;;;; a top-level sheet has one screen transformation, and its pull-downs and dialogs
-;;;; are placed from it — so somebody has to own the one position McCLIM believes in.
-;;;; The primary seat owns it.  See the McCLIM seam in backend.lisp.
+;;;; One seat is the HOME SEAT (its PRIMARY slot; SEAT-HOME-P) and writes THROUGH to
+;;;; those slots instead of shadowing them, so a window's own position goes on meaning
+;;;; the SESSION's arrangement — the default a seat sees until it diverges, and what
+;;;; somebody joining later finds on screen.  It is fixed at the first seat for the life
+;;;; of the session, and the same seat inherits everything else the session has exactly
+;;;; one of: GLASS:SESSION-CLIPBOARD, the session mixer's own mix, GLASS:*KEY-INJECTOR*,
+;;;; the RFB desktop name, and PORT-SEAT's default.  All of that is about a one-seat
+;;;; desktop being the old code path, and none of it follows anybody's mouse.
+;;;;
+;;;; It is NOT, any more, whose arrangement McCLIM believes in.  McCLIM's sheet geometry
+;;;; is single-valued — a top-level sheet has one screen transformation, and its
+;;;; pull-downs and dialogs are placed from it — so somebody has to own the one position
+;;;; McCLIM believes in, and that is whoever is DRIVING McCLIM right now, which travels
+;;;; with the CLIM token.  Those two were one seat and one word until clim-token.lisp
+;;;; separated them; its header says why exactly one of the three should move.
 
 (in-package #:clim-glass)
 
@@ -151,6 +161,33 @@
    (views    :initform (make-hash-table :test 'eq) :accessor seat-views))
   (:documentation "One person's screen, hands, and arrangement of a shared session."))
 
+;;; ---- the two questions that used to be one --------------------------------
+
+(defun seat-home-p (seat)
+  "Is SEAT the HOME seat — the one that inherits the resources a session has exactly one
+   of (the session clipboard, the session mix, the key injector, the desktop name,
+   PORT-SEAT's default) and whose window moves write the session's own arrangement?
+
+   Fixed at the first seat for the life of the session.  The preferred name for the
+   PRIMARY slot, which is kept under its old name because that is what every existing
+   call site says.  Deliberately NOT the same question as `is SEAT driving McCLIM' —
+   see CLIM-DRIVER-P and the header of clim-token.lisp."
+  (and seat (seat-primary-p seat)))
+
+(defun seat-mid-gesture-p (seat)
+  "Is SEAT in the middle of something that must not be interrupted?  A CLIM grab (a
+   pull-down or a tracking loop is following the one pointer), a window drag or resize in
+   flight, a window-manager menu posted, or simply a button held down.
+
+   This is what PINS the McCLIM token: a press from another seat during any of these
+   would teleport CLIM's single pointer out from under a gesture already running."
+  (and seat
+       (or (seat-grab-sheet seat)
+           (seat-drag seat)
+           (seat-menu seat)
+           (logtest (seat-buttons seat) 7))
+       t))
+
 (defmethod print-object ((seat seat) stream)
   (print-unreadable-object (seat stream :type t :identity t)
     (format stream "~s :~d ~dx~d~:[~; primary~]"
@@ -185,9 +222,13 @@
   (let ((v (and seat (seat-view seat window)))) (if v (view-z v) (window-own-z window))))
 
 (defun seat-move-window (seat window x y)
-  "Put WINDOW's content at (X,Y) FOR SEAT.  The primary seat writes the window's own
-   slots (so McCLIM's one idea of where the window is follows it); any other seat
-   materialises a view and moves only its own picture."
+  "Put WINDOW's content at (X,Y) FOR SEAT.  The HOME seat writes the window's own slots —
+   the session's arrangement, which every seat that has not diverged is reading — and any
+   other seat materialises a view and moves only its own picture.
+
+   McCLIM's idea of where the window is no longer rides on this.  It follows whoever is
+   DRIVING McCLIM, home seat or not, and is written separately (WM-SYNC-SHEET ->
+   CLIM-SHEET-GOTO)."
   (if (or (null seat) (seat-primary-p seat))
       (setf (window-own-x window) x (window-own-y window) y)
       (let ((v (seat-view seat window t)))

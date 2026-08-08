@@ -909,7 +909,7 @@ its bytes would land in the middle of a rect."
 ;;; ---- server -----------------------------------------------------------------
 
 (defun serve (fb port &key on-key on-pointer on-resize (name *desktop-name*) once wake
-                           (clipboard (session-clipboard)) (install-injector t))
+                           (clipboard (session-clipboard)) (install-injector t) on-clients)
   "Serve framebuffer FB over RFB on PORT.  ON-KEY (down-p keysym), ON-POINTER
    (button-mask x y) and ON-RESIZE (requested-w requested-h, from the client
    resizing its window) are optional callbacks.  With :ONCE, handle a single
@@ -926,8 +926,17 @@ its bytes would land in the middle of a rect."
    or a dictation types on when nobody named a seat.  A further seat's listener passes
    NIL: there is one *KEY-INJECTOR* and the last listener to start would otherwise own
    it, so the session's typing would land in the newest person's focused window.  The
-   seat keeps its own ON-KEY and hands it to whatever types for that seat."
-  (let ((listen (tcp-listen port)))
+   seat keeps its own ON-KEY and hands it to whatever types for that seat.
+
+   ON-CLIENTS (n) is called whenever a client of THIS listener arrives or goes away, with
+   the number still connected.  It exists so a caller can tell that NOBODY is watching
+   this screen any more: a seat with no viewers has no hands, and anything it was holding
+   on everybody else's behalf (see the McCLIM token in the backend) should be let go
+   rather than waiting out a timeout.  Called inside IGNORE-ERRORS — a callback must not
+   be able to take down the accept loop."
+  (let ((listen (tcp-listen port))
+        (live 0)
+        (live-lock (sb-thread:make-mutex :name "glass-rfb-clients")))
     ;; Paste's fallback consumer types the selection into whatever has focus, and the only path
     ;; that knows where focus IS, is the one a real keystroke takes.  So the callback the caller
     ;; gave us for client keys becomes the session's key injector: an injected key is
@@ -936,19 +945,24 @@ its bytes would land in the middle of a rect."
     (format *error-output* "~&glass: RFB server listening on port ~d (~dx~d)~%"
             port (fb-width fb) (fb-height fb))
     (force-output *error-output*)
-    (flet ((run (stream)
-             (unwind-protect
-                  (when (handshake fb stream name)     ; NIL = auth failed -> drop the client
-                    (client-loop fb stream on-key on-pointer on-resize wake clipboard))
-               (ignore-errors (close stream)))))
-      (unwind-protect
-           (loop
-             (let ((stream (accept-stream listen)))
-               (if once
-                   (progn (run stream) (return))
-                   (sb-thread:make-thread (lambda () (ignore-errors (run stream)))
-                                          :name "glass-client"))))
-        (ignore-errors (sb-bsd-sockets:socket-close listen))))))
+    (flet ((note-clients (delta)
+             (let ((n (sb-thread:with-mutex (live-lock) (incf live delta))))
+               (when on-clients (ignore-errors (funcall on-clients n))))))
+      (flet ((run (stream)
+               (note-clients 1)
+               (unwind-protect
+                    (when (handshake fb stream name)   ; NIL = auth failed -> drop the client
+                      (client-loop fb stream on-key on-pointer on-resize wake clipboard))
+                 (ignore-errors (close stream))
+                 (note-clients -1))))
+        (unwind-protect
+             (loop
+               (let ((stream (accept-stream listen)))
+                 (if once
+                     (progn (run stream) (return))
+                     (sb-thread:make-thread (lambda () (ignore-errors (run stream)))
+                                            :name "glass-client"))))
+          (ignore-errors (sb-bsd-sockets:socket-close listen)))))))
 
 (defun serve-one (fb port &rest args)
   "Serve exactly one client, then return (handy for tests)."

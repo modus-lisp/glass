@@ -41,10 +41,19 @@
       (ignore-errors (string (clim:frame-pretty-name (clim:pane-frame sheet))))
       "window"))
 
-(defun wm-render-titlebar (title width)
+(defparameter +wm-title-bg+ (glass:rgb 204 204 204) "OPEN LOOK title-bar grey.")
+(defparameter +wm-title-other-bg+ (glass:rgb 178 188 204)
+  "Title-bar grey for a CLIM window ON A SEAT THAT IS NOT DRIVING McCLIM — the holder
+   indicator (*CLIM-TOKEN-INDICATOR*, off by default).  The same value cooled towards
+   blue: enough to read as a state at a glance, not enough to look like a different
+   window manager.  It tints only the title bar, and only on the screens of the people
+   who are NOT driving, so the person actually using the application sees the desktop
+   they have always seen.")
+
+(defun wm-render-titlebar (title width &optional (bg +wm-title-bg+))
   "A glass framebuffer of an OPEN LOOK title bar WIDTH px wide — drawn entirely
    with glass primitives + scribe text (no McCLIM)."
-  (let ((tb (glass:make-framebuffer (max 1 width) +wm-titleh+ (glass:rgb 204 204 204))))
+  (let ((tb (glass:make-framebuffer (max 1 width) +wm-titleh+ bg)))
     (glass:fb-hline tb 0 (1- +wm-titleh+) width (glass:rgb 120 120 120))       ; bottom shadow line
     ;; menu button box: raised bevel + abbreviated-menu wedge
     (let* ((bs (- +wm-titleh+ 8)) (bx 4) (by 4))
@@ -61,12 +70,31 @@
                      :size 12 :color glass:+black+ :font (glass:default-font t)))
     tb))
 
-(defun wm-deco (mirror cw)
-  "Cached title-bar framebuffer for MIRROR at content width CW."
-  (when (or (null (glass-mirror-deco mirror)) (/= cw (glass-mirror-deco-w mirror)))
-    (setf (glass-mirror-deco mirror) (wm-render-titlebar (glass-mirror-title mirror) cw)
+(defun wm-deco (mirror cw &optional other)
+  "Cached title-bar framebuffer for MIRROR at content width CW.  With OTHER, the tinted
+   one a seat that is not driving McCLIM sees.  Both are cached and a width change drops
+   both; the tinted one is never rendered at all unless somebody asks for it, which with
+   the indicator off is never."
+  (unless (eql cw (glass-mirror-deco-w mirror))
+    (setf (glass-mirror-deco mirror) nil
+          (glass-mirror-deco-other mirror) nil
           (glass-mirror-deco-w mirror) cw))
-  (glass-mirror-deco mirror))
+  (if other
+      (or (glass-mirror-deco-other mirror)
+          (setf (glass-mirror-deco-other mirror)
+                (wm-render-titlebar (glass-mirror-title mirror) cw +wm-title-other-bg+)))
+      (or (glass-mirror-deco mirror)
+          (setf (glass-mirror-deco mirror)
+                (wm-render-titlebar (glass-mirror-title mirror) cw)))))
+
+(defun wm-driven-elsewhere-p (seat)
+  "Should SEAT's copy of a CLIM window's title bar say that somebody ELSE has the
+   application?  Always NIL unless *CLIM-TOKEN-INDICATOR* is on, and NIL for the driver
+   and for a free token — nobody driving is not somebody else driving."
+  (and *clim-token-indicator*
+       seat (seat-port seat)
+       (clim-token-elsewhere-p (seat-port seat) seat)
+       t))
 
 ;;; ---- compositing ------------------------------------------------------------
 
@@ -233,7 +261,8 @@
   (when-let ((image (mcclim-render::image-mirror-image mirror)))
     (multiple-value-bind (cw ch) (image-wh image)
       (wm-frame fb (seat-window-x seat mirror) (seat-window-y seat mirror) cw ch
-                (wm-deco mirror cw) (lambda () (blit-mirror mirror fb seat))))))
+                (wm-deco mirror cw (wm-driven-elsewhere-p seat))
+                (lambda () (blit-mirror mirror fb seat))))))
 
 ;;; ---- scroll CopyRect: a surface's content translation, mapped onto the screen ----
 ;;;
@@ -905,20 +934,18 @@
    thread (marshalled via the mailbox) — update-mirror-geometry touches sheet state.
    Surfaces have no McCLIM sheet, so they're skipped.
 
-   ONLY THE PRIMARY SEAT SYNCS.  A sheet transformation is single-valued and it is what
-   McCLIM places pull-downs and dialogs from, so it can track exactly one seat's idea of
-   where the window is; the primary seat's, which is also the only seat that writes the
-   window's own position.  A secondary seat dragging a McCLIM window therefore moves the
-   window ON ITS OWN SCREEN and leaves McCLIM's pop-up placement where the primary seat
-   has it — visible only if that seat then opens a pull-down, and the honest cost of a
-   single-pointer toolkit."
+   ONLY THE SEAT DRIVING McCLIM SYNCS, and it syncs to ITS OWN VIEW.  A sheet
+   transformation is single-valued and it is what McCLIM places pull-downs and dialogs
+   from, so it can track exactly one seat's idea of where the window is — but that seat
+   is whoever has their hand on the application, not a seat fixed at session start.  This
+   used to be the home seat unconditionally, which is where 'one at a time' turned into
+   'one forever': a second person could drag a CLIM window across their own screen and
+   still get its pull-downs at the first person's window position.  A NON-driving seat's
+   drag moves the window on its own screen and leaves McCLIM alone, and the geometry
+   comes to it the moment it takes the token (CLIM-RESYNC-GEOMETRY)."
   (unless (wm-surface-p obj)
-    (when (or (null seat) (seat-primary-p seat))
-      (when-let ((sheet (glass-mirror-sheet obj)))
-        (let ((x (window-own-x obj)) (y (window-own-y obj)))
-          (enqueue port (lambda ()
-                          (setf (sheet-transformation sheet) (make-translation-transformation x y))
-                          (climi::update-mirror-geometry sheet))))))))
+    (when (clim-driver-p port seat)
+      (clim-sheet-goto port obj (seat-window-x seat obj) (seat-window-y seat obj)))))
 
 (defun wm-hit (port x y &optional seat)
   "Topmost window whose decoration or content contains (X,Y) ON SEAT'S SCREEN: (values obj REGION cx cy
@@ -984,7 +1011,7 @@
         ;; McCLIM's keyboard focus is single-valued, so only the seat driving McCLIM may
         ;; move it; another seat raising a CLIM window raises it on its own screen and
         ;; leaves the focus with whoever is typing.
-        (when (mcclim-seat-p port seat)
+        (when (clim-driver-p port seat)
           (enqueue port (make-instance 'climi::window-manager-focus-event :sheet sheet)))))))
 
 (defun wm-close (port obj)
@@ -1297,7 +1324,9 @@
          (menu (find-if (lambda (m) (not (eq :outside (wm-menu-index m x y)))) (reverse chain))))
     (cond
       ((null menu)                                              ; off every menu
-       (when (logtest mask 5) (setf (seat-menu seat) nil) (composite-seat seat)))
+       (when (logtest mask 5)
+         (setf (seat-menu seat) nil) (composite-seat seat)
+         (clim-token-settle port seat)))       ; the menu pinned the token; it is gone
       (t
        (let ((idx (wm-menu-index menu x y)))
          (cond
@@ -1316,6 +1345,7 @@
                      (wm-open-submenu menu idx action seat) (composite-seat seat)))
                   (t                                            ; leaf: run + dismiss the whole tree
                    (setf (seat-menu seat) nil) (composite-seat seat)
+                   (clim-token-settle port seat)                ; …and it no longer pins
                    (when action (wm-menu-run port action seat)))))))
            (t                                                   ; over the title strip
             (unless (eql (wm-menu-hover menu) -1)
@@ -1351,9 +1381,23 @@
                         (composite-all port))))
            (unless down                                      ; release: end the drag
              (setf (seat-drag seat) nil)
-             (when (eq mode :move) (wm-sync-sheet port obj seat)))))  ; McCLIM's menu coords
+             (when (eq mode :move) (wm-sync-sheet port obj seat))   ; McCLIM's menu coords
+             ;; The drag pinned the token; it has landed, so a press somebody else made
+             ;; while it was in flight — held rather than obeyed — takes effect now.
+             (clim-token-settle port seat))))
         (t
          (multiple-value-bind (obj region cx cy cw ch) (wm-hit port x y seat)
+           ;; Two token questions, both answered from the hit test that was needed anyway.
+           ;; First: a driver whose pointer has left every CLIM window is no longer
+           ;; driving anything, so the token goes free for whoever is still in one.
+           (clim-token-follow-pointer port seat obj)
+           ;; Second: a press anywhere on a CLIM window — its title bar and its resize
+           ;; corner included — takes a FREE token, so that raising a window after a lull
+           ;; still moves CLIM's keyboard focus to it (WM-RAISE asks CLIM-DRIVER-P).  It
+           ;; does NOT contest a held one: taking the application out of somebody's hands
+           ;; is a press INSIDE the window, and grabbing a title bar is not that.
+           (when (and obj (not (wm-surface-p obj)) (logtest mask 7))
+             (clim-token-claim port seat))
            (cond
              ((and (null obj) (logtest mask 5))              ; press on workspace: root menu
               (wm-open-menu port x y seat) (composite-seat seat))
@@ -1405,6 +1449,18 @@
               (when (wm-surface-on-pointer obj)
                 (funcall (wm-surface-on-pointer obj) mask (- x cx) (- y cy))))
              (t                                              ; content of a McCLIM window
+              ;; ASKED FIRST, before the raise: this is the gesture that takes the McCLIM
+              ;; token, and WM-RAISE just below hands CLIM's keyboard focus to the window
+              ;; only if the asking seat is the driver.  Claiming after the raise (which
+              ;; is where the take used to happen, down inside EMIT-POINTER-EVENTS) meant
+              ;; a second seat's first click got the token but not the focus, and its
+              ;; typing went to whatever window the previous driver had raised.
+              ;;
+              ;; MAY is NIL when the driver is mid-gesture: the press is remembered and
+              ;; applied when that gesture ends, and meanwhile it reaches the window
+              ;; manager (this seat may still raise and move the window on its own screen)
+              ;; but not McCLIM.
+              (let ((may (clim-token-claim port seat :press (logtest mask 7))))
               (when down (setf (seat-focus-surface seat) nil))   ; keyboard back to CLIM
               ;; Raise unless it is already the frontmost window — which now means
               ;; frontmost of ALL windows, not merely of the McCLIM ones.  Against the
@@ -1414,13 +1470,11 @@
               (when (and down (not (eq obj (wm-topmost port seat))))
                 (wm-raise port obj seat) (composite-seat seat))
               ;; The window manager's half of the click is done and it was this seat's.
-              ;; The CLIM half is McCLIM's, which has one pointer: a PRESS takes the token
-              ;; (inside EMIT-POINTER-EVENTS) and drives the application; bare MOTION from
-              ;; a seat that is not driving is dropped, or its mouse would drag the
-              ;; holder's CLIM pointer around under their hands.
-              (when (or (logtest mask 7) (mcclim-seat-p port seat))
+              ;; The CLIM half is McCLIM's, which has one pointer, so it happens only if
+              ;; the claim above said this seat may drive it.
+              (when may
                 (emit-pointer-events port (glass-mirror-sheet obj) mask
-                                     (- x cx) (- y cy) seat))))))))))
+                                     (- x cx) (- y cy) seat)))))))))))
 
 ;;; ---- run ---------------------------------------------------------------------
 
@@ -1824,6 +1878,10 @@
    the same one against its own stack, clip and screen; and it holds the scrolling
    surfaces' framebuffer locks across the whole round, so the pixels cannot move out from
    under the second seat's blit.  Normally that is one lock and one scrolling window."
+  ;; Nobody holds the McCLIM token forever: a holder who has gone quiet loses it here, so
+  ;; the next person's click is a silent take and not a contest.  One integer compare when
+  ;; the token is free, which is what an idle desktop's every tick is.
+  (clim-token-idle-sweep port)
   (let ((scrollers '()))
     (dolist (s (glass-port-surfaces port))
       ;; isolate each surface's poll: a signalling dirty-p is caught, the surface skipped

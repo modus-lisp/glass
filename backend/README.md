@@ -63,16 +63,46 @@ A seat's view of a window is **copy-on-write** against the window's own slots
 (`wm-surface-x`, `wm-mirror-x`, `wm-window-z`), so a seat that has never moved a
 particular window has no record for it and reads those — a seat joining a running
 session sees the desktop as it stands, and a one-seat session carries no view records at
-all. One seat is **primary** and writes through to those slots, because McCLIM's sheet
-geometry is single-valued and somebody has to own the position it believes in.
+all. One seat is the **home seat** and writes through to those slots, so a window's own
+position goes on meaning the *session's* arrangement — the default a seat sees until it
+diverges, and what somebody joining later finds on screen. The same seat inherits
+everything else a session has exactly one of (the session clipboard, the session mixer's
+own mix, `glass:*key-injector*`, the RFB desktop name), and it is fixed at the first seat
+for the life of the session.
 
 **McCLIM windows are one consolidated seat**, and this is a documented seam rather than
-a bug: a CLIM port has one pointer and one keyboard focus, so the last seat to *press a
-button* inside a CLIM window drives it, and another seat's bare pointer motion is
-dropped rather than dragging CLIM's one pointer around under their hands. Everything the
-*window manager* does — see, move, raise, lower, resize, close — stays per-seat for CLIM
-windows too. Native glass surfaces (terminals, the browser, warren, a nested remote
-desktop) carry no such assumption and are per-seat all the way down.
+a bug: a CLIM port has one pointer, one keyboard focus and one screen transformation per
+top-level sheet. So exactly one seat drives a CLIM application at a time — but not the
+same one all session. Which seat it is, is a **token** (`backend/clim-token.lisp`):
+
+- **Taking it.** The last seat to *press a button inside* a CLIM window holds it; another
+  seat's bare pointer motion is dropped rather than dragging CLIM's one pointer around
+  under their hands.
+- **The geometry goes with it.** McCLIM places pull-downs, dialogs and tooltips from the
+  window's sheet transformation, so on acquisition that transformation is re-aimed at the
+  *acquiring* seat's view of every CLIM window (`clim-resync-geometry`). A window whose
+  view has not diverged costs nothing to resync — the comparison is against what CLIM
+  currently believes — so two seats holding the desktop the same way hand it back and
+  forth for free, and the second seat's pull-downs land under the second seat's pointer.
+  The window's *own* position is left alone, so taking the token never moves anybody
+  else's windows.
+- **Letting go of it.** It goes **free** when the holder's pointer leaves every CLIM
+  window, when the holder has been silent for `*clim-token-idle*` (15 s), or when the
+  holder's last viewer disconnects. A *free* token is taken silently by the next input
+  from anybody — which is also what a lone seat does with it all day, so a one-seat
+  desktop cannot tell any of this is here.
+- **Never mid-gesture.** While the holder has a CLIM pull-down posted, a WM menu open, a
+  drag in flight or a button down, the token is **pinned**: another seat's press is
+  recorded as *pending* and applied when the gesture ends, so the one pointer never
+  teleports out of a tracking loop.
+- **Optionally visible.** `(clim-glass::clim-token-show-indicator PORT T)` tints CLIM
+  title bars on the screens of the seats that are *not* driving. Off by default.
+
+Everything the *window manager* does — see, move, raise, lower, resize, close — stays
+per-seat for CLIM windows too. Native glass surfaces (terminals, the browser, warren, a
+nested remote desktop) carry no such assumption and are per-seat all the way down.
+`backend/inspect/clim-handoff-gate.lisp` holds two seats on one real CLIM frame and
+checks all of it, pull-down placement included, from the pixels.
 
 Cursors need no code: glass sends the cursor *shape* once as an RFB pseudo-encoding and
 each viewer draws it at its own pointer.

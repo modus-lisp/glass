@@ -27,16 +27,20 @@
 (defclass glass-port (mcclim-render::render-port-mixin)
   ((seats    :initform '() :accessor glass-port-seats)        ; every seat watching, newest-first
    (default-seat :initform nil :accessor glass-port-default-seat)  ; the one the old accessors mean
-   ;; WHICH SEAT IS DRIVING McCLIM.  McCLIM has ONE pointer and ONE keyboard focus per
-   ;; port (CLIMI::PORT-POINTER, PORT-KEYBOARD-INPUT-FOCUS), so McCLIM windows are one
-   ;; consolidated seat however many are watching.  This is that token: the last seat to
-   ;; press a button inside a McCLIM window holds it, which is what a single shared mouse
-   ;; already does, and only the holder's pointer and keys become CLIM events.  Native
-   ;; glass surfaces — terminals, the browser, warren, a nested remote desktop — carry no
-   ;; such assumption and are genuinely per-seat.  This is a documented seam, not a bug:
-   ;; the seat abstraction lives at the surface level and McCLIM is one surface-producing
-   ;; client that does not implement it.
-   (mcclim-seat :initform nil :accessor glass-port-mcclim-seat)
+   ;; WHICH SEAT IS DRIVING McCLIM, and how that changes hands.  McCLIM has ONE pointer,
+   ;; ONE keyboard focus and ONE sheet transformation per port (CLIMI::PORT-POINTER,
+   ;; PORT-KEYBOARD-INPUT-FOCUS, SHEET-TRANSFORMATION), so McCLIM windows are one
+   ;; consolidated seat however many are watching.  This is that token — held by the last
+   ;; seat to press inside a McCLIM window, free again when that seat's pointer leaves,
+   ;; goes idle or goes away, and never handed over in the middle of a gesture.  Its whole
+   ;; policy, and the reason the token's "primary" is NOT the home seat's, is
+   ;; clim-token.lisp.  Native glass surfaces — terminals, the browser, warren, a nested
+   ;; remote desktop — carry no such assumption and are genuinely per-seat.  This is a
+   ;; documented seam, not a bug: the seat abstraction lives at the surface level and
+   ;; McCLIM is one surface-producing client that does not implement it.
+   ;; (No :accessor — GLASS-PORT-CLIM-TOKEN is an ordinary function in clim-token.lisp,
+   ;; which is loaded first and must be able to name it.)
+   (clim-token :initform (make-instance 'clim-token))
    (mailbox  :initform (sb-concurrency:make-mailbox) :reader glass-port-mailbox)
    (top      :initform nil :accessor glass-port-top)          ; the MAIN top-level sheet
    (mirrors  :initform '() :accessor glass-port-mirrors)      ; all top-level mirrors, newest-first
@@ -107,8 +111,11 @@
 (defun add-seat (port &key name (port-num 5900) (width 1000) (height 720) primary fb)
   "Attach a new SEAT to PORT: a screen of its own at WIDTH x HEIGHT, its own hands, and
    an empty set of views (so it sees the session's windows exactly where they stand).
-   The FIRST seat is the primary one — it owns the single position McCLIM believes in
-   and drives McCLIM's one pointer until another seat clicks."
+   The FIRST seat is the HOME seat: it inherits the things a session has exactly one of
+   (the session clipboard, the session mix, the key injector, the desktop name), it is
+   PORT-SEAT's default, and its window moves write the session's own arrangement.  That
+   is a fixed role and NOT the same as driving McCLIM, which is a token that changes
+   hands — see clim-token.lisp."
   (let* ((first-p (null (glass-port-seats port)))
          (primary (or primary first-p))
          (seat (make-instance 'seat :name (or name (format nil "seat-~d" port-num))
@@ -126,8 +133,12 @@
                                                    (glass:make-clipboard)))))
     (setf (glass-port-seats port) (append (glass-port-seats port) (list seat)))
     (when primary
-      (setf (glass-port-default-seat port) seat
-            (glass-port-mcclim-seat port) seat))
+      (setf (glass-port-default-seat port) seat)
+      ;; The first seat starts out DRIVING McCLIM — not because it is the home seat, but
+      ;; because it is the only pair of hands there is and a desktop with one person must
+      ;; be driving from its first instruction, before anybody has moved a mouse.  Seeded,
+      ;; not contested: nothing was taken from anyone.
+      (clim-token-grant port seat :initial))
     seat))
 
 (defun port-forget-window (port window)
@@ -182,12 +193,25 @@
 (defclass glass-mirror (mcclim-render::image-mirror-mixin)
   ((x    :initform 0   :accessor glass-mirror-x)             ; content screen position
    (y    :initform 0   :accessor glass-mirror-y)
+   ;; Where McCLIM'S SHEET TRANSFORMATION currently puts this window — which is the seat
+   ;; DRIVING McCLIM's view of it, and not necessarily the window's own position above.
+   ;; They were one pair of slots, and that is precisely why a second seat could not take
+   ;; over the geometry: aiming the sheet at its arrangement also rewrote the window's own
+   ;; position and made the first seat's screen jump.  Compared against on every token
+   ;; acquisition, which is what makes an unchanged layout cost nothing to resync.
+   (clim-x :initform 0 :accessor glass-mirror-clim-x)
+   (clim-y :initform 0 :accessor glass-mirror-clim-y)
    (main :initform nil :accessor glass-mirror-main)          ; owns the fb + the RFB server?
    ;; --- window-manager mode ---
    (managed :initform nil :accessor glass-mirror-managed)    ; gets a title bar + border?
    (title   :initform "" :accessor glass-mirror-title)
    (sheet   :initform nil :accessor glass-mirror-sheet)      ; backref (WM pointer routing)
    (deco    :initform nil :accessor glass-mirror-deco)       ; cached (image . width) title bar
+   ;; The same bar tinted for a seat that is NOT driving McCLIM (the holder indicator,
+   ;; *CLIM-TOKEN-INDICATOR*, off by default).  A second cache and not a per-seat one:
+   ;; the bar has exactly two appearances however many people are watching, so a window
+   ;; costs one extra title bar when the indicator is on and nothing when it is off.
+   (deco-other :initform nil :accessor glass-mirror-deco-other)
    (deco-w  :initform -1 :accessor glass-mirror-deco-w)
    ;; Place in the ONE stacking order shared with surface windows.  The accessor is
    ;; named for a window and not for a mirror on purpose: WM-SURFACE carries the same
@@ -281,6 +305,11 @@
                             :on-pointer (lambda (b x y) (glass-on-pointer port b x y seat))
                             :on-resize  (lambda (w h) (glass-on-resize port w h seat))
                             :wake       (seat-wake seat)
+                            ;; Nobody is watching this screen any more: this seat has no
+                            ;; hands, so it must not go on holding the McCLIM token that
+                            ;; the people still here are waiting for.
+                            :on-clients (lambda (n)
+                                          (when (zerop n) (clim-token-seat-gone port seat)))
                             ;; every transport of THIS seat shares THIS selection
                             :clipboard  (seat-clipboard seat)
                             ;; The RFB desktop name is what a viewer puts in its title
@@ -689,8 +718,10 @@
 ;;; and DISTRIBUTE-EVENT routes every keyboard event to that focus regardless of what
 ;;; sheet the event names.  There is no per-pointer anything to hang a second seat on
 ;;; short of reimplementing McCLIM's event distribution, so we do not: McCLIM windows
-;;; are ONE CONSOLIDATED SEAT, and the token for which seat that is lives in
-;;; GLASS-PORT-MCCLIM-SEAT.
+;;; are ONE CONSOLIDATED SEAT, and which seat that is at any moment is a TOKEN, whose
+;;; whole policy — how it is taken, when it goes free, why it is never handed over in the
+;;; middle of a gesture, and how McCLIM's single-valued window GEOMETRY travels with it —
+;;; is clim-token.lisp.  Read that file's header; this one only calls it.
 ;;;
 ;;; The rule is the one a single shared mouse already follows: THE LAST SEAT TO PRESS A
 ;;; BUTTON INSIDE A McCLIM WINDOW HOLDS THE TOKEN.  While it holds it, its pointer moves
@@ -699,6 +730,10 @@
 ;;; until it clicks, which is both a natural gesture for "I am driving now" and
 ;;; immediately visible to everyone.  No arbitration, no locking, no queue: seats
 ;;; cooperate, and a rule you can see is worth more here than a rule you cannot lose.
+;;; What the token adds to that is the other half of "one at a time": it does not stay
+;;; taken.  A holder who moves off the CLIM windows, goes quiet, or disconnects leaves it
+;;; FREE, and a free token is taken silently by the next input from anybody — which is
+;;; also, exactly, what a lone seat does with it all day.
 ;;;
 ;;; What a non-holding seat can still do with a McCLIM window is everything the WINDOW
 ;;; MANAGER does, because that is ours and not McCLIM's: see it, move it, raise it,
@@ -708,15 +743,21 @@
 ;;; desktop — carry none of this: they take (down keysym) and (mask x y) from whichever
 ;;; seat is addressing them, so they are per-seat all the way down.
 
-(defun mcclim-seat-p (port seat)
-  "May SEAT drive McCLIM right now?  A seat that is not the token holder is refused —
-   except when there is no seat at all in the call (an injected key, a test harness),
-   which is the session speaking for itself and is always allowed."
-  (or (null seat) (eq seat (glass-port-mcclim-seat port))))
+;;; MCCLIM-SEAT-P (the pure "is SEAT driving?" question) and CLIM-TOKEN-CLAIM (the same
+;;; question asked by input that may TAKE the token) are both in clim-token.lisp.
+
+(defun glass-port-mcclim-seat (port)
+  "The seat driving McCLIM, or NIL.  The name this had before the token was a thing of
+   its own; kept because a running desktop's control socket says it."
+  (clim-token-holder port))
+
+(defun (setf glass-port-mcclim-seat) (seat port)
+  (if seat (clim-token-grant port seat :contest) (clim-token-release port :gone))
+  seat)
 
 (defun take-mcclim-seat (port seat)
   "SEAT has clicked inside a McCLIM window: it drives McCLIM from now on."
-  (when seat (setf (glass-port-mcclim-seat port) seat))
+  (when seat (clim-token-claim port seat :press t))
   seat)
 
 (defun glass-key-sheet (port &optional seat)
@@ -751,8 +792,11 @@
       (funcall (wm-surface-on-key focus) down-p keysym)
       (return-from glass-on-key)))
   ;; Past here it is McCLIM's keyboard, which there is only one of: a seat that is not
-  ;; holding the token types into nothing rather than into the holder's window.
-  (unless (mcclim-seat-p port seat) (return-from glass-on-key))
+  ;; holding the token types into nothing rather than into the holder's window.  A
+  ;; keystroke is not a press, so it takes only a FREE token — it will not pull the
+  ;; keyboard out of somebody's hands — but it does take a free one, which is what makes
+  ;; a lone seat that has gone idle able to just start typing again.
+  (unless (clim-token-claim port seat) (return-from glass-on-key))
   (let* ((seat (port-seat port seat))
          (mod (cdr (assoc keysym *modifier-keysyms*)))
          (sheet (glass-key-sheet port seat)))
@@ -798,7 +842,11 @@
         ;; The grab is McCLIM's, so only the seat driving McCLIM may satisfy it; another
         ;; seat's pointer goes to the window manager as usual, which is what lets it keep
         ;; moving and raising windows while somebody else has a pull-down open.
-        ((and grab (mcclim-seat-p port seat) (climi::sheet-mirrored-ancestor grab))
+        ;; GRAB is read from SEAT's own slot, so only the seat CLIM is tracking can be
+        ;; here at all; the claim is what re-takes the token if it went free under it
+        ;; (say its viewer blinked) and what refuses if somebody else has since taken it.
+        ((and grab (clim-token-claim port seat :press (logtest mask 7))
+              (climi::sheet-mirrored-ancestor grab))
          ;; Deliver to the leaf sheet under the pointer WITHIN the grabbing frame (so a
          ;; hover over a submenu button opens it — the tracker keys off event-sheet);
          ;; if the pointer is outside that frame's windows (workspace / another app),
@@ -850,8 +898,12 @@
           (emit-pointer-events port grab mask (- x gmx) (- y gmy) seat)))))
 
 (defun glass-on-pointer/single (port mask x y &optional seat)
-  (when-let ((sheet (glass-port-top port)))
-    (emit-pointer-events port sheet mask x y seat)))
+  ;; No window manager here — one application filling the screen — so this is the whole
+  ;; of the gate: a seat that is not driving may take a free token or press to contest,
+  ;; and otherwise its pointer does not reach the one CLIM pointer.
+  (when (clim-token-claim port (port-seat port seat) :press (logtest mask 7))
+    (when-let ((sheet (glass-port-top port)))
+      (emit-pointer-events port sheet mask x y seat))))
 
 (defun emit-pointer-events (port sheet mask lx ly &optional seat)
   "Turn an RFB pointer state (MASK) at sheet-local (LX,LY) into CLIM motion/
@@ -861,9 +913,12 @@
 
    A BUTTON PRESS is what takes the McCLIM token: a seat that clicks inside a CLIM
    window is driving it from that moment, and a seat that merely moves the mouse over
-   somebody else's CLIM window is refused before it gets here."
+   somebody else's CLIM window is refused before it gets here.  The claim below is
+   therefore mostly a TOUCH — it records that the holder is still doing something, which
+   is what keeps the idle sweep off it — and the backstop for the one caller that has no
+   window manager above it to have asked first (GLASS-ON-POINTER/SINGLE)."
   (let ((seat (port-seat port seat)))
-    (when (logtest mask 7) (take-mcclim-seat port seat))
+    (clim-token-claim port seat :press (logtest mask 7))
     ;; wheel (RFB buttons 4/5 = bits 8/16) arrives as a transient press
     (loop for (bit . delta) in '((8 . -1) (16 . 1))
           when (logtest mask bit)
@@ -889,7 +944,10 @@
                                          :button cbtn :x lx :y ly
                                          :modifier-state (seat-mods seat)
                                          :timestamp (next-timestamp port)))))
-      (setf (seat-buttons seat) real))))
+      (setf (seat-buttons seat) real)
+      ;; The buttons are up: whatever gesture this was is over, so a press another seat
+      ;; made while it was running — deferred rather than dropped — takes effect now.
+      (when (zerop real) (clim-token-settle port seat)))))
 
 (defun glass-on-resize (port w h &optional seat)
   "Client asked (by resizing its VNC window) for a W x H desktop.  Relayout the
@@ -941,14 +999,24 @@
       ;; REGION is the mirror rect in screen coords — where we composite this sheet.
       ;; Managed windows are positioned by moving their SHEET (realize-mirror / wm-move),
       ;; so McCLIM's region already carries the WM slot; just read it back here.
+      ;;
+      ;; Two slots now, because McCLIM's geometry follows whichever seat is DRIVING it and
+      ;; the window's own position is the session's arrangement.  CLIM-X/Y always records
+      ;; what CLIM believes.  X/Y — what every non-diverged seat is looking at — is left
+      ;; alone when this update IS the aim-at-the-driver write (CLIM-SHEET-GOTO binds the
+      ;; special), or a second seat taking the token would drag the first seat's windows
+      ;; across its screen.
       (when (typep mirror 'glass-mirror)
-        (setf (glass-mirror-x mirror) (floor x1)
-              (glass-mirror-y mirror) (floor y1))))
+        (setf (glass-mirror-clim-x mirror) (floor x1)
+              (glass-mirror-clim-y mirror) (floor y1))
+        (unless *clim-geometry-follows-driver*
+          (setf (glass-mirror-x mirror) (floor x1)
+                (glass-mirror-y mirror) (floor y1)))))
     (values x1 y1 x2 y2)))
 ;; McCLIM asks the PORT for the modifier state, having one keyboard; the answer is the
 ;; modifier state of the seat currently driving McCLIM.
 (defmethod port-modifier-state ((port glass-port))
-  (seat-mods (or (glass-port-mcclim-seat port) (glass-port-default-seat port))))
+  (seat-mods (clim-token-seat port)))
 ;; NB: keyboard-input-focus is handled by basic-port (it tracks the focused sheet
 ;; and distribute-event routes key events there) — we must NOT shadow it, or keys
 ;; never reach an interactor/editor.
@@ -964,15 +1032,19 @@
 ;; idea seats exist, and the person it is tracking is by definition the one whose click
 ;; opened the menu.  Another seat's pointer is not held by it (glass-on-pointer), so a
 ;; pull-down open on one screen does not freeze the other's mouse.
+;; A live grab also PINS the token: while CLIM is tracking the one pointer through a
+;; pull-down, another seat's press is remembered rather than obeyed, and it is obeyed the
+;; moment the grab is dropped (CLIM-TOKEN-SETTLE below).  That is the case that corrupts
+;; state if it is got wrong — the pointer teleporting out of a tracking loop.
 (defmethod port-grab-pointer ((port glass-port) pointer sheet &key multiple-window)
   (declare (ignore pointer multiple-window))
-  (setf (seat-grab-sheet (or (glass-port-mcclim-seat port) (glass-port-default-seat port)))
-        sheet)
+  (setf (seat-grab-sheet (clim-token-seat port)) sheet)
   t)
 (defmethod port-ungrab-pointer ((port glass-port) pointer sheet)
   (declare (ignore pointer sheet))
-  (setf (seat-grab-sheet (or (glass-port-mcclim-seat port) (glass-port-default-seat port)))
-        nil)
+  (let ((seat (clim-token-seat port)))
+    (setf (seat-grab-sheet seat) nil)
+    (clim-token-settle port seat))
   t)
 
 ;;; ---- convenience: run a frame ----------------------------------------------

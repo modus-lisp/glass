@@ -12,6 +12,7 @@
   :components ((:file "package")
                (:file "render-fix")
                (:file "seat")
+               (:file "clim-token")
                (:file "backend")
                (:file "message-port")
                (:file "wm")
