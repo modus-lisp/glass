@@ -11,6 +11,7 @@
   :serial t
   :components ((:file "package")
                (:file "render-fix")
+               (:file "seat")
                (:file "backend")
                (:file "message-port")
                (:file "wm")

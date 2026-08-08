@@ -71,7 +71,12 @@
     (when-let ((aw (gethash id (compositor-windows comp))))
       (let ((surf (awin-surface aw)))
         (setf (wm-surface-fb surf) (argb->fb arr w h)) ; atomic swap (also handles relayout/resize)
-        (composite-all (compositor-port comp) (wm-window-box surf))))))   ; damage just this window
+        ;; Damage just this window — named as the WINDOW and not as a screen rectangle, so
+        ;; every seat converts it against wherever IT is holding the app's window.
+        (port-damage-window (compositor-port comp) surf)
+        (dolist (seat (glass-port-seats (compositor-port comp)))
+          (let ((pend (seat-take-pending seat)))
+            (when pend (composite-seat seat (unless (eq pend :full) pend)))))))))
 
 (defun comp-destroy (comp msg)
   (let ((id (second msg)))

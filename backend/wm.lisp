@@ -138,7 +138,15 @@
    ;; A translation may only be believed when the screen still holds that same rect: if
    ;; the window moved, resized, or was last drawn under a clip that cut it, the pixels a
    ;; copy would read are not the ones the hint is about.  Compositor-owned.
+   ;;
+   ;; VESTIGIAL as of seats: the claim is about ONE SCREEN's pixels, so it moved to the
+   ;; seat (SEAT-COPY-BASE).  The slot stays because it is initarg-visible and somebody
+   ;; may read it; nothing in the compositor writes it any more.
    (copy-base :initarg :copy-base :initform nil        :accessor wm-surface-copy-base)
+   ;; This round's take of COPY-P, so that every seat judges the SAME translation instead
+   ;; of the first one consuming it — see WM-SURFACE-ROUND-HINT.
+   (copy-round :initform nil :accessor wm-surface-copy-round)
+   (copy-hint  :initform nil :accessor wm-surface-copy-hint)
    ;; (px-w px-h)->() : resize the content, or nil = not resizable
    (resize-fn :initarg :resize-fn :initform nil        :accessor wm-surface-resize-fn)
    ;; ()->() : tear down the content on window close
@@ -159,6 +167,16 @@
    ;; accessor name as GLASS-MIRROR's, so WM-STACKING-ORDER can order a list holding
    ;; both kinds without a single type test.
    (z         :initarg :z         :initform 0          :accessor wm-window-z)))
+
+;;; A surface's OWN geometry — the position and stacking every seat sees until it
+;;; arranges the window for itself.  GLASS-MIRROR answers the same three questions in
+;;; backend.lisp, which is what lets a seat hold either species without a type test.
+(defmethod window-own-x ((s wm-surface)) (wm-surface-x s))
+(defmethod (setf window-own-x) (v (s wm-surface)) (setf (wm-surface-x s) v))
+(defmethod window-own-y ((s wm-surface)) (wm-surface-y s))
+(defmethod (setf window-own-y) (v (s wm-surface)) (setf (wm-surface-y s) v))
+(defmethod window-own-z ((s wm-surface)) (wm-window-z s))
+(defmethod (setf window-own-z) (v (s wm-surface)) (setf (wm-window-z s) v))
 
 (defun make-wm-surface (&rest initargs)
   "Make a surface window.  Keyword-for-keyword what the DEFSTRUCT constructor took,
@@ -188,8 +206,11 @@
   (when (>= (incf (wm-surface-err-count surf)) *wm-surface-error-limit*)
     (ignore-errors
      (setf (glass-port-surfaces port) (remove surf (glass-port-surfaces port)))
-     (when (eq (glass-port-focus-surface port) surf)
-       (setf (glass-port-focus-surface port) nil))
+     ;; The window is gone for everybody, so every seat's keyboard comes off it and no
+     ;; seat keeps a view of it.
+     (dolist (seat (glass-port-seats port))
+       (when (eq (seat-focus-surface seat) surf) (setf (seat-focus-surface seat) nil)))
+     (port-forget-window port surf)
      (when (wm-surface-close-fn surf) (ignore-errors (funcall (wm-surface-close-fn surf)))))))
 
 (defun wm-surface-deco* (surf cw)
@@ -208,11 +229,11 @@
     (glass:fb-frame fb wx wy ww wh glass:+black+ +wm-border+)
     (wm-corners fb wx wy ww wh)))
 
-(defun wm-draw-window (mirror fb)
+(defun wm-draw-window (mirror fb &optional seat)
   (when-let ((image (mcclim-render::image-mirror-image mirror)))
     (multiple-value-bind (cw ch) (image-wh image)
-      (wm-frame fb (glass-mirror-x mirror) (glass-mirror-y mirror) cw ch
-                (wm-deco mirror cw) (lambda () (blit-mirror mirror fb))))))
+      (wm-frame fb (seat-window-x seat mirror) (seat-window-y seat mirror) cw ch
+                (wm-deco mirror cw) (lambda () (blit-mirror mirror fb seat))))))
 
 ;;; ---- scroll CopyRect: a surface's content translation, mapped onto the screen ----
 ;;;
@@ -320,10 +341,16 @@
 ;;; terminal, however recently you had touched it, because "above" was decided by what
 ;;; kind of window it was.  Both kinds now carry a Z and there is one order.
 
-(defun wm-stacking-order (port)
-  "Every window on the screen, topmost first.  THE answer to what is above what — asked
-   by the compositor, the pointer, and the occlusion guards, so that the pixels, the
-   clicks and the CopyRect refusals cannot disagree about the stack.
+(defun wm-stacking-order (port &optional seat)
+  "Every window on the screen, topmost first, AS SEAT SEES IT.  THE answer to what is
+   above what — asked by the compositor, the pointer, and the occlusion guards, so that
+   the pixels, the clicks and the CopyRect refusals cannot disagree about the stack.
+
+   WHICH windows exist is the session's; WHERE THEY STAND is the seat's.  So membership
+   comes from the port's MIRRORS and SURFACES, unchanged, and only the sort key is the
+   seat's — SEAT-WINDOW-Z, which answers with the window's own ticket for any window
+   this seat has never restacked.  A session with one seat therefore sorts by exactly
+   the same numbers it always did.
 
    Unmanaged McCLIM mirrors — pull-down menus, submenus, tooltips — are not in the
    shared order at all: they sit above it, always.  They are transient parts of the
@@ -334,15 +361,16 @@
     (append (remove-if #'glass-mirror-managed mirrors)               ; pop-up tier, on top
             (sort (append (remove-if-not #'glass-mirror-managed mirrors)
                           (copy-list (glass-port-surfaces port)))
-                  #'> :key #'wm-window-z))))
+                  #'> :key (lambda (w) (seat-window-z seat w))))))
 
-(defun wm-topmost (port)
-  "The frontmost window a click can raise: the top of the shared order, skipping the
-   pop-up tier, which nobody raises and which is gone by the time the click lands."
+(defun wm-topmost (port &optional seat)
+  "The frontmost window a click can raise FOR SEAT: the top of that seat's order,
+   skipping the pop-up tier, which nobody raises and which is gone by the time the
+   click lands."
   (find-if (lambda (w) (or (wm-surface-p w) (glass-mirror-managed w)))
-           (wm-stacking-order port)))
+           (wm-stacking-order port seat)))
 
-(defun wm-boxes-above (port obj)
+(defun wm-boxes-above (port obj &optional seat)
   "The (x y w h) boxes of everything WM-COMPOSITE draws AFTER OBJ — i.e. everything
    whose pixels can sit on top of OBJ's on the screen.  WM-STACKING-ORDER is topmost
    first, so the windows listed BEFORE OBJ are the ones above it, of either kind; the
@@ -353,31 +381,42 @@
    before any surface, so none is ever above one'.  That was true, and it was the bug:
    it is what made a McCLIM window unable to come to the front.  Now that a mirror CAN
    be above a surface, it has to be counted here, or a terminal scrolling under a text
-   window would CopyRect the window's pixels along with its own."
+   window would CopyRect the window's pixels along with its own.
+
+   Every box here is in SEAT's screen coordinates and the order is SEAT's, because
+   occlusion is: the same two windows overlap on one seat's screen and not on
+   another's, so a CopyRect one seat must refuse is one the other may take."
   (let ((boxes '()))
-    (loop for w in (wm-stacking-order port)
+    (loop for w in (wm-stacking-order port seat)
           until (eq w obj)
-          do (when-let ((b (wm-window-box w))) (push b boxes)))
-    (when (glass-port-drag-wire port)
-      (when-let ((b (glass-port-drag-wire-box port))) (push b boxes)))
-    (when-let ((menu (glass-port-menu port)))
-      (dolist (m (wm-menu-chain menu))
-        (push (list (wm-menu-x m) (wm-menu-y m)
-                    (glass:fb-width (wm-menu-fb m)) (glass:fb-height (wm-menu-fb m)))
-              boxes)))
+          do (when-let ((b (wm-window-box w seat))) (push b boxes)))
+    (let ((seat (port-seat port seat)))
+      (when (seat-drag-wire seat)
+        (when-let ((b (seat-drag-wire-box seat))) (push b boxes)))
+      (when-let ((menu (seat-menu seat)))
+        (dolist (m (wm-menu-chain menu))
+          (push (list (wm-menu-x m) (wm-menu-y m)
+                      (glass:fb-width (wm-menu-fb m)) (glass:fb-height (wm-menu-fb m)))
+                boxes))))
     boxes))
 
-(defun wm-obstructed-p (port surf &rest boxes)
-  "Does anything WM-COMPOSITE draws AFTER SURF — a window stacked over it, the drag
-   wireframe, an open menu — land on any of BOXES?  THE occlusion question, asked once
-   and answered in one place: both the wire CopyRect and the in-RAM screen translation
-   ask it, of different rectangles, so that the two verdicts can differ in strictness
-   without ever differing in what 'above' means."
-  (let ((above (wm-boxes-above port surf)))
+(defun wm-obstructed-p* (port surf boxes &optional seat)
+  "Does anything WM-COMPOSITE draws AFTER SURF ON SEAT'S SCREEN — a window stacked over
+   it, the drag wireframe, an open menu — land on any of BOXES (a LIST of boxes)?  THE
+   occlusion question, asked once and answered in one place: both the wire CopyRect and
+   the in-RAM screen translation ask it, of different rectangles, so that the two
+   verdicts can differ in strictness without ever differing in what 'above' means."
+  (let ((above (wm-boxes-above port surf seat)))
     (and above
          (some (lambda (b) (some (lambda (a) (wm-boxes-overlap-p a b)) above))
                (remove nil boxes))
          t)))
+
+(defun wm-obstructed-p (port surf &rest boxes)
+  "WM-OBSTRUCTED-P* for the default seat, spelled the way the rest of the tree and the
+   inspect harnesses already spell it: the boxes as trailing arguments.  A &REST cannot
+   also carry a trailing seat, which is the whole reason the starred one exists."
+  (wm-obstructed-p* port surf boxes))
 
 (defvar *wm-copy-tally* nil
   "NIL, or a plist WM-SURFACE-SCREEN-COPY tallies its verdicts into — the only way to
@@ -397,7 +436,64 @@
     (incf (getf *wm-copy-tally* key 0) n))
   nil)
 
-(defun wm-surface-screen-copy (port surf fb)
+;;; ---- ONE take, MANY seats ----------------------------------------------------
+;;;
+;;; A surface reports its translation CONSUMINGLY: WM-SURFACE-COPY-P answers "how did
+;;; my content move since you last asked", so the second asker is told "not at all" and
+;;; the second seat loses the CopyRect entirely — which on a window drag is 24-57x the
+;;; bytes on a nested hop, far too much to hand away.
+;;;
+;;; So the take happens ONCE PER COMPOSITING ROUND and every seat judges the same hint.
+;;; A round is a dynamic extent, marked by *WM-COPY-ROUND*: the WM tick loop binds it to
+;;; a fresh number and composites every seat inside it, so the first seat to reach a
+;;; surface takes the hint and the rest read what it took.  Outside a round — a drag, a
+;;; menu, an explicit COMPOSITE-SEAT — the variable is NIL and every call takes afresh,
+;;; which is exactly what a single-seat session did before there were rounds.
+;;;
+;;; The take alone is not enough: a hint describes the pixels AS THEY WERE WHEN IT WAS
+;;; TAKEN, so if the surface repaints between seat A's blit and seat B's, B applies A's
+;;; translation to newer pixels and smears.  The tick loop therefore holds the scrolling
+;;; surfaces' framebuffer locks across the WHOLE round (WM-WITH-SCROLL-LOCKS), which is
+;;; the same lock WM-DRAW-SURFACE has always taken around take-and-blit, merely widened
+;;; from one seat to all of them.  There is normally at most one scrolling window, so
+;;; the round holds one lock.
+
+(defvar *wm-copy-round* nil
+  "The current compositing round's identity while every seat is being composited from
+   one set of surface translations, or NIL outside such a round (take per call).")
+
+(defun wm-surface-round-hint (surf)
+  "SURF's content translation for this round: taken from the surface the first time it
+   is asked within a round and remembered for the rest of it, so every seat judges the
+   same move.  Outside a round, taken afresh — the pre-seat behaviour."
+  (let ((take (wm-surface-copy-p surf)))
+    (cond
+      ((null take) nil)
+      ((null *wm-copy-round*) (funcall take))
+      ((eql (wm-surface-copy-round surf) *wm-copy-round*) (wm-surface-copy-hint surf))
+      (t (setf (wm-surface-copy-round surf) *wm-copy-round*
+               (wm-surface-copy-hint surf) (funcall take))))))
+
+(defun wm-with-scroll-locks (surfaces thunk)
+  "Run THUNK holding every surface in SURFACES' framebuffer lock, so a round's take and
+   all the seats' blits see one set of pixels.  Nested rather than looped because that
+   is what a scoped lock macro gives; the list is normally empty or one long."
+  (if (null surfaces)
+      (funcall thunk)
+      (glass:with-fb-locked ((wm-surface-fb (first surfaces)))
+        (wm-with-scroll-locks (rest surfaces) thunk))))
+
+(defun seat-copy-base (seat surf)
+  "The content rect SEAT's screen was last known to hold whole for SURF, or NIL.
+   Per-seat, and it has to be: it is a claim about ONE SCREEN's pixels, and two seats
+   holding the window at different places, under different clips, with different things
+   stacked over it do not have the same claim to make."
+  (gethash surf (seat-copy-bases seat)))
+
+(defun (setf seat-copy-base) (value seat surf)
+  (setf (gethash surf (seat-copy-bases seat)) value))
+
+(defun wm-surface-screen-copy (port surf fb &optional seat)
   "Take SURF's pending content translation and return it as a screen-space CopyRect
    hint (sx sy dx dy w h) for framebuffer FB — or NIL to refuse it.
 
@@ -436,20 +532,20 @@
 
    Both ends matter: the source must be this window's own content (or the copy reads
    somebody else's pixels) and so must the destination (or it overwrites them)."
-  (let* ((take (wm-surface-copy-p surf))
-         (hint (and take (funcall take)))              ; consumed even if refused below
+  (let* ((seat (port-seat port seat))
+         (hint (wm-surface-round-hint surf))     ; one take per round, judged by every seat
          (sfb (wm-surface-fb surf))
-         (content (list (wm-surface-x surf) (wm-surface-y surf)
+         (content (list (seat-window-x seat surf) (seat-window-y seat surf)
                         (glass:fb-width sfb) (glass:fb-height sfb)))
          (clip (glass:fb-clip fb))
          (clip-box (if clip
                        (list (first clip) (second clip)
                              (- (third clip) (first clip)) (- (fourth clip) (second clip)))
                        (list 0 0 (glass:fb-width fb) (glass:fb-height fb))))
-         (base (wm-surface-copy-base surf)))
+         (base (seat-copy-base seat surf)))
     ;; This composite redraws the window WHOLE only if the clip contains all of it;
     ;; that — and only that — makes the screen a base the next translation can read.
-    (setf (wm-surface-copy-base surf)
+    (setf (seat-copy-base seat surf)
           (and (equal content (wm-box-intersect content clip-box)) content))
     (when hint
       (wm-copy-tally :offered)
@@ -477,11 +573,11 @@
                        ;; wire: refused only while the guard holds and something above
                        ;; sits on one end of the move — the diff repairs it either way
                        (wire (unless (and *wm-copyrect-occlusion-guard*
-                                          (wm-obstructed-p port surf src dst))
+                                          (wm-obstructed-p* port surf (list src dst) seat))
                                copy))
                        ;; screen: refused whenever anything above touches the region the
                        ;; strip path writes, guard or no guard — nothing repairs that
-                       (screen (unless (wm-obstructed-p port surf allowed) copy)))
+                       (screen (unless (wm-obstructed-p* port surf (list allowed) seat) copy)))
                   (when *wm-copy-tally*
                     (wm-copy-tally :clipped-px (- (* hw hh) (* dw dh)))
                     (if wire
@@ -491,26 +587,29 @@
                   (values wire screen allowed)))
               (wm-copy-tally :empty)))))))               ; clipped to nothing / a null move
 
-(defun wm-draw-surface (surf fb &optional port)
-  "Draw SURF's decorated window into the screen framebuffer FB.  Given a PORT, also
-   collect SURF's scroll CopyRect hint for this composite (GLASS-PORT-FRAME-COPY).
+(defun wm-draw-surface (surf fb &optional port seat)
+  "Draw SURF's decorated window into SEAT's screen framebuffer FB, at the position SEAT
+   holds it.  Given a PORT, also collect SURF's scroll CopyRect hint for this composite
+   (SEAT-FRAME-COPY).
 
    The hint is taken under the SURFACE's lock, in the same breath as the blit that
    copies its pixels onto the screen: the two describe each other, and a paint landing
    between them would leave the hint one translation behind the pixels it names.  Only
    one CopyRect can ride an RFB update, so if two windows scroll at once the larger
    block wins and the other simply rides the diff."
-  (let* ((sfb (wm-surface-fb surf)) (cw (glass:fb-width sfb)) (ch (glass:fb-height sfb)))
-    (wm-frame fb (wm-surface-x surf) (wm-surface-y surf) cw ch (wm-surface-deco* surf cw)
+  (let* ((sfb (wm-surface-fb surf)) (cw (glass:fb-width sfb)) (ch (glass:fb-height sfb))
+         (sx (seat-window-x seat surf)) (sy (seat-window-y seat surf)))
+    (wm-frame fb sx sy cw ch (wm-surface-deco* surf cw)
               (lambda ()
                 (glass:with-fb-locked (sfb)
                   (when port
-                    (when-let ((c (ignore-errors (wm-surface-screen-copy port surf fb))))
-                      (let ((cur (glass-port-frame-copy port)))
+                    (when-let ((c (ignore-errors (wm-surface-screen-copy port surf fb seat))))
+                      (let* ((seat (port-seat port seat))
+                             (cur (seat-frame-copy seat)))
                         (when (or (null cur)
                                   (> (* (fifth c) (sixth c)) (* (fifth cur) (sixth cur))))
-                          (setf (glass-port-frame-copy port) c)))))
-                  (blit-fb sfb (wm-surface-x surf) (wm-surface-y surf) fb))))))
+                          (setf (seat-frame-copy seat) c)))))
+                  (blit-fb sfb sx sy fb))))))
 
 (defun %svg-path-p (path)
   (let ((s (string-downcase (princ-to-string path))))
@@ -527,14 +626,14 @@
       (:fit     (r (min (/ sw iw) (/ sh ih))))
       (t        (values nil nil)))))
 
-(defun wm-render-background (port path &key (mode :cover))
+(defun wm-render-background (seat path &key (mode :cover))
   "Rasterise the image at PATH (any format pigment decodes — PNG/JPEG/GIF/WebP/SVG)
    into a screen-sized framebuffer for use as the desktop background.  MODE places
    it: :cover (fill, centre-crop — default), :fit (whole image, teal letterbox),
    :stretch (distort to fill), :center (1:1), or :tile.  An SVG is re-rasterised at
    the display size (vector — crisp at any resolution, not an upscaled intrinsic)."
   (multiple-value-bind (iw ih samp) (%decode-image path)
-    (let ((sw (glass-port-screen-w port)) (sh (glass-port-screen-h port)))
+    (let ((sw (seat-screen-w seat)) (sh (seat-screen-h seat)))
       ;; SVG: re-render at the size MODE will show it -> crisp, no upscale blur
       (when (%svg-path-p path)
         (multiple-value-bind (tw th) (%bg-render-size mode sw sh iw ih)
@@ -560,12 +659,16 @@
                  (when (and (<= 0 sx) (< sx iw) (<= 0 sy) (< sy ih)) (put dx dy sx sy)))))))))
       fb))))
 
-(defun wm-set-background (port path &key (mode :cover))
-  "Set the desktop background to the image at PATH (NIL clears it -> flat teal)."
-  (setf (glass-port-bg port)
-        (and path (ignore-errors (wm-render-background port path :mode mode))))
-  (when (glass-port-fb port) (composite-all port))
-  (glass-port-bg port))
+(defun wm-set-background (port path &key (mode :cover) seat)
+  "Set the desktop background to the image at PATH (NIL clears it -> flat teal).  With
+   no SEAT this is the session's taste and every seat gets it, each rasterised AT ITS OWN
+   SCREEN SIZE — the same picture, not the same pixels, which is the whole reason the
+   wallpaper is a per-seat slot.  With a SEAT, only that seat's changes."
+  (dolist (s (if seat (list (port-seat port seat)) (glass-port-seats port)))
+    (setf (seat-bg s) (and path (ignore-errors (wm-render-background s path :mode mode)))))
+  (when (glass-port-fb port)
+    (if seat (composite-seat (port-seat port seat)) (composite-all port)))
+  (seat-bg (port-seat port seat)))
 
 ;;; ---- compositing a scroll: translate the screen, redraw only the strip ----------
 ;;;
@@ -590,22 +693,23 @@
 ;;; strict verdict (WM-SURFACE-SCREEN-COPY's second value) whatever the wire policy
 ;;; says, and refusing simply falls back to the whole-window blit below.
 
-(defun wm-covered-p (port box)
-  "Is BOX entirely inside one window that this composite draws opaquely?  Every window,
-   McCLIM or surface, paints its whole decorated rectangle — title bar, content, border
-   — so a region inside one never shows a pixel of whatever was drawn under it.  Used
-   to skip the desktop background, which is otherwise drawn and immediately buried."
+(defun wm-covered-p (port box &optional seat)
+  "Is BOX entirely inside one window that this composite draws opaquely ON SEAT'S
+   SCREEN?  Every window, McCLIM or surface, paints its whole decorated rectangle —
+   title bar, content, border — so a region inside one never shows a pixel of whatever
+   was drawn under it.  Used to skip the desktop background, which is otherwise drawn
+   and immediately buried."
   (and box
-       (or (some (lambda (s) (wm-box-inside-p box (wm-window-box s)))
+       (or (some (lambda (s) (wm-box-inside-p box (wm-window-box s seat)))
                  (glass-port-surfaces port))
            (some (lambda (m) (and (glass-mirror-managed m)
-                                  (wm-box-inside-p box (wm-window-box m))))
+                                  (wm-box-inside-p box (wm-window-box m seat))))
                  (glass-port-mirrors port)))))
 
-(defun wm-scroll-candidate (port box)
+(defun wm-scroll-candidate (port box &optional seat)
   "The one surface a composite of region BOX could be painted as a translation of: the
-   topmost one that answers the translation question at all and whose decorated window
-   CONTAINS the whole box.
+   topmost one, IN SEAT'S ORDER, that answers the translation question at all and whose
+   decorated window CONTAINS the whole box on SEAT's screen.
 
    Containment is what makes skipping the rest of the paint sound.  A window is opaque
    over its own box, so everything below it inside BOX is invisible and redrawing it
@@ -616,89 +720,97 @@
   (when box
     (find-if (lambda (w) (and (wm-surface-p w)
                               (wm-surface-copy-p w)
-                              (wm-box-inside-p box (wm-window-box w))))
-             (wm-stacking-order port))))
+                              (wm-box-inside-p box (wm-window-box w seat))))
+             (wm-stacking-order port seat))))
 
-(defun wm-paint-strip (surf fb copy allowed)
+(defun wm-paint-strip (surf fb copy allowed &optional seat)
   "Paint SURF's window as the translation COPY (sx sy dx dy w h) of what FB already
    holds, plus a blit of everything in ALLOWED the translation did not carry — the
    newly exposed strip, and (for a scroll, which never moves the chrome) the rows above
-   the moved block.  Both are in screen coordinates; ALLOWED is SURF's visible content."
+   the moved block.  Both are in SEAT's screen coordinates; ALLOWED is SURF's visible
+   content."
   (destructuring-bind (sx sy dx dy w h) copy
     (glass:fb-move-rect fb sx sy dx dy w h)
     (let ((sfb (wm-surface-fb surf))
-          (cx (wm-surface-x surf)) (cy (wm-surface-y surf)))
+          (cx (seat-window-x seat surf)) (cy (seat-window-y seat surf)))
       (dolist (band (wm-box-difference allowed (list dx dy w h)))
         (destructuring-bind (bx by bw bh) band
           (glass:with-fb-clip (fb bx by bw bh) (blit-fb sfb cx cy fb)))))))
 
-(defun wm-composite-scroll (port fb box)
+(defun wm-composite-scroll (port fb box &optional seat)
   "Try to paint this composite as SURF's scroll instead of a redraw: true if it did.
    The hint is taken under the surface's lock and the translation applied in the same
-   breath, so the copy and the pixels it names cannot drift apart.  Refused or absent,
-   the hint is still handed to the wire (GLASS-PORT-FRAME-COPY) before returning NIL,
-   so falling back here never costs the CopyRect the update would otherwise have had."
+   breath, so the copy and the pixels it names cannot drift apart — and within a round
+   (see WM-SURFACE-ROUND-HINT) the tick loop holds that lock across every seat, so the
+   same is true of the second screen.  Refused or absent, the hint is still handed to
+   the wire (SEAT-FRAME-COPY) before returning NIL, so falling back here never costs the
+   CopyRect the update would otherwise have had."
   (when-let ((surf (and *wm-scroll-copyrect* *wm-scroll-strip*
-                        (wm-scroll-candidate port box))))
+                        (wm-scroll-candidate port box seat))))
     (glass:with-fb-locked ((wm-surface-fb surf))
       (multiple-value-bind (wire screen allowed)
-          (handler-case (wm-surface-screen-copy port surf fb)
+          (handler-case (wm-surface-screen-copy port surf fb seat)
             (error () (values nil nil nil)))                 ; no hint, not a half-hint
-        (when wire (setf (glass-port-frame-copy port) wire))
+        (when wire (setf (seat-frame-copy (port-seat port seat)) wire))
         (when screen
           ;; A translation that dies half-applied simply reports failure: the caller
           ;; then paints the region WHOLE, which overwrites whatever it managed to do.
-          (handler-case (progn (wm-paint-strip surf fb screen allowed) t)
+          (handler-case (progn (wm-paint-strip surf fb screen allowed seat) t)
             (error (e) (wm-note-surface-error port surf e) nil)))))))
 
-(defun wm-composite (port fb)
-  "Draw the desktop into the screen framebuffer FB, within whatever region FB's clip
-   marks as this composite's responsibility."
-  (let ((box (wm-clip-box fb)))
-    (unless (wm-composite-scroll port fb box)
-      (wm-composite-whole port fb box))))
+(defun wm-composite (seat fb)
+  "Draw the desktop into SEAT's screen framebuffer FB, within whatever region FB's clip
+   marks as this composite's responsibility.  Everything below reads the arrangement
+   from SEAT: which window is where, what is above what, whose menu is open, whose drag
+   is in flight."
+  (let ((port (seat-port seat))
+        (box (wm-clip-box fb)))
+    (unless (wm-composite-scroll port fb box seat)
+      (wm-composite-whole port fb box seat))))
 
-(defun wm-composite-whole (port fb box)
+(defun wm-composite-whole (port fb box &optional seat)
   "Rebuild region BOX (NIL = the whole screen) from the bottom up: desktop, McCLIM
    windows, surface windows, drag wireframe, menus.  Always correct, and what every
    composite that is not a believable scroll does."
-  (unless (and *wm-skip-covered-background* (wm-covered-p port box))
-    (if (glass-port-bg port)
-        (blit-fb (glass-port-bg port) 0 0 fb)                  ; desktop wallpaper
-        (glass:fb-fill fb +wm-teal+)))
-  (dolist (w (reverse (wm-stacking-order port)))              ; every window, bottom-to-top
-    (if (wm-surface-p w)
-        (handler-case (wm-draw-surface w fb port)             ; isolate each surface's draw
-          (error (e) (wm-note-surface-error port w e)))       ; skip it this frame; cull if persistent
-        (ignore-errors                                        ; a bad window draws nothing, not a crash
-         (if (glass-mirror-managed w) (wm-draw-window w fb) (blit-mirror w fb)))))
-  (when-let ((b (and (glass-port-drag-wire port) (glass-port-drag-wire-box port))))  ; wireframe outline
-    (destructuring-bind (x y w h) b
-      (glass:fb-frame fb x y w h glass:+white+ 2)             ; white + inner black = visible on any bg
-      (glass:fb-frame fb (1+ x) (1+ y) (max 0 (- w 2)) (max 0 (- h 2)) glass:+black+ 1)))
-  (when-let ((menu (glass-port-menu port)))                   ; root menu (+ submenu chain) on top
-    (dolist (m (wm-menu-chain menu))
-      (blit-fb (wm-menu-fb m) (wm-menu-x m) (wm-menu-y m) fb))))
+  (let ((seat (port-seat port seat)))
+    (unless (and *wm-skip-covered-background* (wm-covered-p port box seat))
+      (if (seat-bg seat)
+          (blit-fb (seat-bg seat) 0 0 fb)                       ; desktop wallpaper
+          (glass:fb-fill fb +wm-teal+)))
+    (dolist (w (reverse (wm-stacking-order port seat)))         ; every window, bottom-to-top
+      (if (wm-surface-p w)
+          (handler-case (wm-draw-surface w fb port seat)        ; isolate each surface's draw
+            (error (e) (wm-note-surface-error port w e)))       ; skip it this frame; cull if persistent
+          (ignore-errors                                        ; a bad window draws nothing, not a crash
+           (if (glass-mirror-managed w) (wm-draw-window w fb seat) (blit-mirror w fb seat)))))
+    (when-let ((b (and (seat-drag-wire seat) (seat-drag-wire-box seat))))   ; wireframe outline
+      (destructuring-bind (x y w h) b
+        (glass:fb-frame fb x y w h glass:+white+ 2)             ; white + inner black = visible on any bg
+        (glass:fb-frame fb (1+ x) (1+ y) (max 0 (- w 2)) (max 0 (- h 2)) glass:+black+ 1)))
+    (when-let ((menu (seat-menu seat)))                         ; root menu (+ submenu chain) on top
+      (dolist (m (wm-menu-chain menu))
+        (blit-fb (wm-menu-fb m) (wm-menu-x m) (wm-menu-y m) fb)))))
 
 ;;; ---- pointer routing --------------------------------------------------------
 
-(defun wm-window-box (obj)
-  "(x y w h) of OBJ's whole decorated window — title bar + border + content — for
-   damage accounting."
+(defun wm-window-box (obj &optional seat)
+  "(x y w h) of OBJ's whole decorated window — title bar + border + content — AS SEAT
+   HOLDS IT (NIL = the window's own position), for damage accounting."
   (multiple-value-bind (cx cy cw ch)
       (if (wm-surface-p obj)
-          (values (wm-surface-x obj) (wm-surface-y obj)
+          (values (seat-window-x seat obj) (seat-window-y seat obj)
                   (glass:fb-width (wm-surface-fb obj)) (glass:fb-height (wm-surface-fb obj)))
           (when-let ((img (mcclim-render::image-mirror-image obj)))
             (multiple-value-bind (w h) (image-wh img)
-              (values (glass-mirror-x obj) (glass-mirror-y obj) w h))))
+              (values (seat-window-x seat obj) (seat-window-y seat obj) w h))))
     (when cx
       (list (- cx +wm-border+) (- cy +wm-titleh+ +wm-border+)
             (+ cw (* 2 +wm-border+)) (+ +wm-titleh+ ch (* 2 +wm-border+))))))
 
 (defun wm-window-box-at (obj cx cy)
   "The decorated (x y w h) OBJ WOULD occupy if its content were at (CX,CY) — for the
-   wireframe outline, which shows a hypothetical position without moving the window."
+   wireframe outline, which shows a hypothetical position without moving the window.
+   Seat-free: the caller has already decided the position it is asking about."
   (multiple-value-bind (cw ch)
       (if (wm-surface-p obj)
           (values (glass:fb-width (wm-surface-fb obj)) (glass:fb-height (wm-surface-fb obj)))
@@ -716,6 +828,11 @@
 ;;; only once the send backlog (glass:*send-lag*) shows the link falling behind —
 ;;; the outline is a few thin rects, near-free to encode; the real window snaps to
 ;;; the final spot on release.
+;;;
+;;; A drag is one seat's, all the way down: the seat that grabbed the title bar moves
+;;; the window ON ITS OWN SCREEN, and the composite, the CopyRect hint and the wireframe
+;;; are that seat's.  Nobody else's picture moves, and nobody else's link decides whether
+;;; this drag goes wireframe.
 (defparameter *drag-adaptive* t "Auto-switch a laggy opaque drag to wireframe.")
 (defparameter *wireframe-queue-kb* 100.0d0
   "Socket send-queue backlog EWMA (KB, glass:*send-queue*) past which an in-progress
@@ -724,78 +841,87 @@
    no-CopyRect client (macOS) re-encoding the whole window backs it up and trips
    wireframe.  Tune live over the control socket.")
 
-(defun wm-drag-move-opaque (port obj ncx ncy)
-  "Opaque move step: move the real window to content-position (NCX,NCY) and composite
-   old+new with a CopyRect hint (near-free on a client that can CopyRect)."
-  (let ((old (wm-window-box obj)))
-    (wm-move obj ncx ncy)
-    (let ((new (wm-window-box obj)))
-      (composite-all port (wm-box-union (list old new))
-                     (when (and old new)
-                       (list (first old) (second old) (first new) (second new)
-                             (third old) (fourth old)))))))
+(defun wm-drag-move-opaque (port obj ncx ncy &optional seat)
+  "Opaque move step: move the real window to content-position (NCX,NCY) on SEAT's screen
+   and composite old+new with a CopyRect hint (near-free on a client that can CopyRect)."
+  (let* ((seat (port-seat port seat))
+         (old (wm-window-box obj seat)))
+    (wm-move obj ncx ncy seat)
+    (let ((new (wm-window-box obj seat)))
+      (composite-seat seat (wm-box-union (list old new))
+                      (when (and old new)
+                        (list (first old) (second old) (first new) (second new)
+                              (third old) (fourth old)))))))
 
-(defun wm-drag-move (port obj ncx ncy)
+(defun wm-drag-move (port obj ncx ncy &optional seat)
   "A drag move: opaque, unless the socket send-queue (glass:*send-queue*) shows the
    client can't keep up — then switch THIS drag to wireframe (outline starts at the
    window's current box) and don't move the real window."
-  (if (and *drag-adaptive* (> glass:*send-queue* *wireframe-queue-kb*))
-      (progn
-        (setf (glass-port-drag-wire port) t
-              (glass-port-drag-wire-box port) (wm-window-box obj))
-        (wm-drag-wire-to port obj ncx ncy))
-      (wm-drag-move-opaque port obj ncx ncy)))
+  (let ((seat (port-seat port seat)))
+    (if (and *drag-adaptive* (> glass:*send-queue* *wireframe-queue-kb*))
+        (progn
+          (setf (seat-drag-wire seat) t
+                (seat-drag-wire-box seat) (wm-window-box obj seat))
+          (wm-drag-wire-to port obj ncx ncy seat))
+        (wm-drag-move-opaque port obj ncx ncy seat))))
 
-(defun wm-drag-wire-to (port obj ncx ncy)
+(defun wm-drag-wire-to (port obj ncx ncy &optional seat)
   "Wireframe drag step: move only the OUTLINE to content-position (NCX,NCY); the real
    window stays put (its pixels stay on the client), so only the thin outline tiles
    change — cheap even with no CopyRect."
-  (let ((old (glass-port-drag-wire-box port))
-        (new (wm-window-box-at obj ncx ncy)))
-    (setf (glass-port-drag-wire-box port) new)
-    (composite-all port (wm-box-union (list old new)))))
+  (let* ((seat (port-seat port seat))
+         (old (seat-drag-wire-box seat))
+         (new (wm-window-box-at obj ncx ncy)))
+    (setf (seat-drag-wire-box seat) new)
+    (composite-seat seat (wm-box-union (list old new)))))
 
-(defun wm-drag-wire-drop (port obj ncx ncy)
+(defun wm-drag-wire-drop (port obj ncx ncy &optional seat)
   "End a wireframe drag: move the real window to (NCX,NCY) and composite the union of
    the window's OLD position (it stayed put through the drag, so its pixels are still
    on the client and must be ERASED — otherwise a ghost window lingers there), the
    last outline, and the window's NEW box.  The one time the moved content is re-sent."
-  (let ((old (wm-window-box obj))            ; real position BEFORE the move (the ghost source)
-        (wire (glass-port-drag-wire-box port)))
-    (wm-move obj ncx ncy)
-    (setf (glass-port-drag-wire port) nil (glass-port-drag-wire-box port) nil)
-    (composite-all port (wm-box-union (list old wire (wm-window-box obj))))))
+  (let* ((seat (port-seat port seat))
+         (old (wm-window-box obj seat))       ; real position BEFORE the move (the ghost source)
+         (wire (seat-drag-wire-box seat)))
+    (wm-move obj ncx ncy seat)
+    (setf (seat-drag-wire seat) nil (seat-drag-wire-box seat) nil)
+    (composite-seat seat (wm-box-union (list old wire (wm-window-box obj seat))))))
 
-(defun wm-box-union (boxes)
-  "Bounding (x y w h) of BOXES, or NIL if empty."
-  (let ((x0 nil) (y0 nil) (x1 nil) (y1 nil))
-    (dolist (b (remove nil boxes))
-      (destructuring-bind (x y w h) b
-        (setf x0 (if x0 (min x0 x) x) y0 (if y0 (min y0 y) y)
-              x1 (if x1 (max x1 (+ x w)) (+ x w)) y1 (if y1 (max y1 (+ y h)) (+ y h)))))
-    (when x0 (list x0 y0 (- x1 x0) (- y1 y0)))))
+(defun wm-pos-x (obj &optional seat) (seat-window-x seat obj))
+(defun wm-pos-y (obj &optional seat) (seat-window-y seat obj))
 
-(defun wm-pos-x (obj) (if (wm-surface-p obj) (wm-surface-x obj) (glass-mirror-x obj)))
-(defun wm-pos-y (obj) (if (wm-surface-p obj) (wm-surface-y obj) (glass-mirror-y obj)))
-(defun wm-move (obj x y)
-  (if (wm-surface-p obj) (setf (wm-surface-x obj) x (wm-surface-y obj) y)
-      (setf (glass-mirror-x obj) x (glass-mirror-y obj) y)))
+(defun wm-move (obj x y &optional seat)
+  "Put OBJ's content at (X,Y) for SEAT.  With no seat — which is how the harnesses, the
+   control socket and every pre-seat call site say it — this writes the window's OWN
+   position, the one every seat sees until it diverges, exactly as it always did."
+  (if seat
+      (seat-move-window seat obj x y)
+      (setf (window-own-x obj) x (window-own-y obj) y)))
 
-(defun wm-sync-sheet (port obj)
+(defun wm-sync-sheet (port obj &optional seat)
   "After a WM move settles, resync a McCLIM window's SHEET transformation to its new
-   glass-mirror-x/y so McCLIM positions its pull-down menus/dialogs at the window's
-   new spot (wm-move only pokes glass-mirror-x/y, cheap, for per-motion blitting).
-   Runs on the event thread (marshalled via the mailbox) — update-mirror-geometry
-   touches sheet state.  Surfaces have no McCLIM sheet, so they're skipped."
-  (unless (wm-surface-p obj)
-    (when-let ((sheet (glass-mirror-sheet obj)))
-      (let ((x (glass-mirror-x obj)) (y (glass-mirror-y obj)))
-        (enqueue port (lambda ()
-                        (setf (sheet-transformation sheet) (make-translation-transformation x y))
-                        (climi::update-mirror-geometry sheet)))))))
+   position so McCLIM positions its pull-down menus/dialogs at the window's new spot
+   (wm-move only pokes the position, cheap, for per-motion blitting).  Runs on the event
+   thread (marshalled via the mailbox) — update-mirror-geometry touches sheet state.
+   Surfaces have no McCLIM sheet, so they're skipped.
 
-(defun wm-hit (port x y)
-  "Topmost window whose decoration or content contains (X,Y): (values obj REGION cx cy
+   ONLY THE PRIMARY SEAT SYNCS.  A sheet transformation is single-valued and it is what
+   McCLIM places pull-downs and dialogs from, so it can track exactly one seat's idea of
+   where the window is; the primary seat's, which is also the only seat that writes the
+   window's own position.  A secondary seat dragging a McCLIM window therefore moves the
+   window ON ITS OWN SCREEN and leaves McCLIM's pop-up placement where the primary seat
+   has it — visible only if that seat then opens a pull-down, and the honest cost of a
+   single-pointer toolkit."
+  (unless (wm-surface-p obj)
+    (when (or (null seat) (seat-primary-p seat))
+      (when-let ((sheet (glass-mirror-sheet obj)))
+        (let ((x (window-own-x obj)) (y (window-own-y obj)))
+          (enqueue port (lambda ()
+                          (setf (sheet-transformation sheet) (make-translation-transformation x y))
+                          (climi::update-mirror-geometry sheet))))))))
+
+(defun wm-hit (port x y &optional seat)
+  "Topmost window whose decoration or content contains (X,Y) ON SEAT'S SCREEN: (values obj REGION cx cy
    cw ch), REGION one of :winmenu (title-bar menu button) / :resize (bottom-right corner
    grab) / :title / :content; NIL over the workspace.
 
@@ -815,20 +941,25 @@
                 (list obj :resize cx cy cw ch))
                ((and (<= cx x (+ cx cw)) (<= cy y (+ cy ch))) (list obj :content cx cy cw ch))
                ((and (<= cx x (+ cx cw)) (<= ty y cy)) (list obj :title cx cy cw ch))))))
-    (dolist (w (wm-stacking-order port))
+    (dolist (w (wm-stacking-order port seat))
       (let ((hit (cond
                    ((wm-surface-p w)
-                    (test (wm-surface-x w) (wm-surface-y w)
+                    (test (seat-window-x seat w) (seat-window-y seat w)
                           (glass:fb-width (wm-surface-fb w)) (glass:fb-height (wm-surface-fb w)) w))
                    ((glass-mirror-managed w)
                     (when-let ((image (mcclim-render::image-mirror-image w)))
                       (multiple-value-bind (cw ch) (image-wh image)
-                        (test (glass-mirror-x w) (glass-mirror-y w) cw ch w)))))))
+                        (test (seat-window-x seat w) (seat-window-y seat w) cw ch w)))))))
         (when hit (return-from wm-hit (values-list hit)))))))
 
-(defun wm-raise (port obj)
-  "Move OBJ to the front of the one stacking order, whichever kind of window it is,
+(defun wm-raise (port obj &optional seat)
+  "Move OBJ to the front of SEAT's stacking order, whichever kind of window it is,
    and — for a McCLIM window — give it the keyboard.
+
+   The ticket comes from the SESSION's one ZCLOCK even though the stack it goes into is
+   the seat's: one monotonic counter keeps tickets comparable between a window this seat
+   has restacked and one it has never touched, which is what lets a seat diverge from
+   the session arrangement one window at a time instead of all at once.
 
    The second half is the window manager's job and there was nobody else to do it.
    McCLIM routes keyboard events by PORT-KEYBOARD-INPUT-FOCUS, ignoring the sheet on
@@ -846,23 +977,30 @@
 
    Surfaces are not McCLIM windows and take the keyboard the other way, through
    GLASS-PORT-FOCUS-SURFACE, which the caller sets."
-  (setf (wm-window-z obj) (incf (glass-port-zclock port)))
+  (seat-restack-window (port-seat port seat) obj (incf (glass-port-zclock port)))
   (unless (wm-surface-p obj)
     (when-let ((sheet (glass-mirror-sheet obj)))
       (when (typep sheet 'climi::top-level-sheet-mixin)
-        (enqueue port (make-instance 'climi::window-manager-focus-event :sheet sheet))))))
+        ;; McCLIM's keyboard focus is single-valued, so only the seat driving McCLIM may
+        ;; move it; another seat raising a CLIM window raises it on its own screen and
+        ;; leaves the focus with whoever is typing.
+        (when (mcclim-seat-p port seat)
+          (enqueue port (make-instance 'climi::window-manager-focus-event :sheet sheet)))))))
 
 (defun wm-close (port obj)
   "Close window OBJ: tear down a surface's content (kill its shell) and drop it, or
    drop a McCLIM window's mirror (the window vanishes; its frame thread lingers,
-   idle).  Recomposites."
+   idle).  Recomposites EVERY seat — the window is gone for all of them, whichever one
+   asked, and each drops its view and its keyboard along with it."
   (cond
     ((wm-surface-p obj)
      (when (wm-surface-close-fn obj) (ignore-errors (funcall (wm-surface-close-fn obj))))
      (setf (glass-port-surfaces port) (remove obj (glass-port-surfaces port)))
-     (when (eq (glass-port-focus-surface port) obj) (setf (glass-port-focus-surface port) nil)))
+     (dolist (seat (glass-port-seats port))
+       (when (eq (seat-focus-surface seat) obj) (setf (seat-focus-surface seat) nil))))
     (t
      (setf (glass-port-mirrors port) (remove obj (glass-port-mirrors port)))))
+  (port-forget-window port obj)
   (composite-all port))
 
 (defun wm-resize (port obj px-w px-h)
@@ -878,50 +1016,64 @@
 ;;; Back / Refresh / Quit (kill).  We honour the names we can act on; iconify and
 ;;; the mouseless Move/Resize are out of scope (no icon strip; we drag/corner).
 
-(defun wm-lower (port obj)
-  "Back: send OBJ behind every other window — of either kind, now that there is only
+(defun wm-lower (port obj &optional seat)
+  "Back: send OBJ behind every other window ON SEAT'S SCREEN — of either kind, now that there is only
    one stack for it to go to the back of.
 
    One below the current minimum rather than a counter of its own: Back is rare, the
    windows are few, and a second counter is a second thing that can drift out of step
    with the first."
-  (setf (wm-window-z obj)
-        (1- (reduce #'min (wm-stacking-order port) :key #'wm-window-z :initial-value 0)))
-  (composite-all port))
+  (let ((seat (port-seat port seat)))
+    (seat-restack-window
+     seat obj
+     (1- (reduce #'min (wm-stacking-order port seat)
+                 :key (lambda (w) (seat-window-z seat w)) :initial-value 0)))
+    (composite-seat seat)))
 
-(defun wm-fullsize (port obj)
-  "Toggle Full Size / Restore Size for a resizable surface (fills the workspace,
-   below the title bar; a second time restores the saved geometry)."
-  (when (and (wm-surface-p obj) (wm-surface-resize-fn obj))
-    (if (wm-surface-saved-geom obj)
-        (destructuring-bind (x y w h) (wm-surface-saved-geom obj)          ; Restore Size
-          (setf (wm-surface-x obj) x (wm-surface-y obj) y (wm-surface-saved-geom obj) nil)
-          (funcall (wm-surface-resize-fn obj) w h))
-        (progn                                                             ; Full Size
-          (setf (wm-surface-saved-geom obj)
-                (list (wm-surface-x obj) (wm-surface-y obj)
-                      (glass:fb-width (wm-surface-fb obj)) (glass:fb-height (wm-surface-fb obj)))
-                (wm-surface-x obj) +wm-border+
-                (wm-surface-y obj) (+ +wm-titleh+ +wm-border+))
-          (funcall (wm-surface-resize-fn obj)
-                   (- (glass-port-screen-w port) (* 2 +wm-border+))
-                   (- (glass-port-screen-h port) +wm-titleh+ (* 2 +wm-border+)))))
-    (composite-all port)))
+(defun wm-fullsize (port obj &optional seat)
+  "Toggle Full Size / Restore Size for a resizable surface (fills SEAT's workspace,
+   below the title bar; a second time restores the saved geometry).
 
-(defun wm-window-menu-items (port obj)
-  "The Window Menu items (LABEL . THUNK) for OBJ."
+   Full Size is where the shared/per-seat line shows: the POSITION it sets is the asking
+   seat's, but the SIZE it sets is the window's, and a window has one size for everybody
+   because that is what the application laid its content out to.  So a seat filling ITS
+   screen with a window resizes that window on every screen.  The alternative is a
+   per-seat layout, which is a second copy of the application."
+  (let ((seat (port-seat port seat)))
+    (when (and (wm-surface-p obj) (wm-surface-resize-fn obj))
+      (if (wm-surface-saved-geom obj)
+          (destructuring-bind (x y w h) (wm-surface-saved-geom obj)          ; Restore Size
+            (seat-move-window seat obj x y)
+            (setf (wm-surface-saved-geom obj) nil)
+            (funcall (wm-surface-resize-fn obj) w h))
+          (progn                                                             ; Full Size
+            (setf (wm-surface-saved-geom obj)
+                  (list (seat-window-x seat obj) (seat-window-y seat obj)
+                        (glass:fb-width (wm-surface-fb obj)) (glass:fb-height (wm-surface-fb obj))))
+            (seat-move-window seat obj +wm-border+ (+ +wm-titleh+ +wm-border+))
+            (funcall (wm-surface-resize-fn obj)
+                     (- (seat-screen-w seat) (* 2 +wm-border+))
+                     (- (seat-screen-h seat) +wm-titleh+ (* 2 +wm-border+)))))
+      ;; the size changed for everybody, so everybody repaints
+      (composite-all port))))
+
+(defun wm-window-menu-items (port obj &optional seat)
+  "The Window Menu items (LABEL . THUNK) for OBJ, closed over the SEAT that opened it —
+   Back and Refresh act on that seat's screen and nobody else's."
   (append
    (when (and (wm-surface-p obj) (wm-surface-resize-fn obj))
      (list (cons (if (wm-surface-saved-geom obj) "Restore Size" "Full Size")
-                 (lambda () (wm-fullsize port obj)))))
-   (list (cons "Back"    (lambda () (wm-lower port obj)))
-         (cons "Refresh" (lambda () (composite-all port)))
+                 (lambda () (wm-fullsize port obj seat)))))
+   (list (cons "Back"    (lambda () (wm-lower port obj seat)))
+         (cons "Refresh" (lambda () (composite-seat (port-seat port seat))))
          (cons "Quit"    (lambda () (wm-close port obj))))))
 
-(defun wm-open-window-menu (port obj cx cy)
+(defun wm-open-window-menu (port obj cx cy &optional seat)
   "Pop the Window Menu just below OBJ's title bar (at content top-left CX,CY)."
-  (let ((menu (make-wm-menu :hover -1 :title "Window" :items (wm-window-menu-items port obj))))
-    (setf (glass-port-menu port) (wm-place-menu menu port cx cy))))
+  (let ((seat (port-seat port seat))
+        (menu (make-wm-menu :hover -1 :title "Window"
+                            :items (wm-window-menu-items port obj seat))))
+    (setf (seat-menu seat) (wm-place-menu menu seat cx cy))))
 
 ;;; ---- workspace root menu ----------------------------------------------------
 
@@ -966,14 +1118,16 @@
                 (if (< i (length (wm-menu-items menu))) i :title))))
         :outside)))
 
-(defun wm-place-menu (menu port x y)
-  "Render MENU and position it on-screen, top-left near (X,Y) but kept in bounds."
+(defun wm-place-menu (menu seat x y)
+  "Render MENU and position it on SEAT's screen, top-left near (X,Y) but kept in that
+   seat's bounds — a menu clamps to the screen it opened on, which is why this needs a
+   seat and not a port: the two screens are different sizes."
   (wm-menu-render menu)
-  (setf (wm-menu-x menu) (max 0 (min x (- (glass-port-screen-w port) (glass:fb-width (wm-menu-fb menu)))))
-        (wm-menu-y menu) (max 0 (min y (- (glass-port-screen-h port) (glass:fb-height (wm-menu-fb menu))))))
+  (setf (wm-menu-x menu) (max 0 (min x (- (seat-screen-w seat) (glass:fb-width (wm-menu-fb menu)))))
+        (wm-menu-y menu) (max 0 (min y (- (seat-screen-h seat) (glass:fb-height (wm-menu-fb menu))))))
   menu)
 
-(defun wm-open-menu (port x y)
+(defun wm-open-menu (port x y &optional seat)
   "Open the workspace root menu at (X,Y): the port's items, plus whatever the SESSION
    itself can offer from the workspace — today, speaking the clipboard.  Those are
    appended here rather than registered as apps because they are not apps and because
@@ -981,10 +1135,11 @@
    exactly while something is being said.  A port whose menu was overridden still gets
    them, for the same reason it still gets a window menu — they are the desktop's, not
    the menu list's."
-  (let ((menu (make-wm-menu :x x :y y :hover -1
+  (let ((seat (port-seat port seat))
+        (menu (make-wm-menu :x x :y y :hover -1
                             :items (append (glass-port-menu-items port)
-                                           (wm-clipboard-menu-items)))))
-    (setf (glass-port-menu port) (wm-place-menu menu port x y))))
+                                           (wm-clipboard-menu-items seat)))))
+    (setf (seat-menu seat) (wm-place-menu menu seat x y))))
 
 ;;; ---- the selection menu (right-click ON the thing you selected) --------------
 ;;;
@@ -1060,12 +1215,13 @@
        (when (and hush (wm-speaking-p))
          (list (cons "Stop speaking" (lambda () (ignore-errors (funcall hush))))))))))
 
-(defun wm-clipboard-menu-items ()
-  "The session-CLIPBOARD speech items, appended to the workspace root menu (see
-   WM-OPEN-MENU).  The counterpart of the selection menu, and deliberately named for
-   what it does: this reads whatever was last COPIED, which is the session's, outlives
-   any one window's highlight, and is still there to be read from the bare workspace
-   where there is nobody to ask what is selected.  An empty clipboard says so rather
+(defun wm-clipboard-menu-items (&optional seat)
+  "The CLIPBOARD speech items, appended to the workspace root menu (see WM-OPEN-MENU).
+   The counterpart of the selection menu, and deliberately named for what it does: this
+   reads whatever THIS SEAT last COPIED, which outlives any one window's highlight and
+   is still there to be read from the bare workspace where there is nobody to ask what
+   is selected.  A seat's clipboard and not the session's, so the item on my menu reads
+   back what I copied and not what you did.  An empty clipboard says so rather
    than saying nothing — silence is indistinguishable from a broken voice.
 
    Empty when this image has no speech at all, so the root menu grows nothing it cannot
@@ -1076,7 +1232,9 @@
       (append
        (list (cons "Speak clipboard"
                    (lambda ()
-                     (let ((text (ignore-errors (glass:clipboard-text (glass:session-clipboard)))))
+                     (let ((text (ignore-errors
+                                  (glass:clipboard-text (if seat (seat-clipboard seat)
+                                                            (glass:session-clipboard))))))
                        (when hush (ignore-errors (funcall hush)))
                        (ignore-errors
                         (funcall speak (if (and (stringp text) (plusp (length text)))
@@ -1085,34 +1243,40 @@
        (when (and hush (wm-speaking-p))
          (list (cons "Stop speaking" (lambda () (ignore-errors (funcall hush))))))))))
 
-(defun wm-open-selection-menu (port surf x y)
+(defun wm-open-selection-menu (port surf x y &optional seat)
   "Open the selection menu over SURF at (X,Y), or return NIL if there is nothing to
    offer — a NIL return is the caller's signal to let the press through to the app."
   (when-let* ((text (wm-surface-live-selection surf))
               (items (wm-selection-menu-items text)))
-    (let ((menu (make-wm-menu :x x :y y :hover -1 :title "Selection" :items items)))
-      (setf (glass-port-menu port) (wm-place-menu menu port x y)))))
+    (let ((seat (port-seat port seat))
+          (menu (make-wm-menu :x x :y y :hover -1 :title "Selection" :items items)))
+      (setf (seat-menu seat) (wm-place-menu menu seat x y)))))
 
-(defun wm-open-submenu (parent idx action port)
+(defun wm-open-submenu (parent idx action seat)
   "Open ACTION's submenu as PARENT's child, to the right of PARENT's item IDX."
   (let ((sub (make-wm-menu :hover -1 :title (car (nth idx (wm-menu-items parent)))
                            :items (cdr action))))                ; (:submenu ITEM...) -> ITEMs
     (wm-menu-render sub)
     (setf (wm-menu-child parent)
-          (wm-place-menu sub port
+          (wm-place-menu sub seat
                          (+ (wm-menu-x parent) (glass:fb-width (wm-menu-fb parent)) -2)
                          (+ (wm-menu-y parent) +menu-titleh+ (* idx +menu-itemh+) -1)))))
 
-(defun wm-menu-pointer (port root mask x y)
+(defun wm-menu-pointer (port root mask x y &optional seat)
   "Route a pointer event to the open menu tree ROOT (a menu + its submenu chain).
    Hover opens/closes submenus; a left-press on a leaf runs it and dismisses all;
-   a click off every menu dismisses."
-  (let* ((left (logtest mask 1))
+   a click off every menu dismisses.
+
+   The whole tree belongs to the seat that opened it: the hover highlight, the submenu
+   chain and the dismiss all recomposite THAT seat.  Another seat never sees this menu
+   and its screen is not touched by any of it."
+  (let* ((seat (port-seat port seat))
+         (left (logtest mask 1))
          (chain (wm-menu-chain root))
          (menu (find-if (lambda (m) (not (eq :outside (wm-menu-index m x y)))) (reverse chain))))
     (cond
       ((null menu)                                              ; off every menu
-       (when (logtest mask 5) (setf (glass-port-menu port) nil) (composite-all port)))
+       (when (logtest mask 5) (setf (seat-menu seat) nil) (composite-seat seat)))
       (t
        (let ((idx (wm-menu-index menu x y)))
          (cond
@@ -1121,107 +1285,140 @@
               (unless (eql idx (wm-menu-hover menu))            ; hover moved within this menu
                 (setf (wm-menu-hover menu) idx
                       (wm-menu-child menu) nil)                 ; drop any sibling's submenu
-                (when (wm-submenu-p action) (wm-open-submenu menu idx action port))
+                (when (wm-submenu-p action) (wm-open-submenu menu idx action seat))
                 (wm-menu-render menu)
-                (composite-all port))
+                (composite-seat seat))
               (when left
                 (cond
                   ((wm-submenu-p action)                        ; keep it open, don't dismiss
                    (unless (wm-menu-child menu)
-                     (wm-open-submenu menu idx action port) (composite-all port)))
+                     (wm-open-submenu menu idx action seat) (composite-seat seat)))
                   (t                                            ; leaf: run + dismiss the whole tree
-                   (setf (glass-port-menu port) nil) (composite-all port)
-                   (when action (wm-menu-run port action)))))))
+                   (setf (seat-menu seat) nil) (composite-seat seat)
+                   (when action (wm-menu-run port action seat)))))))
            (t                                                   ; over the title strip
             (unless (eql (wm-menu-hover menu) -1)
-              (setf (wm-menu-hover menu) -1) (wm-menu-render menu) (composite-all port)))))))))
+              (setf (wm-menu-hover menu) -1) (wm-menu-render menu) (composite-seat seat)))))))))
 
-(defun wm-on-pointer (port mask x y)
-  (when-let ((menu (glass-port-menu port)))                    ; an open menu grabs the pointer
-    (wm-menu-pointer port menu mask x y)
-    (return-from wm-on-pointer))
-  (let ((down (logtest mask 1)))
-    (cond
-      ((glass-port-drag port)                                 ; a move or resize in progress
-       (destructuring-bind (obj mode . rest) (glass-port-drag port)
-         (ecase mode
-           (:move
-            (destructuring-bind (dx dy) rest
-              (let ((ncx (- x dx)) (ncy (- y dy)))
-                (cond
-                  ((glass-port-drag-wire port)               ; already wireframe (no flapping)
-                   (if down (wm-drag-wire-to port obj ncx ncy)
-                       (wm-drag-wire-drop port obj ncx ncy)))  ; release -> land the window
-                  (down (wm-drag-move port obj ncx ncy))     ; opaque; switch to wireframe if laggy
-                  (t (wm-drag-move-opaque port obj ncx ncy)))))) ; release -> final opaque, no switch
-           (:resize (destructuring-bind (x0 y0 cw0 ch0) rest
-                      (wm-resize port obj (+ cw0 (- x x0)) (+ ch0 (- y y0))) (composite-all port))))
-         (unless down                                        ; release: end the drag
-           (setf (glass-port-drag port) nil)
-           (when (eq mode :move) (wm-sync-sheet port obj)))))   ; keep McCLIM's menu coords tracking
-      (t
-       (multiple-value-bind (obj region cx cy cw ch) (wm-hit port x y)
-         (cond
-           ((and (null obj) (logtest mask 5))                 ; press on workspace (left OR right): root menu
-            (wm-open-menu port x y) (composite-all port))
-           ((null obj))                                       ; workspace: ignore
-           ((eq region :winmenu)                              ; title-bar wedge: the Window Menu
-            (when down
-              (wm-raise port obj)
-              (when (wm-surface-p obj) (setf (glass-port-focus-surface port) obj))
-              (wm-open-window-menu port obj cx cy) (composite-all port)))
-           ((eq region :resize)                               ; bottom-right corner: start a resize
-            (when down
-              (wm-raise port obj)
-              (when (wm-surface-p obj) (setf (glass-port-focus-surface port) obj))
-              (setf (glass-port-drag port) (list obj :resize x y cw ch))
-              (composite-all port)))
-           ((eq region :title)                                ; title bar: start a move
-            (when down
-              (wm-raise port obj)
-              (when (wm-surface-p obj) (setf (glass-port-focus-surface port) obj))
-              (setf (glass-port-drag port) (list obj :move (- x (wm-pos-x obj)) (- y (wm-pos-y obj))))
-              (composite-all port)))
-           ;; Right-press inside the window that is holding the selection: the selection
-           ;; menu, over the words themselves.  WM-OPEN-SELECTION-MENU answers NIL when
-           ;; this window owns nothing worth a menu, and then the clause fails and the
-           ;; press goes to the app below exactly as it always did — button 3 is the
-           ;; application's until there is something of the session's to say about it.
-           ((and (wm-surface-p obj) (logtest mask 4)
-                 (wm-open-selection-menu port obj x y))
-            (composite-all port))
-           ((wm-surface-p obj)                                ; content of a surface window
-            (when down
-              (setf (glass-port-focus-surface port) obj)
-              ;; Raise only if it is not already the frontmost window — the same guard
-              ;; the McCLIM branch below has, and for a bigger reason.  DOWN is true of
-              ;; every motion event with a button held, so a drag or a text selection
-              ;; INSIDE this window used to run a full-screen COMPOSITE-ALL per event:
-              ;; a whole-desktop repaint, marked as :FULL damage, which then makes the
-              ;; RFB sender diff the entire screen instead of the box that changed.  It
-              ;; painted the pixels that were already there, every time.  A window that
-              ;; is already on top has nothing to raise and nothing to repaint.
-              (unless (eq obj (wm-topmost port))
-                (wm-raise port obj) (composite-all port)))
-            (when (wm-surface-on-pointer obj) (funcall (wm-surface-on-pointer obj) mask (- x cx) (- y cy))))
-           (t                                                 ; content of a McCLIM window
-            (when down (setf (glass-port-focus-surface port) nil))   ; keyboard back to CLIM
-            ;; Raise unless it is already the frontmost window — which now means
-            ;; frontmost of ALL windows, not merely of the McCLIM ones.  Against the
-            ;; old mirrors-only test, clicking a McCLIM window that sat under a
-            ;; terminal did nothing: it was already first among mirrors, so no raise
-            ;; and no composite, and the window stayed buried.
-            (when (and down (not (eq obj (wm-topmost port))))
-              (wm-raise port obj) (composite-all port))
-            (emit-pointer-events port (glass-mirror-sheet obj) mask (- x cx) (- y cy)))))))))
+(defun wm-on-pointer (port mask x y &optional seat)
+  "Route one seat's pointer.  Every decision here — which window is under the pointer,
+   whether it is already on top, whose menu is open, whose drag is in flight, which
+   window has this keyboard — is read from and written to SEAT, so two people can be
+   dragging two windows, or the same window to two different places, at once."
+  (let ((seat (port-seat port seat)))
+    (when-let ((menu (seat-menu seat)))                      ; an open menu grabs the pointer
+      (wm-menu-pointer port menu mask x y seat)
+      (return-from wm-on-pointer))
+    (let ((down (logtest mask 1)))
+      (cond
+        ((seat-drag seat)                                    ; a move or resize in progress
+         (destructuring-bind (obj mode . rest) (seat-drag seat)
+           (ecase mode
+             (:move
+              (destructuring-bind (dx dy) rest
+                (let ((ncx (- x dx)) (ncy (- y dy)))
+                  (cond
+                    ((seat-drag-wire seat)                   ; already wireframe (no flapping)
+                     (if down (wm-drag-wire-to port obj ncx ncy seat)
+                         (wm-drag-wire-drop port obj ncx ncy seat)))  ; release -> land the window
+                    (down (wm-drag-move port obj ncx ncy seat))  ; opaque; wireframe if laggy
+                    (t (wm-drag-move-opaque port obj ncx ncy seat)))))) ; release -> final opaque
+             ;; A resize changes the window's SIZE, which is the session's — so it
+             ;; recomposites every seat, not just this one.
+             (:resize (destructuring-bind (x0 y0 cw0 ch0) rest
+                        (wm-resize port obj (+ cw0 (- x x0)) (+ ch0 (- y y0)))
+                        (composite-all port))))
+           (unless down                                      ; release: end the drag
+             (setf (seat-drag seat) nil)
+             (when (eq mode :move) (wm-sync-sheet port obj seat)))))  ; McCLIM's menu coords
+        (t
+         (multiple-value-bind (obj region cx cy cw ch) (wm-hit port x y seat)
+           (cond
+             ((and (null obj) (logtest mask 5))              ; press on workspace: root menu
+              (wm-open-menu port x y seat) (composite-seat seat))
+             ((null obj))                                    ; workspace: ignore
+             ((eq region :winmenu)                           ; title-bar wedge: the Window Menu
+              (when down
+                (wm-raise port obj seat)
+                (when (wm-surface-p obj) (setf (seat-focus-surface seat) obj))
+                (wm-open-window-menu port obj cx cy seat) (composite-seat seat)))
+             ((eq region :resize)                            ; bottom-right corner: start a resize
+              (when down
+                (wm-raise port obj seat)
+                (when (wm-surface-p obj) (setf (seat-focus-surface seat) obj))
+                (setf (seat-drag seat) (list obj :resize x y cw ch))
+                (composite-seat seat)))
+             ((eq region :title)                             ; title bar: start a move
+              (when down
+                (wm-raise port obj seat)
+                (when (wm-surface-p obj) (setf (seat-focus-surface seat) obj))
+                (setf (seat-drag seat)
+                      (list obj :move (- x (wm-pos-x obj seat)) (- y (wm-pos-y obj seat))))
+                (composite-seat seat)))
+             ;; Right-press inside the window that is holding the selection: the selection
+             ;; menu, over the words themselves.  WM-OPEN-SELECTION-MENU answers NIL when
+             ;; this window owns nothing worth a menu, and then the clause fails and the
+             ;; press goes to the app below exactly as it always did — button 3 is the
+             ;; application's until there is something of the session's to say about it.
+             ((and (wm-surface-p obj) (logtest mask 4)
+                   (wm-open-selection-menu port obj x y seat))
+              (composite-seat seat))
+             ((wm-surface-p obj)                             ; content of a surface window
+              (when down
+                (setf (seat-focus-surface seat) obj)
+                ;; Raise only if it is not already the frontmost window — the same guard
+                ;; the McCLIM branch below has, and for a bigger reason.  DOWN is true of
+                ;; every motion event with a button held, so a drag or a text selection
+                ;; INSIDE this window used to run a full-screen composite per event: a
+                ;; whole-desktop repaint, marked as :FULL damage, which then makes the
+                ;; RFB sender diff the entire screen instead of the box that changed.  It
+                ;; painted the pixels that were already there, every time.  A window that
+                ;; is already on top has nothing to raise and nothing to repaint.
+                ;;
+                ;; Both halves are THIS SEAT's: frontmost-for-this-seat, raised for this
+                ;; seat, recomposited on this seat's screen.  Seat A raising a window does
+                ;; not reorder seat B's stack, so it must not skip a raise because the
+                ;; window happens to be on top of B's.
+                (unless (eq obj (wm-topmost port seat))
+                  (wm-raise port obj seat) (composite-seat seat)))
+              (when (wm-surface-on-pointer obj)
+                (funcall (wm-surface-on-pointer obj) mask (- x cx) (- y cy))))
+             (t                                              ; content of a McCLIM window
+              (when down (setf (seat-focus-surface seat) nil))   ; keyboard back to CLIM
+              ;; Raise unless it is already the frontmost window — which now means
+              ;; frontmost of ALL windows, not merely of the McCLIM ones.  Against the
+              ;; old mirrors-only test, clicking a McCLIM window that sat under a
+              ;; terminal did nothing: it was already first among mirrors, so no raise
+              ;; and no composite, and the window stayed buried.
+              (when (and down (not (eq obj (wm-topmost port seat))))
+                (wm-raise port obj seat) (composite-seat seat))
+              ;; The window manager's half of the click is done and it was this seat's.
+              ;; The CLIM half is McCLIM's, which has one pointer: a PRESS takes the token
+              ;; (inside EMIT-POINTER-EVENTS) and drives the application; bare MOTION from
+              ;; a seat that is not driving is dropped, or its mouse would drag the
+              ;; holder's CLIM pointer around under their hands.
+              (when (or (logtest mask 7) (mcclim-seat-p port seat))
+                (emit-pointer-events port (glass-mirror-sheet obj) mask
+                                     (- x cx) (- y cy) seat))))))))))
 
 ;;; ---- run ---------------------------------------------------------------------
 
-(defun wm-add-surface* (port surf)
+(defvar *wm-spawn-seat* nil
+  "The seat whose menu pick is launching a window, or NIL.  A spec-spawning call chain is
+   long and passes through user code (an app's own invoker), so the seat that asked rides
+   a dynamic binding rather than an extra argument on eight launchers — it is read once,
+   by WM-ADD-SURFACE*, to decide whose keyboard the new window takes.")
+
+(defun wm-add-surface* (port surf &optional seat)
+  "Add SURF to the session and raise it.  A NEW WINDOW OPENS ON TOP FOR EVERYBODY: the z
+   ticket goes on the window itself, which is what every seat reads for a window it has
+   never restacked, so nobody has to be told about it.  The KEYBOARD, though, goes only
+   to the seat that opened it — a window appearing on my screen must not take the keys
+   out from under you mid-sentence."
   (setf (glass-port-cascade port) (mod (+ (glass-port-cascade port) 28) 200))
   (push surf (glass-port-surfaces port))
-  (wm-raise port surf)                   ; a new window opens on top of everything
-  (setf (glass-port-focus-surface port) surf)
+  (setf (window-own-z surf) (incf (glass-port-zclock port)))
+  (setf (seat-focus-surface (port-seat port (or seat *wm-spawn-seat*))) surf)
   surf)
 
 (defun add-surface (port make-fn &key (title "surface") (width 800) (height 600))
@@ -1526,12 +1723,15 @@
                                    (when title (list :pretty-name title)))
                        (or title (princ-to-string class)))))))
 
-(defun wm-menu-run (port action)
+(defun wm-menu-run (port action &optional seat)
   "Run a chosen menu ACTION: a window spec (launch it) or, as an escape hatch, a
-   thunk (call it)."
+   thunk (call it).  A launched window is the SESSION's — it appears for everybody — but
+   its keyboard goes to the seat that picked it off the menu."
   (if (functionp action)
       (funcall action)
-      (progn (wm-spawn-spec port action) (composite-all port))))
+      (let ((*wm-spawn-seat* (port-seat port seat)))
+        (wm-spawn-spec port action)
+        (composite-all port))))
 
 (defun wm-app-item (label pkg class-name &rest args)
   "A menu item launching McCLIM frame CLASS-NAME in PKG, or NIL if that package/
@@ -1585,6 +1785,53 @@
                           '("Browse example.com" :browse "https://example.com"))))))
    *extra-apps*))                                          ; external apps (empty unless registered)
 
+(defvar *wm-tick-round* 0 "Monotonic compositing-round counter for the WM tick loop.")
+
+(defun wm-tick (port)
+  "One frame of the desktop, for EVERY seat.
+
+   The shape is the one it always had — poll the surfaces, fold in the McCLIM repaints
+   the mirrors accumulated, composite what changed — with the damage now expressed in
+   each window's own coordinates and converted per seat, because one content change
+   lands on a different rectangle of each screen.
+
+   THE ROUND IS WHY THIS IS ONE FUNCTION AND NOT A LOOP OVER SEATS OF THE OLD ONE.  A
+   surface reports its scroll translation consumingly, so if each seat asked in turn the
+   first would take it and the rest would composite as though nothing moved — the second
+   seat would lose the CopyRect, which on a window drag over a nested desktop is 24-57x
+   the bytes.  So the tick takes each hint ONCE (*WM-COPY-ROUND*) and every seat judges
+   the same one against its own stack, clip and screen; and it holds the scrolling
+   surfaces' framebuffer locks across the whole round, so the pixels cannot move out from
+   under the second seat's blit.  Normally that is one lock and one scrolling window."
+  (let ((scrollers '()))
+    (dolist (s (glass-port-surfaces port))
+      ;; isolate each surface's poll: a signalling dirty-p is caught, the surface skipped
+      ;; this frame (and culled if it keeps failing), and the compositor loop kept ALIVE —
+      ;; one bad window can't take down the desktop.
+      (handler-case
+          (let ((dp (wm-surface-dirty-p s)))
+            (cond ((null dp) (port-damage-all port))              ; unknown extent
+                  ((funcall dp)
+                   (port-damage-window port s)                      ; its own box, per seat
+                   (when (wm-surface-copy-p s) (push s scrollers))))
+            (setf (wm-surface-err-count s) 0))                      ; healthy poll -> reset
+        (error (e) (wm-note-surface-error port s e))))
+    ;; McCLIM repaints were accumulated per seat by PRESENT-MIRROR, already in each
+    ;; seat's screen coordinates; drain them alongside the surface damage so a burst of
+    ;; ~20 repaints still becomes ONE composite per seat.
+    (let ((*wm-copy-round* (incf *wm-tick-round*)))
+      (wm-with-scroll-locks
+       scrollers
+       (lambda ()
+         (dolist (seat (glass-port-seats port))
+           ;; Surface damage and McCLIM damage now land in the SAME per-seat
+           ;; accumulator, so one drained box is the union the old loop built by hand,
+           ;; and an idle desktop still composites exactly nothing.
+           (let ((pend (seat-take-pending seat)))
+             (when pend
+               (ignore-errors
+                (composite-seat seat (unless (eq pend :full) pend)))))))))))
+
 (defun run-wm (specs &key (port 5900) (width 1000) (height 720) menu
                           background (background-mode :cover))
   "Run a mini OPEN LOOK desktop over VNC.  Each spec is a decorated window:
@@ -1613,24 +1860,4 @@
     ;; no wasted full-screen redraws.  A NIL dirty-p means "always redraw" (safe
     ;; default); a static surface (image) reports NIL forever.  WM operations
     ;; (move/resize/menu/...) recomposite directly, so they're not gated here.
-    (loop (sleep 1/60)
-          (let ((boxes '()) (full nil))
-            (dolist (s (glass-port-surfaces p))
-              ;; isolate each surface's poll: a signalling dirty-p is caught, the
-              ;; surface skipped this frame (and culled if it keeps failing), and the
-              ;; compositor loop kept ALIVE — one bad window can't take down the desktop.
-              (handler-case
-                  (let ((dp (wm-surface-dirty-p s)))
-                    (cond ((null dp) (setf full t))                      ; unknown extent -> whole screen
-                          ((funcall dp) (push (wm-window-box s) boxes)))
-                    (setf (wm-surface-err-count s) 0))                   ; healthy poll -> reset
-                (error (e) (wm-note-surface-error p s e))))
-            ;; McCLIM app repaints accumulated by present-mirror since the last tick,
-            ;; coalesced into ONE composite here (a burst of ~20 repaints -> 1 paint)
-            (let ((pend (port-take-pending p)))
-              (cond ((eq pend :full) (setf full t))
-                    (pend (push pend boxes))))
-            (when (or full boxes)
-              ;; damage only the changed windows (a full-screen surface with no
-              ;; dirty-p, or a :full McCLIM repaint, forces a whole-screen recomposite)
-              (ignore-errors (composite-all p (unless full (wm-box-union boxes)))))))))
+    (loop (sleep 1/60) (wm-tick p))))

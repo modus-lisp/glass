@@ -11,6 +11,23 @@
 ;;;; selection is.  So the clipboard lives here, beside the framebuffer, and a transport is a thin
 ;;;; thing that converts.
 ;;;;
+;;;; PER-TRANSPORT IS WRONG; PER-SEAT IS RIGHT.  Those are different axes and the argument above
+;;;; is only about the first one.  A transport is a WIRE — a VNC connection, a WebRTC channel —
+;;;; and several of them can carry ONE person's screen and hands, so a clipboard per transport
+;;;; splits one person's selection in two: they copy in the VNC window and cannot paste in the
+;;;; WebRTC one.  A SEAT is a PERSON — a screen, a pointer, a keyboard, a focus (see the backend's
+;;;; seat.lisp) — and two of them are two people cooperating on one set of applications.  Two
+;;;; people copying must not clobber each other: you copy a paragraph, I copy a filename, and
+;;;; neither of us should find the other's text on the end of our next paste.  So the selection
+;;;; belongs to the SEAT, and ALL of a seat's transports share it.
+;;;;
+;;;; Nothing in this file has to change for that, which is the point of it being here: a clipboard
+;;;; is a value with an owner, and WHOSE it is, is decided by whoever makes one.  A single-seat
+;;;; session has exactly one and reaches it through SESSION-CLIPBOARD, exactly as before; a
+;;;; multi-seat session gives each seat its own and hands it to that seat's transports (glass:SERVE
+;;;; takes a :CLIPBOARD).  SESSION-CLIPBOARD remains the default for anything that has no seat to
+;;;; ask — a local app, a test, a lone transport — and is the one a single-seat desktop uses.
+;;;;
 ;;;; Where it is NOT the mixer, which matters more than where it is:
 ;;;;
 ;;;; IT IS DISCRETE, SO THERE IS NO CLOCK.  Audio has to be produced whether anyone is listening

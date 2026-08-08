@@ -571,9 +571,11 @@ network decides how much we READ; it must not decide how much we ALLOCATE."
                (read-sequence buf s :end k)
                (decf n k)))))
 
-(defun read-client-cut-text (client s)
+(defun read-client-cut-text (client s &optional (clipboard (session-clipboard)))
   "ClientCutText (RFC 6143 §7.5.6): a 32-bit length, then that many Latin-1 bytes, which become
-the session selection with this client as its owner.
+CLIPBOARD's selection with this client as its owner.  CLIPBOARD defaults to the session's, which
+is what a one-seat desktop has; a multi-seat one hands each seat's transports that SEAT's
+clipboard, so two people copying do not clobber each other.
 
 The length is SIGNED, and a NEGATIVE one is not a length: it is the extended-clipboard
 pseudo-encoding (-1063) re-using message type 6, with |len| bytes of a capability-tagged,
@@ -591,8 +593,8 @@ implementing it is the follow-on that makes this clipboard UTF-8 instead of Lati
          (format *trace-output* "~&glass: ClientCutText ~d bytes truncated to ~d~%"
                  len *max-cut-text*)
          (force-output *trace-output*)
-         (clipboard-own (session-clipboard) client :text (latin1-string keep) :name "vnc client")))
-      (t (clipboard-own (session-clipboard) client
+         (clipboard-own clipboard client :text (latin1-string keep) :name "vnc client")))
+      (t (clipboard-own clipboard client
                         :text (if (plusp len) (latin1-string (r-bytes s len)) "")
                         :name "vnc client")))))
 
@@ -705,14 +707,14 @@ its bytes would land in the middle of a rect."
   (if w (sb-thread:with-mutex ((wake-lock w)) (sb-thread:condition-wait (wake-cv w) (wake-lock w) :timeout timeout))
       (sleep timeout)))
 
-(defun send-pending-cut-text (client s)
-  "Tell this client about the session selection if it has changed since it last heard.
+(defun send-pending-cut-text (client s &optional (clipboard (session-clipboard)))
+  "Tell this client about ITS SEAT's selection if it has changed since it last heard.
 
    Runs at the top of the sender loop — on the ONE thread that writes to this socket, between
    framebuffer updates, never inside one.  A client is never sent its own cut text back: it
    already has it, and echoing it is how two viewers of the same session end up handing one
    string back and forth forever."
-  (let ((cb (session-clipboard)))
+  (let ((cb clipboard))
     ;; The gate is an unlocked read of one fixnum, because this runs ~60 times a second per
     ;; client and almost always has nothing to do: taking the lock and materializing the text
     ;; every tick would make the common case (nobody copied anything) the expensive one, and
@@ -725,12 +727,12 @@ its bytes would land in the middle of a rect."
           (handler-case (progn (send-cut-text s text) t)
             (error () (setf (rc-running client) nil) nil)))))))
 
-(defun rfb-sender-loop (client fb s wake)
+(defun rfb-sender-loop (client fb s wake &optional (clipboard (session-clipboard)))
   "Fulfil the client's pending request the moment the fb changes (parked on WAKE,
    ~60 Hz safety timeout).  Runs in its own thread; exits when the client stops."
   (let ((fd (ignore-errors (sb-sys:fd-stream-fd s))))    ; for the socket-queue backlog
   (loop while (rc-running client) do
-    (send-pending-cut-text client s)
+    (send-pending-cut-text client s clipboard)
     (let ((req (sb-thread:with-mutex ((rc-lock client)) (rc-want client))))
       (cond
         ((null req) (wake-wait wake 1/60))
@@ -813,8 +815,9 @@ its bytes would land in the middle of a rect."
    framebuffers with no window manager at all.  The key is CONSUMED when it fires — which is
    right, because Shift+Insert in the app underneath means exactly this.")
 
-(defun rfb-paste-chord (client down keysym)
+(defun rfb-paste-chord (client down keysym &optional (clipboard (session-clipboard)))
   "Track Shift and notice the paste chord.  Returns T if the key was consumed by a paste.
+   Pastes from CLIPBOARD — this client's seat's selection, not necessarily the session's.
 
    A modifier arrives as its own key event and never as a flag on the keystroke it modifies, so
    Shift has to be latched; it is passed through as well as latched, or the app underneath would
@@ -824,20 +827,20 @@ its bytes would land in the middle of a rect."
     (t (let ((chord *paste-chord*))
          (when (and chord (plusp down) (eql keysym (second chord))
                     (or (not (eq (first chord) :shift)) (rc-shift client)))
-           (clipboard-paste)                                          ; types on its own thread
+           (clipboard-paste :clipboard clipboard)                     ; types on its own thread
            t)))))
 
-(defun client-loop (fb s on-key on-pointer on-resize wake)
+(defun client-loop (fb s on-key on-pointer on-resize wake &optional (clipboard (session-clipboard)))
   "Read RFB client messages, handling input (key/pointer) IMMEDIATELY; framebuffer
    updates are produced by a companion sender thread, so input is never blocked on
    a frame.  Only the sender writes pixels; this thread never writes to S."
   (let* ((client (make-rfb-client :last-size (cons (fb-width fb) (fb-height fb))))
-         (sender (sb-thread:make-thread (lambda () (rfb-sender-loop client fb s wake))
+         (sender (sb-thread:make-thread (lambda () (rfb-sender-loop client fb s wake clipboard))
                                         :name "glass-sender")))
     ;; A selection change should reach this client now, not at the next 1/60 safety tick — the
     ;; same nudge the compositor gives the sender when it has drawn.  Keyed by the client, so a
     ;; reconnect replaces its listener instead of stacking another one.
-    (clipboard-listen (session-clipboard) client
+    (clipboard-listen clipboard client
                       (lambda (cb serial owner)
                         (declare (ignore cb serial owner))
                         (wake-signal wake)))
@@ -881,11 +884,11 @@ its bytes would land in the middle of a rect."
                (4 (let ((down (r-u8 s)))                   ; KeyEvent
                     (skip s 2)
                     (let ((key (r-u32 s)))
-                      (unless (rfb-paste-chord client down key)
+                      (unless (rfb-paste-chord client down key clipboard)
                         (when on-key (funcall on-key (plusp down) key))))))
                (5 (let ((buttons (r-u8 s)) (x (r-u16 s)) (y (r-u16 s)))   ; PointerEvent
                     (when on-pointer (funcall on-pointer buttons x y))))
-               (6 (skip s 3) (read-client-cut-text client s))             ; ClientCutText
+               (6 (skip s 3) (read-client-cut-text client s clipboard))   ; ClientCutText
                (251 (skip s 1)                             ; SetDesktopSize (client wants a size)
                     (let ((rw (r-u16 s)) (rh (r-u16 s)) (nscreens (r-u8 s)))
                       (skip s 1)
@@ -900,18 +903,24 @@ its bytes would land in the middle of a rect."
       ;; still leaves its text on the session clipboard — CLIPBOARD-DISOWN here would wipe the
       ;; user's clipboard every time they closed a viewer tab, and the content is a plain string
       ;; that needs no owner to serve it.  Disowning is for an owner whose CONTENT dies with it.
-      (clipboard-unlisten (session-clipboard) client)
+      (clipboard-unlisten clipboard client)
       (ignore-errors (sb-thread:join-thread sender)))))
 
 ;;; ---- server -----------------------------------------------------------------
 
-(defun serve (fb port &key on-key on-pointer on-resize (name *desktop-name*) once wake)
+(defun serve (fb port &key on-key on-pointer on-resize (name *desktop-name*) once wake
+                           (clipboard (session-clipboard)))
   "Serve framebuffer FB over RFB on PORT.  ON-KEY (down-p keysym), ON-POINTER
    (button-mask x y) and ON-RESIZE (requested-w requested-h, from the client
    resizing its window) are optional callbacks.  With :ONCE, handle a single
    client and return; otherwise loop, each client in its own thread.  WAKE (a
    glass:make-wake) lets the caller nudge parked senders the instant it has
-   drawn — call glass:wake-signal after compositing; NIL falls back to polling."
+   drawn — call glass:wake-signal after compositing; NIL falls back to polling.
+
+   CLIPBOARD is the selection every client of THIS listener shares, defaulting to the
+   session's.  Several transports of one seat pass the same one (a VNC viewer and a
+   WebRTC channel showing the same screen must paste each other's text); separate SEATS
+   pass different ones, because two people copying must not clobber each other."
   (let ((listen (tcp-listen port)))
     ;; Paste's fallback consumer types the selection into whatever has focus, and the only path
     ;; that knows where focus IS, is the one a real keystroke takes.  So the callback the caller
@@ -924,7 +933,7 @@ its bytes would land in the middle of a rect."
     (flet ((run (stream)
              (unwind-protect
                   (when (handshake fb stream name)     ; NIL = auth failed -> drop the client
-                    (client-loop fb stream on-key on-pointer on-resize wake))
+                    (client-loop fb stream on-key on-pointer on-resize wake clipboard))
                (ignore-errors (close stream)))))
       (unwind-protect
            (loop
