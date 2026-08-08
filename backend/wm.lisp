@@ -1193,13 +1193,23 @@
    returns (values ON-KEY ON-POINTER DIRTY-P) — the same surface contract the
    terminal exposes (on-key/on-pointer forward RFB input, dirty-p repaints into the
    fb and reports change).  The WM decorates, composites, drags, raises and closes
-   it like any window.  Nothing here knows about any particular app."
+   it like any window.  Nothing here knows about any particular app.
+
+   Three more values are OPTIONAL and default to what an app that returns three has
+   always had: COPY-P (how the content translated — a scrolling app hands its
+   CopyRect to the compositor instead of being re-encoded; see the COPY-P slot),
+   CLOSE-FN (tear the app down when the window closes) and RESIZE-FN.  They are
+   extra return values rather than extra arguments because MAKE-FN is what builds
+   the app: it is the only thing that knows whether the app HAS a translation to
+   report, and it does not know that until it has made it."
   (let* ((fb (glass:make-framebuffer width height (glass:rgb 255 255 255)))
          (c (glass-port-cascade port)))
-    (multiple-value-bind (on-key on-pointer dirty-p) (funcall make-fn fb)
+    (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn resize-fn)
+        (funcall make-fn fb)
       (wm-add-surface* port
         (make-wm-surface :fb fb :x (+ 40 c) :y (+ 40 c +wm-titleh+) :title title
-                         :on-key on-key :on-pointer on-pointer :dirty-p dirty-p)))))
+                         :on-key on-key :on-pointer on-pointer :dirty-p dirty-p
+                         :copy-p copy-p :close-fn close-fn :resize-fn resize-fn)))))
 
 (defun wm-add-terminal (port &key (cols 80) (rows 24) (ppem 14))
   "Create a terminal (shell in a pty) and add it as a WM surface window."

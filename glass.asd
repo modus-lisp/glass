@@ -54,6 +54,24 @@ give modus a remote display, developed and tested on SBCL first."
      (:file "rfb")
      (:file "zrle")))))
 
+(asdf:defsystem :glass/client
+  :description "The other end of the wire: an RFB (VNC) CLIENT, so a glass desktop
+can show another one.  Connects to a remote RFB server and keeps a local glass
+framebuffer holding what it displays, forwarding keys and pointer events back — a
+remote desktop reduced to the same (framebuffer + on-key + on-pointer) a terminal or
+a browser already is, which is what lets a window manager host it as an ordinary
+window.  Shares the server's ZRLE tables (read backwards) and cram's inflate,
+continued across rectangles the way RFB's one persistent zlib stream needs.  No
+McCLIM and no window-manager dependency: usable headless as a screen scraper or as
+the measuring instrument in a bandwidth benchmark.  Carries no clipboard and no
+audio across the boundary, deliberately."
+  :version "0.0.1"
+  :author "ynniv"
+  :license "MIT"
+  :depends-on ("glass")
+  :serial t
+  :components ((:module "src" :serial t :components ((:file "rfb-client")))))
+
 (asdf:defsystem :glass/vncauth
   :description "VNC Authentication (the RFB DES challenge/response) for glass's
 server, via seal's DES.  OPTIONAL — core :glass carries no crypto dependency and

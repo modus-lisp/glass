@@ -102,6 +102,29 @@ does the interesting work:
 
 See [backend/README](backend/README.md).
 
+## The other end of the wire (`:glass/client`)
+
+`:glass/client` is an RFB **client**: connect to a remote VNC server and keep a
+local glass framebuffer holding what it displays, forwarding keys and pointer
+events back. ZRLE (the server's own tile tables, read backwards, over one
+persistent zlib stream), CopyRect, Raw, and `DesktopSize`; it reconnects on its
+own and never blocks its caller on the socket. No McCLIM, no window manager —
+`glass-client:connect-remote` gives you a framebuffer and two input functions, so
+it is equally a screen scraper or a bandwidth-measuring instrument.
+
+Which makes a remote desktop a `wm-surface`: `mcclim-glass/remote` wraps it as one
+and registers **"Remote desktop"** in the root menu, so another glass session runs
+as a window on this one, decorated, dragged, raised and typed into like a
+terminal. The part worth having is that the scroll optimisation **composes across
+the boundary**: a CopyRect arriving from the inner desktop becomes this window's
+translation hint, which the compositor turns into a screen strip-blit and a
+CopyRect on the outer connection. Measured on a nested pair
+([`inspect/nested-copyrect.lisp`](inspect/nested-copyrect.lisp)), a scroll two
+desktops deep costs **153 KB/frame on the outer hop instead of 1168 KB** — 7.5x —
+while the inner hop is unchanged. Deliberately carries **no clipboard and no
+audio** across the boundary: ours is a session-wide selection, and bridging one
+across a trust boundary automatically is a channel, not a feature.
+
 ## Sound (`:glass/audio`)
 
 A session has a screen and it has a sound, and it can have more than one listener
