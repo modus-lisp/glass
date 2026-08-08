@@ -46,6 +46,42 @@ McCLIM application frames, PTY **terminals**, and a **browser** side by side. Ea
   tunable on the running server (see `inspect/serve-desktop.lisp`, which also
   opens a bare-TCP eval socket: `echo '(glass:perf-report)' | nc -q1 127.0.0.1 4009`).
 
+## Multi-seat: several people, one session
+
+`(clim-glass::add-wm-seat PORT :port-num N :width W :height H)` attaches a **second
+person** to a running desktop — a screen of their own on RFB port `N`, with their own
+pointer, keyboard, focus, open menu, clipboard, and **arrangement of the same windows**.
+
+The axis is: **what runs** is shared, **who watches** is per-seat. The applications and
+each window's *content* framebuffer are shared, and so is each window's *size* — size is
+what an application lays its content out to, so a per-seat size would be a per-seat
+layout, which is a second copy of the application. Position and stacking carry no such
+consequence, so they are per-seat: two people can hold the same window in different
+places, with different things in front of it, and click, drag and type independently.
+
+A seat's view of a window is **copy-on-write** against the window's own slots
+(`wm-surface-x`, `wm-mirror-x`, `wm-window-z`), so a seat that has never moved a
+particular window has no record for it and reads those — a seat joining a running
+session sees the desktop as it stands, and a one-seat session carries no view records at
+all. One seat is **primary** and writes through to those slots, because McCLIM's sheet
+geometry is single-valued and somebody has to own the position it believes in.
+
+**McCLIM windows are one consolidated seat**, and this is a documented seam rather than
+a bug: a CLIM port has one pointer and one keyboard focus, so the last seat to *press a
+button* inside a CLIM window drives it, and another seat's bare pointer motion is
+dropped rather than dragging CLIM's one pointer around under their hands. Everything the
+*window manager* does — see, move, raise, lower, resize, close — stays per-seat for CLIM
+windows too. Native glass surfaces (terminals, the browser, warren, a nested remote
+desktop) carry no such assumption and are per-seat all the way down.
+
+Cursors need no code: glass sends the cursor *shape* once as an RFB pseudo-encoding and
+each viewer draws it at its own pointer. Audio and the microphone are **not** per-seat
+yet — the mix reaches a listener over a separate socket, so that is work in
+`glass/audio-stream` and `glass/mic-stream`, not in the compositor.
+
+`backend/inspect/seat-gate.lisp` holds two seats on one session and checks all of the
+above from the pixels.
+
 Also a **message-port** backend (`clim-glass:make-message-port`) + **compositor**
 that run each app as an isolated actor drawing to a shared display over a mailbox —
 an unmodified CLIM frame across an actor boundary — the shape glass takes toward

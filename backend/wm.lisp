@@ -1861,3 +1861,30 @@
     ;; default); a static surface (image) reports NIL forever.  WM operations
     ;; (move/resize/menu/...) recomposite directly, so they're not gated here.
     (loop (sleep 1/60) (wm-tick p))))
+
+(defun add-wm-seat (port &key port-num (width 1000) (height 720) name background
+                              (background-mode :cover))
+  "Attach a SECOND (third, …) person to a running desktop: a screen of their own at
+   WIDTH x HEIGHT serving on PORT-NUM, with their own pointer, keyboard, focus, menu,
+   clipboard and arrangement of the SAME windows.
+
+   Nothing about the session changes.  The new seat starts with no views, so it sees
+   every window exactly where the others have it, and diverges one window at a time as
+   it moves or raises them.  The tick loop picks it up on its next frame because it
+   loops over PORT's seats.
+
+   PORT-NUM is required and deliberately has no default: the obvious ones are ports
+   somebody is already serving a desktop on, and a seat that quietly failed to listen
+   is a seat nobody can find.
+
+   Returns the seat."
+  (check-type port-num (integer 1 65535))
+  (let ((seat (add-seat port :name (or name (format nil "seat-~d" port-num))
+                             :port-num port-num :width width :height height
+                             :fb (glass:make-framebuffer width height +wm-teal+))))
+    (when background
+      (setf (seat-bg seat)
+            (ignore-errors (wm-render-background seat background :mode background-mode))))
+    (start-seat-server seat)
+    (composite-seat seat)
+    seat))
