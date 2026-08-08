@@ -44,6 +44,25 @@
 5913), and bound to loopback by default: the mix is a session's private sound, and a listener
 off the box should come through something that authenticates.")
 
+(defparameter *audio-port-offset* 10
+  "How far a seat's audio port sits from its RFB screen port.
+
+It is the convention that already existed — the desktop on 5903 serves its mix on 5913 — read as
+arithmetic instead of as a number typed into a startup script, so that a SECOND seat's ports
+follow from the one thing a seat already has: the port its screen is on.  The live WebRTC
+gateway finds 5913 from GLASS_AUDIO_PORT with exactly that default, so the primary seat's
+numbers do not move and nothing outside has to learn anything.
+
+The pair is +10/+11, so two seats want their screen ports at least two apart; the desktop-side
+convention is one decade apart (5903 -> 5913/5914, 5923 -> 5933/5934), which also keeps the
+audio ports of one seat away from the screen port of another.")
+
+(defparameter *mic-port-offset* 11
+  "How far a seat's microphone port sits from its RFB screen port (5903 -> 5914).")
+
+(defun seat-audio-port (rfb-port) (+ rfb-port *audio-port-offset*))
+(defun seat-mic-port   (rfb-port) (+ rfb-port *mic-port-offset*))
+
 ;;; ---- wire format -----------------------------------------------------------
 
 (defun %put-s16le (pcm octets)
@@ -99,7 +118,7 @@ audio, not a disconnect."
 ;;; ---- the server ------------------------------------------------------------
 
 (defstruct (audio-stream (:constructor %make-audio-stream))
-  mixer
+  mix                               ; the composite this port serves: the session's, or a seat's
   (port 0 :type fixnum)
   socket
   thread
@@ -108,6 +127,11 @@ audio, not a disconnect."
   (lock (sb-thread:make-mutex :name "glass-audio-stream"))
   (clients '())
   (served 0 :type fixnum))
+
+(defun audio-stream-mixer (srv)
+  "The bus behind the mix this port serves.  Kept under its old name because that is what a
+caller asking wants — the session's rate and clock — and a seat's mix is on the same one."
+  (mix-bus (audio-stream-mix srv)))
 
 (defun %audio-client-name (sock)
   (or (ignore-errors
@@ -118,8 +142,9 @@ audio, not a disconnect."
 (defun %serve-audio-client (srv sock)
   "One connection: subscribe a private sink, announce it, then a frame per period until the peer
 goes away.  Runs on its own thread, so a peer that stops reading costs exactly this thread."
-  (let ((m (audio-stream-mixer srv))
-        (stream nil) (sink nil) (who (%audio-client-name sock)))
+  (let* ((mix (audio-stream-mix srv))
+         (m (mix-bus mix))
+         (stream nil) (sink nil) (who (%audio-client-name sock)))
     (unwind-protect
          (handler-case
              (progn
@@ -138,8 +163,8 @@ goes away.  Runs on its own thread, so a peer that stops reading costs exactly t
                       (bytes (* 2 frame))
                       (octets (make-array bytes :element-type '(unsigned-byte 8)))
                       (silence (reed:make-pcm16 frame)))
-                 (setf sink (mixer-subscribe m :name name :rate rate :frame-samples frame
-                                               :gain gain :lead (audio-stream-lead srv)))
+                 (setf sink (mixer-subscribe mix :name name :rate rate :frame-samples frame
+                                                 :gain gain :lead (audio-stream-lead srv)))
                  (sb-thread:with-mutex ((audio-stream-lock srv))
                    (push sink (audio-stream-clients srv))
                    (incf (audio-stream-served srv)))
@@ -151,7 +176,7 @@ goes away.  Runs on its own thread, so a peer that stops reading costs exactly t
       (when sink
         (sb-thread:with-mutex ((audio-stream-lock srv))
           (setf (audio-stream-clients srv) (remove sink (audio-stream-clients srv))))
-        (ignore-errors (mixer-unsubscribe (audio-stream-mixer srv) sink)))
+        (ignore-errors (sink-unsubscribe sink)))
       (ignore-errors (when stream (close stream)))
       (ignore-errors (sb-bsd-sockets:socket-close sock)))))
 
@@ -195,8 +220,12 @@ consumer's read pace must not become the rate at which the session is sampled."
         ;; its buffer exists to absorb.  Same judgement as the mixer's clock.
         (setf next (if (< (+ next tick) now) (+ now tick) (+ next tick)))))))
 
-(defun start-audio-stream (&key mixer (port *audio-stream-port*) (address "127.0.0.1") (lead 2))
-  "Serve MIXER's mix on PORT: one MIXER-SUBSCRIBE per connection, 20 ms frames, forever.
+(defun start-audio-stream (&key mixer mix (port *audio-stream-port*) (address "127.0.0.1") (lead 2))
+  "Serve a mix on PORT: one MIXER-SUBSCRIBE per connection, 20 ms frames, forever.
+
+MIX is the composite to serve — one SEAT's, when a seat has one of its own.  MIXER (or neither)
+means the session's own mix, which is what a one-seat desktop has and what every caller written
+before there were seats meant.
 
 LEAD is each connection's cushion in the sink, in frames — the jitter absorbed between the
 mixer's clock and this connection's before a reader ever sees a gap.  It is latency you are
@@ -206,8 +235,8 @@ its own queue on the far side should not need more.
 Returns an AUDIO-STREAM; STOP-AUDIO-STREAM closes it.  Safe to call with no listeners and safe
 to leave running with none — the mix advances regardless, which is the point of it having its
 own clock."
-  (let* ((m (or mixer (session-mixer)))
-         (srv (%make-audio-stream :mixer m :port port :lead lead
+  (let* ((target (as-mix (or mix mixer (session-mixer))))
+         (srv (%make-audio-stream :mix target :port port :lead lead
                                   :socket (tcp-listen port :address address :backlog 4)
                                   :running t)))
     (setf (audio-stream-thread srv)
@@ -225,15 +254,28 @@ own clock."
 (defun stop-audio-stream (srv)
   (setf (audio-stream-running srv) nil)
   (ignore-errors (sb-bsd-sockets:socket-close (audio-stream-socket srv)))
+  ;; A stopped stream is not there to be adopted: leaving it in *SESSION-AUDIO-STREAM* would
+  ;; hand the next headset a closed socket to call the session's sound.  (STOP-MIC-STREAM has
+  ;; always done the same for its half.)
+  (when (eq srv *session-audio-stream*) (setf *session-audio-stream* nil))
   srv)
 
 (defun audio-stream-report (srv)
   (sb-thread:with-mutex ((audio-stream-lock srv))
-    (format nil "audio-stream :~d served=~d listening=~a clients=(~{~a~^ ~})"
-            (audio-stream-port srv) (audio-stream-served srv) (audio-stream-running srv)
+    (format nil "audio-stream :~d [~a] served=~d listening=~a clients=(~{~a~^ ~})"
+            (audio-stream-port srv) (mix-name (audio-stream-mix srv))
+            (audio-stream-served srv) (audio-stream-running srv)
             (mapcar (lambda (s) (format nil "~a@~d:~d/-~d/u~d" (sink-name s) (sink-rate s)
                                         (sink-frames s) (sink-drops s) (sink-underruns s)))
                     (audio-stream-clients srv)))))
+
+(defvar *session-audio-stream* nil
+  "The port this image is serving the SESSION's mix on, if any — the primary seat's.
+
+Kept so that a seat asking for audio it already has does not open a second listener on a port
+that is already answering: the desktop's startup script starts this one directly (and the live
+WebRTC gateway is connected to it), so a headset for the primary seat ADOPTS it rather than
+racing it.  A further seat's stream is its own and is not this.")
 
 (defun start-session-audio (&key (port *audio-stream-port*) (address "127.0.0.1") (lead 2)
                                  (file (sb-ext:posix-getenv "GLASS_AUDIO_MP3")) (gain 0.6d0) (loop t))
@@ -259,6 +301,7 @@ yet make any noise, and the stream still runs."
             (serious-condition (e)
               (format *error-output* "~&@@ audio: ~a not usable (~a) — the mix is silence~%" file e))))
         (let ((srv (start-audio-stream :mixer m :port port :address address :lead lead)))
+          (setf *session-audio-stream* srv)
           (format *error-output* "~&@@ audio stream on ~a:~d — ~a~%" address port (mixer-report m))
           (finish-output *error-output*)
           srv))

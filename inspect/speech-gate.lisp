@@ -238,6 +238,50 @@ that waits for audio that is never coming does not hang — it fills the heap."
       (setf glass:*speech-voice* installed))
     (glass:stop-speaker spk)))
 
+;;; ---- 6. said to the person who asked --------------------------------------
+;;;
+;;; A selection belongs to one seat — they highlighted it — so "Speak selection" is for them.
+;;; The voice itself stays session-wide (one engine, one queue, utterances in turn); what is
+;;; per-seat is the AUDIENCE the utterance carries, which the mixer's composite reads.
+
+(format t "~&~%=== an utterance addressed to one seat ===~%")
+(let* ((m (glass:make-mixer))
+       (spk (glass:make-speaker :mixer m))
+       (seat-b (glass:make-mix m :name "seat-b"))
+       (ear-a (glass:mixer-subscribe m :name "seat-a-ear" :lead 0))
+       (ear-b (glass:mixer-subscribe seat-b :name "seat-b-ear" :lead 0))
+       (loud-a 0) (loud-b 0))
+  ;; B's selection, read to B
+  (glass:speak "This is only for the second seat." :speaker spk :audience (list seat-b))
+  (await (lambda () (plusp (glass::spk-said spk))) :timeout 120 :what "the sentence")
+  (loop repeat 600
+        do (glass:mixer-tick m)
+           (let ((fa (glass:sink-next-frame ear-a)) (fb (glass:sink-next-frame ear-b)))
+             (when (and fa (> (rms fa) 20d0)) (incf loud-a))
+             (when (and fb (> (rms fb) 20d0)) (incf loud-b)))
+           (when (and (not (glass:speaking-p spk)) (> loud-b 10) (null (glass::spk-ready spk)))
+             (return)))
+  (check-that "the seat it was addressed to hears it" (plusp loud-b)
+              (format nil "~d frames with sound in them" loud-b))
+  (check-that "and the other seat hears nothing at all" (zerop loud-a)
+              (format nil "~d loud frames on the seat that did not ask" loud-a))
+  (check-that "one voice, one source on the bus — not one engine per person"
+              (= 1 (length (glass:mixer-sources m))))
+  ;; and with no audience it is the desktop talking out loud, which everybody hears
+  (setf loud-a 0 loud-b 0)
+  (glass:speak "This one is for the room." :speaker spk)
+  (await (lambda () (= 2 (glass::spk-said spk))) :timeout 120 :what "the second sentence")
+  (loop repeat 600
+        do (glass:mixer-tick m)
+           (let ((fa (glass:sink-next-frame ear-a)) (fb (glass:sink-next-frame ear-b)))
+             (when (and fa (> (rms fa) 20d0)) (incf loud-a))
+             (when (and fb (> (rms fb) 20d0)) (incf loud-b)))
+           (when (and (not (glass:speaking-p spk)) (> loud-a 10) (null (glass::spk-ready spk)))
+             (return)))
+  (check-that "an unaddressed sentence reaches everybody" (and (plusp loud-a) (plusp loud-b))
+              (format nil "~d and ~d frames" loud-a loud-b))
+  (glass:stop-speaker spk))
+
 (glass:stop-speaker *spk*)
 
 (format t "~&~%~a~%" (glass:speech-report *spk*))

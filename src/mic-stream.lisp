@@ -105,8 +105,14 @@ honestly as an underrun, short enough that a real pause is a real pause.")
   (served 0 :type fixnum))
 
 (defvar *session-mic-stream* nil
-  "The one microphone port this image is serving, if any.  Session-wide for the reason the mixer
-and the clipboard are: a second one would be a second answer to 'who is talking to this box'.")
+  "The microphone port the SESSION is serving, if any — the primary seat's.
+
+There was one of these because there was one person.  With seats there is one PER SEAT, and they
+do not merge: a microphone is the one thing here that is nobody else's business, and two people
+in two rooms talking into two phones are two microphones and never a mix (mixing them is what
+would put each one's voice into the other's ear over a network round trip).  This variable stays
+the SESSION's — the primary seat's — because everything that asks without a seat to ask about
+(the ear a one-seat desktop starts, a control socket, MIC-REPORT) means that one.")
 
 (defun session-mic ()
   "The microphone the session is currently being spoken into, or NIL.
@@ -306,9 +312,20 @@ until the peer goes away.  Its own thread, so a sender that stalls costs exactly
       (ignore-errors (when stream (close stream)))
       (ignore-errors (sb-bsd-sockets:socket-close sock)))))
 
+(defun stream-mic (&optional (srv *session-mic-stream*))
+  "The microphone currently connected to THIS port, or NIL.  SESSION-MIC is this asked of the
+session's; a seat's ear asks it of the seat's, which is what makes my microphone mine."
+  (and srv (sb-thread:with-mutex ((mic-stream-lock srv)) (mic-stream-current srv))))
+
 (defun start-mic-stream (&key (port *mic-stream-port*) (address "127.0.0.1")
-                              (rate *mic-rate*) frame-samples (depth 16) (prime 4))
+                              (rate *mic-rate*) frame-samples (depth 16) (prime 4)
+                              (install t))
   "Accept a peer's microphone on PORT and convert it to RATE for whoever asks.
+
+INSTALL t (the default, and what a one-seat desktop wants) also makes this the SESSION's
+microphone port — *SESSION-MIC-STREAM*, which is what SESSION-MIC and everything without a seat
+to ask reads.  A further seat passes NIL: its microphone is its own, and installing it would
+hand the session's ear somebody else's room.
 
 PRIME is deliberately deeper than the audio tap's 2 in the other direction, because the consumer
 here is a RECOGNIZER and not a loudspeaker.  A listener would rather lose 20 ms than hear it 80 ms
@@ -334,7 +351,7 @@ state of the port, and it costs one thread asleep in accept."
                                             :name "glass-mic-client"))
                  (serious-condition () (sleep 0.2)))))
            :name "glass-mic-stream"))
-    (setf *session-mic-stream* srv)
+    (when install (setf *session-mic-stream* srv))
     srv))
 
 (defun stop-mic-stream (&optional (srv *session-mic-stream*))

@@ -102,6 +102,12 @@ a transcript further and further in the past, which is worse than a gap and a co
 ;; exactly the case where a struct redefinition costs a desktop restart.  See src/record.lisp.
 (define-record (ears (:constructor %make-ears) (:conc-name ear-))
   (mixer nil)
+  (mix nil)                           ; the composite it falls back to — one seat's, or the session's
+  ;; The microphone port THIS ear prefers.  NIL means the session's (*SESSION-MIC-STREAM*), which
+  ;; is what a one-seat desktop has and what every caller written before there were seats meant.
+  ;; A seat's ear names its seat's port, and that is the whole of "my microphone reaches my ear
+  ;; and not yours": two ears, two ports, no arbitration.
+  (mic-stream nil)
   (sink nil)                          ; the MIXER-SINK this hears through, if it made one
   (source nil)                        ; the thunk it pulls frames from
   (rate 16000 :type fixnum)
@@ -159,8 +165,9 @@ paying for an ear."
              (setf (ear-rec ear) (funcall (%stave "LOAD-RECOGNIZER") dir))
           (setf (ear-loading ear) nil)))))
 
-(defun %peer-mic ()
-  "The peer microphone the session is being spoken into, if one is live.
+(defun %peer-mic (&optional ear)
+  "The peer microphone THIS ear is being spoken into, if one is live: its own port's if it has
+one, and the session's otherwise.
 
 Looked up by name at run time — the symbols are exported by packages.lisp whether or not anything
 defines them, and FBOUNDP is the question actually being asked: is :glass/mic-stream loaded?  Same
@@ -168,7 +175,8 @@ trick as %STAVE, for the same reason, and it is what keeps this system's depende
 (glass/audio stave) while still preferring a microphone the moment one can exist."
   (and *hearing-prefer-mic*
        (fboundp 'session-mic)
-       (let ((mic (funcall 'session-mic)))
+       (let ((mic (let ((own (and ear (ear-mic-stream ear))))
+                    (if own (funcall 'stream-mic own) (funcall 'session-mic)))))
          (and mic (funcall 'mic-live-p mic) mic))))
 
 (defun %hearing-source (ear sink)
@@ -182,7 +190,7 @@ one, and the transport already converts to exactly this rate — a mismatch mean
 the two ends with different arithmetic, and silently listening to the mix instead is a better
 answer than confident nonsense."
   (lambda ()
-    (let ((mic (%peer-mic)))
+    (let ((mic (%peer-mic ear)))
       (cond ((and mic (= (funcall 'mic-rate mic) (ear-rate ear)))
              (setf (ear-listening-to ear) :peer)
              (funcall 'mic-next-frame mic))
@@ -478,14 +486,24 @@ weights and 80 ms to decode a chunk, and neither costs the puller a single frame
 
 ;;; ---- starting and stopping -------------------------------------------------
 
-(defun make-ears (&key (mixer (session-mixer)) (rate *hearing-rate*) source (gain 1.0d0))
-  "An ear on MIXER: one sink in the mix and TWO threads behind it, all started.
+(defun make-ears (&key (mixer (session-mixer)) mix mic-stream (rate *hearing-rate*) source
+                       (gain 1.0d0) rec)
+  "An ear on a mix: one sink in it and TWO threads behind them, all started.
 
 SOURCE overrides everything below — a thunk returning the next frame of signed 16-bit mono at
 RATE, or NIL when there is none, which is reed's contract and therefore also an audio tap's.  It
 is how audio from anywhere at all gets transcribed, and it is what a test hands in.
 
-With no SOURCE the ear listens to A PEER'S MICROPHONE WHILE ONE IS LIVE and to the session mix
+MIX is the composite to sink on (one SEAT's), MIXER the bus whose session mix to use; MIC-STREAM
+is the microphone port this ear prefers, and NIL means the session's.  A seat passes both of its
+own, and that is the whole of a per-seat ear: my microphone into my ear, my mix behind it.
+
+REC is an already-loaded recognizer to hear through instead of reading the weights again.  It is
+offered because a second ear otherwise costs a second quarter of a gigabyte; it is not the
+default, because stave's recognizer state under two concurrent listeners is not something this
+file is entitled to assume.
+
+With no SOURCE the ear listens to A PEER'S MICROPHONE WHILE ONE IS LIVE and to the mix
 the rest of the time (%HEARING-SOURCE).  The sink is subscribed either way, because the fall-back
 has to be already running when the phone hangs up — a sink created at that moment would be a
 sink with an empty cushion, which is a hole in the audio exactly where the microphone stopped.
@@ -497,10 +515,13 @@ has heard nothing, which is the truth and is cheap to say.
 
 For the push half of the transcript — a consumer that must ACT on speech rather than display it,
 as dictation does — see HEARING-LISTEN."
-  (let* ((frame (max 1 (round (* rate (mixer-period mixer)))))
+  (let* ((target (as-mix (or mix mixer)))
+         (bus (mix-bus target))
+         (frame (max 1 (round (* rate (mixer-period bus)))))
          (sink (unless source
-                 (mixer-subscribe mixer :name "ears" :rate rate :frame-samples frame :gain gain)))
-         (ear (%make-ears :mixer mixer :sink sink :rate rate :frame-samples frame
+                 (mixer-subscribe target :name "ears" :rate rate :frame-samples frame :gain gain)))
+         (ear (%make-ears :mixer bus :mix target :mic-stream mic-stream :rec rec
+                          :sink sink :rate rate :frame-samples frame
                           :listening-to (if source :given :mix))))
     (setf (ear-source ear) (or source (%hearing-source ear sink)))
     (setf (ear-running ear) t
@@ -550,7 +571,7 @@ dictation listener registered on it, so the lie would survive the fix for it."
       (when th (ignore-errors (sb-thread:join-thread th :timeout 30))))
     (setf (ear-decode-thread ear) nil (ear-ready ear) nil)
     (when (ear-sink ear)
-      (ignore-errors (mixer-unsubscribe (ear-mixer ear) (ear-sink ear)))
+      (ignore-errors (sink-unsubscribe (ear-sink ear)))
       (setf (ear-sink ear) nil))
     (when (eq ear *session-ears*) (setf *session-ears* nil)))
   t)

@@ -138,6 +138,21 @@ desktop that cannot transcribe can still carry a microphone."
   :serial t
   :components ((:module "src" :serial t :components ((:file "mic-stream")))))
 
+(asdf:defsystem :glass/headset
+  :description "One person's audio on a shared session: a mix of their own out (their selection
+and their gains over the session's sources, composited on the one clock — never a second pull of
+a source that can only be pulled once), their own microphone in, their own ear behind it, and the
+keyboard their dictation types on.  The audio half of a SEAT, with no idea that McCLIM or RFB
+exist: the ports are derived from the seat's screen port (5903 -> 5913 out, 5914 in), so the
+primary seat's numbers are the ones a one-seat desktop has always served.  The ear and dictation
+are looked up by name, so a desktop with no recognizer installed still gives every seat sound."
+  :version "0.0.1"
+  :author "ynniv"
+  :license "MIT"
+  :depends-on ("glass" "glass/audio-stream" "glass/mic-stream")
+  :serial t
+  :components ((:module "src" :serial t :components ((:file "headset")))))
+
 (asdf:defsystem :glass/speech
   :description "The desktop's voice: chord (a neural TTS engine, also pure Common Lisp) as one
 long-lived source in the session mix.  SPEAK queues text and returns; a thread behind it

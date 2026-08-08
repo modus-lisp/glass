@@ -26,6 +26,17 @@
 ;;;; splits them) so a paragraph starts speaking after its first sentence rather than after its
 ;;;; last.
 ;;;;
+;;;; ONE VOICE FOR A SESSION WITH SEVERAL PEOPLE IN IT, AND THE AUDIENCE IS PER UTTERANCE.  Two
+;;;; seats do not want two engines: that would be two 60 MB voices and two synthesis threads
+;;;; competing for the same cores, to buy a privacy that costs a list here.  What is per-seat is
+;;;; who a sentence is FOR — audio.lisp's SRC-AUDIENCE — and it can be, because there is one
+;;;; voice and it says one thing at a time, so the audience of the samples being handed to the
+;;;; clock is never ambiguous.  SPEAK with no :AUDIENCE is the desktop talking out loud and
+;;;; everybody watching hears it (a notification, a job announcing itself); SPEAK :AUDIENCE with
+;;;; a seat's mix is reading THAT person's selection to them, which is what the WM's "Speak
+;;;; selection" does, because a selection is one person's.  Two seats asking at once are answered
+;;;; in turn — which is not a limitation, it is what having a voice means.
+;;;;
 ;;;; chord is looked up at run time, not depended on at read time, for the same reason the
 ;;;; desktop looks up START-SESSION-AUDIO by name: a build without a voice must still be a
 ;;;; working desktop.
@@ -59,6 +70,10 @@ run together — the model puts no pause at a boundary it never saw.")
   (voice nil)                         ; chord's loaded voice, on first use
   (lock (sb-thread:make-mutex :name "glass-speech"))
   (wake (sb-thread:make-semaphore :name "glass-speech-wake"))
+  ;; Each entry carries WHO IT IS FOR: (TEXT . AUDIENCE) waiting, (SAMPLES . AUDIENCE) ready.
+  ;; NIL audience is the session — everybody watching hears the desktop talk, which is what a
+  ;; notification means.  A list of mixes is one seat, which is what reading THAT PERSON's
+  ;; selection aloud means.  One voice either way: see the header.
   (pending '())                       ; text waiting to be synthesized, oldest first
   (ready '())                         ; (simple-array (signed-byte 16) (*)) at the mix rate
   (offset 0 :type fixnum)             ; how far into the first READY buffer the thunk has read
@@ -92,15 +107,28 @@ lazily keeps a desktop that never speaks from paying for a voice."
 
 ;;; ---- text in ---------------------------------------------------------------
 
-(defun speak (text &key (speaker (session-speaker)))
-  "Say TEXT on the session mix.  Returns immediately — this queues.
+(defun %audience-list (audience)
+  "AUDIENCE as the list a source's AUDIENCE slot wants: NIL, one mix, or several."
+  (cond ((null audience) nil)
+        ((listp audience) audience)
+        (t (list audience))))
+
+(defun speak (text &key (speaker (session-speaker)) audience)
+  "Say TEXT.  Returns immediately — this queues.
+
+AUDIENCE is the list of MIXes that hear it, and NIL — the default — means every listener on the
+session, which is what a notification, an app announcing itself or a SPEAK over the control
+socket means: the desktop said something out loud.  A caller with one person in mind passes that
+person's mix, and the sentence reaches them and nobody else; there is still ONE voice, and two
+seats asking at once are answered in turn, because that is what having a voice means.
 
 Utterances are spoken in the order they were queued, one at a time.  A caller that wants to
 interrupt what is already being said calls HUSH first."
   (let ((text (string-trim '(#\Space #\Tab #\Newline #\Return) (string text))))
     (when (plusp (length text))
       (sb-thread:with-mutex ((spk-lock speaker))
-        (setf (spk-pending speaker) (append (spk-pending speaker) (list text))))
+        (setf (spk-pending speaker)
+              (append (spk-pending speaker) (list (cons text (%audience-list audience))))))
       (sb-thread:signal-semaphore (spk-wake speaker))
       t)))
 
@@ -138,13 +166,22 @@ does no work beyond copying: no synthesis, no allocation past the frame itself.
 
 A sentence that ends mid-frame is followed by the next one in the SAME frame rather than by a
 padded short frame — a hole at every sentence boundary is a click, and it is louder than the
-speech."
+speech.  It is NOT followed into the same frame when the next buffer is for somebody else: a
+frame belongs to one audience, so an utterance addressed to one seat ends where it ends and the
+next one starts on the next frame.  One boundary of 20 ms is the price of not saying half of a
+private sentence to the room, and there is one voice, so it can only happen at a seam."
   (sb-thread:with-mutex ((spk-lock spk))
     (when (spk-ready spk)
       (let ((out (reed:make-pcm16 n))
-            (at 0))
-        (loop while (and (< at n) (spk-ready spk))
-              do (let* ((buf (first (spk-ready spk)))
+            (at 0)
+            (audience (cdr (first (spk-ready spk)))))
+        ;; The SOURCE carries who this frame is for; the mixer's composite reads it (audio.lisp:
+        ;; MIX-HEARS-P).  Set before the samples, and per frame, because it is the answer for
+        ;; exactly the frame being handed back.
+        (when (spk-source spk) (setf (src-audience (spk-source spk)) audience))
+        (loop while (and (< at n) (spk-ready spk)
+                         (eq audience (cdr (first (spk-ready spk)))))
+              do (let* ((buf (car (first (spk-ready spk))))
                         (take (min (- n at) (- (length buf) (spk-offset spk)))))
                    (replace out buf :start1 at
                                     :start2 (spk-offset spk)
@@ -175,9 +212,11 @@ speech."
 (defun %speech-gap (spk)
   (reed:make-pcm16 (round (* (mixer-rate (spk-mixer spk)) *speech-gap-ms*) 1000)))
 
-(defun %say-one (spk text)
+(defun %say-one (spk text &optional audience)
   "Synthesize TEXT and hand it to the thunk, sentence by sentence.  Each sentence is appended
-as soon as it exists, which is why a paragraph starts speaking after the first one."
+as soon as it exists, which is why a paragraph starts speaking after the first one.  Every piece
+carries AUDIENCE, so the seam between two utterances for two people is the only place the voice
+changes who it is talking to."
   (let ((voice (%speech-voice spk))
         (gen (sb-thread:with-mutex ((spk-lock spk)) (spk-generation spk)))
         (synthesize (%chord "SYNTHESIZE"))
@@ -195,19 +234,22 @@ as soon as it exists, which is why a paragraph starts speaking after the first o
               (when (= gen (spk-generation spk))
                 (setf (spk-ready spk)
                       (append (spk-ready spk)
-                              (if gap (list gap pcm) (list pcm))))))))))))
+                              (if gap
+                                  (list (cons gap audience) (cons pcm audience))
+                                  (list (cons pcm audience)))))))))))))
 
 (defun %speech-loop (spk)
   (loop while (spk-running spk) do
     (sb-thread:wait-on-semaphore (spk-wake spk) :timeout 1)
-    (loop for text = (sb-thread:with-mutex ((spk-lock spk))
-                       ;; taking the work and marking the voice busy have to happen under one
-                       ;; hold of the lock, or SPEAKING-P sees the gap between them as silence
-                       (let ((next (pop (spk-pending spk))))
-                         (setf (spk-busy spk) (and next (spk-generation spk)))
-                         next))
-          while text
-          do (handler-case (%say-one spk text)
+    (loop for job = (sb-thread:with-mutex ((spk-lock spk))
+                      ;; taking the work and marking the voice busy have to happen under one
+                      ;; hold of the lock, or SPEAKING-P sees the gap between them as silence
+                      (let ((next (pop (spk-pending spk))))
+                        (setf (spk-busy spk) (and next (spk-generation spk)))
+                        next))
+          while job
+          for text = (car job)
+          do (handler-case (%say-one spk text (cdr job))
                ;; A sentence chord cannot say — an unknown phoneme, a missing voice file — is
                ;; one sentence lost and recorded as such.  It is not a dead voice, and it is
                ;; certainly not something to paper over with silence and no trace.
@@ -263,7 +305,8 @@ as soon as it exists, which is why a paragraph starts speaking after the first o
                 (or (spk-pending speaker) (spk-ready speaker)
                     (eql (spk-busy speaker) (spk-generation speaker)))
                 (length (spk-pending speaker))
-                (/ (- (reduce #'+ (spk-ready speaker) :key #'length :initial-value 0)
+                (/ (- (reduce #'+ (spk-ready speaker)
+                              :key (lambda (e) (length (car e))) :initial-value 0)
                       (spk-offset speaker))
                    (float (mixer-rate (spk-mixer speaker)) 1d0))
                 (spk-said speaker) (spk-failed speaker) (spk-last-error speaker)

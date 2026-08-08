@@ -909,7 +909,7 @@ its bytes would land in the middle of a rect."
 ;;; ---- server -----------------------------------------------------------------
 
 (defun serve (fb port &key on-key on-pointer on-resize (name *desktop-name*) once wake
-                           (clipboard (session-clipboard)))
+                           (clipboard (session-clipboard)) (install-injector t))
   "Serve framebuffer FB over RFB on PORT.  ON-KEY (down-p keysym), ON-POINTER
    (button-mask x y) and ON-RESIZE (requested-w requested-h, from the client
    resizing its window) are optional callbacks.  With :ONCE, handle a single
@@ -920,13 +920,19 @@ its bytes would land in the middle of a rect."
    CLIPBOARD is the selection every client of THIS listener shares, defaulting to the
    session's.  Several transports of one seat pass the same one (a VNC viewer and a
    WebRTC channel showing the same screen must paste each other's text); separate SEATS
-   pass different ones, because two people copying must not clobber each other."
+   pass different ones, because two people copying must not clobber each other.
+
+   INSTALL-INJECTOR t (the default) makes ON-KEY the SESSION's keyboard — what a paste
+   or a dictation types on when nobody named a seat.  A further seat's listener passes
+   NIL: there is one *KEY-INJECTOR* and the last listener to start would otherwise own
+   it, so the session's typing would land in the newest person's focused window.  The
+   seat keeps its own ON-KEY and hands it to whatever types for that seat."
   (let ((listen (tcp-listen port)))
     ;; Paste's fallback consumer types the selection into whatever has focus, and the only path
     ;; that knows where focus IS, is the one a real keystroke takes.  So the callback the caller
     ;; gave us for client keys becomes the session's key injector: an injected key is
     ;; indistinguishable from a typed one, and nothing downstream needs to learn about pasting.
-    (when on-key (setf *key-injector* on-key))
+    (when (and on-key install-injector) (setf *key-injector* on-key))
     (format *error-output* "~&glass: RFB server listening on port ~d (~dx~d)~%"
             port (fb-width fb) (fb-height fb))
     (force-output *error-output*)

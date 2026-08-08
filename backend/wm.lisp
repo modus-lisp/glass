@@ -1200,7 +1200,24 @@
       (let ((text (ignore-errors (funcall fn))))
         (and (stringp text) (plusp (length text)) text)))))
 
-(defun wm-selection-menu-items (text)
+(defun wm-say (speak text &optional seat)
+  "Say TEXT — to SEAT if it has a mix of its own, and to the session if it does not.
+
+   Which is the same rule the menu that calls this already follows: a SELECTION is one
+   person's (they highlighted it), so reading it aloud is for that person, and a seat
+   that has no headset has no private mix to be addressed at, so the desktop simply
+   says it out loud — which is what a one-seat desktop has always done and still does.
+
+   The voice itself stays SESSION-wide: one chord engine, one queue, utterances in turn.
+   Making it per-seat would be two engines and two synthesis threads to buy privacy that
+   the audience already buys for the price of a list."
+  (let ((mix (seat-mix seat)))
+    (ignore-errors
+     (if mix
+         (funcall speak text :audience (list mix))
+         (funcall speak text)))))
+
+(defun wm-selection-menu-items (text &optional seat)
   "Items for the selection menu over TEXT.  Deliberately two lines long: this is a menu
    about one selection, not a second place to put applications."
   (let ((speak (wm-speech-fn "SPEAK")) (hush (wm-speech-fn "HUSH")))
@@ -1211,7 +1228,7 @@
                      ;; A new selection replaces what is being said — picking this twice
                      ;; means "read THIS", not "read it again after the last one".
                      (when hush (ignore-errors (funcall hush)))
-                     (ignore-errors (funcall speak text)))))
+                     (wm-say speak text seat))))
        (when (and hush (wm-speaking-p))
          (list (cons "Stop speaking" (lambda () (ignore-errors (funcall hush))))))))))
 
@@ -1236,10 +1253,12 @@
                                   (glass:clipboard-text (if seat (seat-clipboard seat)
                                                             (glass:session-clipboard))))))
                        (when hush (ignore-errors (funcall hush)))
-                       (ignore-errors
-                        (funcall speak (if (and (stringp text) (plusp (length text)))
-                                           text
-                                           "The clipboard is empty.")))))))
+                       ;; THIS seat's clipboard, said to THIS seat: the item exists because
+                       ;; the selection is one person's, and so is the answer.
+                       (wm-say speak (if (and (stringp text) (plusp (length text)))
+                                         text
+                                         "The clipboard is empty.")
+                               seat)))))
        (when (and hush (wm-speaking-p))
          (list (cons "Stop speaking" (lambda () (ignore-errors (funcall hush))))))))))
 
@@ -1247,9 +1266,11 @@
   "Open the selection menu over SURF at (X,Y), or return NIL if there is nothing to
    offer — a NIL return is the caller's signal to let the press through to the app."
   (when-let* ((text (wm-surface-live-selection surf))
-              (items (wm-selection-menu-items text)))
-    (let ((seat (port-seat port seat))
-          (menu (make-wm-menu :x x :y y :hover -1 :title "Selection" :items items)))
+              (seat (port-seat port seat))
+              ;; the items close over the seat that opened the menu, so what they say is
+              ;; said to that person — the selection was theirs
+              (items (wm-selection-menu-items text seat)))
+    (let ((menu (make-wm-menu :x x :y y :hover -1 :title "Selection" :items items)))
       (setf (seat-menu seat) (wm-place-menu menu seat x y)))))
 
 (defun wm-open-submenu (parent idx action seat)
@@ -1863,10 +1884,10 @@
     (loop (sleep 1/60) (wm-tick p))))
 
 (defun add-wm-seat (port &key port-num (width 1000) (height 720) name background
-                              (background-mode :cover))
+                              (background-mode :cover) (audio t))
   "Attach a SECOND (third, …) person to a running desktop: a screen of their own at
    WIDTH x HEIGHT serving on PORT-NUM, with their own pointer, keyboard, focus, menu,
-   clipboard and arrangement of the SAME windows.
+   clipboard, sound and arrangement of the SAME windows.
 
    Nothing about the session changes.  The new seat starts with no views, so it sees
    every window exactly where the others have it, and diverges one window at a time as
@@ -1875,7 +1896,9 @@
 
    PORT-NUM is required and deliberately has no default: the obvious ones are ports
    somebody is already serving a desktop on, and a seat that quietly failed to listen
-   is a seat nobody can find.
+   is a seat nobody can find.  AUDIO t (the default) also gives them their own mix and
+   their own microphone, on the ports beside it (5923 -> 5933 out, 5934 in) — so seat
+   ports want a decade of room between them, and a seat with no sound is one :audio nil.
 
    Returns the seat."
   (check-type port-num (integer 1 65535))
@@ -1885,6 +1908,9 @@
     (when background
       (setf (seat-bg seat)
             (ignore-errors (wm-render-background seat background :mode background-mode))))
+    ;; the server first: it is what fills SEAT-INJECTOR, which is the keyboard this
+    ;; seat's dictation types on
     (start-seat-server seat)
+    (when audio (start-seat-audio port :seat seat))
     (composite-seat seat)
     seat))

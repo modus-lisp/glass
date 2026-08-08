@@ -265,12 +265,19 @@
    Nothing here is shared with another seat's listener, so a second seat is a second
    call: same session, second screen, second pair of hands."
   (unless (seat-server seat)
-    (let ((fb (seat-fb seat)) (port (seat-port seat)))
+    (let* ((fb (seat-fb seat)) (port (seat-port seat))
+           ;; Made once and KEPT: this is the seat's keyboard, and dictation for this seat
+           ;; types on it (see SEAT-INJECTOR).  Only the primary seat's also becomes the
+           ;; session's GLASS:*KEY-INJECTOR*, or the newest listener would own the typing
+           ;; that nobody addressed to a seat.
+           (on-key (lambda (down k) (glass-on-key port down k seat))))
+      (setf (seat-injector seat) on-key)
       (setf (seat-server seat)
             (sb-thread:make-thread
              (lambda ()
                (glass:serve fb (seat-port-num seat)
-                            :on-key     (lambda (down k) (glass-on-key port down k seat))
+                            :on-key     on-key
+                            :install-injector (seat-primary-p seat)
                             :on-pointer (lambda (b x y) (glass-on-pointer port b x y seat))
                             :on-resize  (lambda (w h) (glass-on-resize port w h seat))
                             :wake       (seat-wake seat)
@@ -290,6 +297,58 @@
 (defun start-glass-server (port &optional seat)
   "Start the RFB server thread for PORT's default seat (or SEAT).  Idempotent."
   (start-seat-server (port-seat port seat)))
+
+;;; ---- this seat's sound ------------------------------------------------------
+;;; The screen is served by the seat's RFB listener; the sound is not — RFB carries no
+;;; audio, and the mix reaches a listener over sockets of its own.  So a seat's audio is
+;;; a GLASS:HEADSET (src/headset.lisp) and this is the two lines of seam: derive its
+;;; ports from the seat's screen port, and hand it the seat's keyboard so that what the
+;;; seat DICTATES lands in the window the seat has focused.
+;;;
+;;; Looked up by name because :glass/headset is optional, exactly as the WM resolves
+;;; SPEAK: a desktop built without audio is a working desktop with silent seats.
+
+(defun start-seat-audio (port &key seat (address "127.0.0.1") audio-port mic-port (mic t))
+  "Give SEAT (or PORT's default seat) sound of its own: its mix out and its microphone in,
+   on the ports beside its screen's (5903 -> 5913 / 5914).  Idempotent — returns the
+   seat's existing headset if it has one.
+
+   The PRIMARY seat's headset is the SESSION's: its mix is GLASS:SESSION-MIXER's own and
+   its microphone port is the session's, so a one-seat desktop is the same objects, the
+   same ports and the same code that ran before seats had audio.  Every further seat gets
+   a private composite of the SAME sources — one podcast, played once, heard by both, at
+   whatever gain each of them chose.
+
+   Returns the HEADSET, or NIL if this image has no :glass/headset."
+  (let* ((seat (port-seat port seat))
+         (make (let ((s (find-symbol "MAKE-HEADSET" '#:glass))) (and s (fboundp s) s))))
+    (or (seat-headset seat)
+        (when make
+          (setf (seat-headset seat)
+                (funcall make :name (seat-name seat)
+                              :rfb-port (seat-port-num seat)
+                              :audio-port audio-port :mic-port mic-port
+                              :address address :mic mic
+                              :primary (seat-primary-p seat)
+                              ;; the seat's own keyboard, so dictation reaches ITS focus
+                              :injector (seat-injector seat)))))))
+
+(defun stop-seat-audio (port &optional seat)
+  "Close this seat's audio ports and stop its ear.  The session's sources go on playing
+   to everybody else."
+  (let* ((seat (port-seat port seat))
+         (stop (let ((s (find-symbol "STOP-HEADSET" '#:glass))) (and s (fboundp s) s))))
+    (when (and stop (seat-headset seat))
+      (funcall stop (seat-headset seat))
+      (setf (seat-headset seat) nil)
+      t)))
+
+(defun seat-mix (seat)
+  "The composite SEAT hears, or NIL if it has no sound.  What to address a sound AT when
+   it is for that person only — reading their selection aloud, say."
+  (let* ((h (and seat (seat-headset seat)))
+         (mix (let ((s (find-symbol "HEADSET-MIX" '#:glass))) (and s (fboundp s) s))))
+    (and h mix (funcall mix h))))
 
 (defun ensure-fb-and-server (port mirror)
   "The MAIN mirror allocates the framebuffer (sized to its image) and starts the

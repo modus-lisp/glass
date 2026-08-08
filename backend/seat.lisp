@@ -19,8 +19,12 @@
 ;;;;   listener serving it and the wake that nudges its senders; pointer position,
 ;;;;   button mask and modifier state; keyboard focus (the focused surface) and the
 ;;;;   McCLIM pointer grab; the drag in progress and its wireframe; the open menu
-;;;;   chain; the composite's pending damage and its CopyRect hint; and the VIEWS —
-;;;;   this seat's position and z for each window.
+;;;;   chain; the composite's pending damage and its CopyRect hint; the VIEWS —
+;;;;   this seat's position and z for each window — and the HEADSET: this person's mix
+;;;;   out, microphone in, ear and dictation (src/headset.lisp), which decomposes the
+;;;;   same way the screen does and for the same reason.  A window's pixels are painted
+;;;;   once and composited per seat; a source's samples are pulled once and summed per
+;;;;   seat.  What a seat gets is a composite, never a second copy of the content.
 ;;;;
 ;;;; WHAT STAYS ON THE PORT (session-wide): the mirrors and surfaces themselves (which
 ;;;;   windows EXIST is not a matter of opinion), the CLIM event mailbox and clock, the
@@ -114,6 +118,17 @@
    ;; the clipboard without going through a seat — dictation, a paste chord, loom, an app
    ;; calling SESSION-CLIPBOARD — must land on the same one the only person here is using.
    (clipboard :initarg :clipboard :initform nil :accessor seat-clipboard)
+   ;; THIS person's sound: their mix out on a port of their own, their microphone in on
+   ;; another, their ear behind it, and their dictation.  A GLASS:HEADSET, made by
+   ;; START-SEAT-AUDIO, and NIL until something asks for one — a desktop can be watched
+   ;; without being listened to, and the audio systems are optional (see src/headset.lisp
+   ;; for why each of those four is one person's and not the session's).
+   (headset  :initform nil :accessor seat-headset)
+   ;; This seat's keyboard, as a function (DOWN-P KEYSYM): the very :ON-KEY its RFB
+   ;; listener was started with, kept so that anything TYPING for this seat — dictation,
+   ;; a paste — reaches the window THIS seat has focused.  GLASS:*KEY-INJECTOR* cannot
+   ;; answer that question: there is one of it, and the last listener to start owns it.
+   (injector :initform nil :accessor seat-injector)
    ;; --- what this seat is in the middle of ---
    (drag     :initform nil :accessor seat-drag)          ; (window mode . rest) while moving/resizing
    (drag-wire :initform nil :accessor seat-drag-wire)    ; this drag went wireframe (laggy link)?

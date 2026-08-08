@@ -75,12 +75,31 @@ windows too. Native glass surfaces (terminals, the browser, warren, a nested rem
 desktop) carry no such assumption and are per-seat all the way down.
 
 Cursors need no code: glass sends the cursor *shape* once as an RFB pseudo-encoding and
-each viewer draws it at its own pointer. Audio and the microphone are **not** per-seat
-yet — the mix reaches a listener over a separate socket, so that is work in
-`glass/audio-stream` and `glass/mic-stream`, not in the compositor.
+each viewer draws it at its own pointer.
+
+**Sound is per-seat too, and it decomposes exactly as the screen does.**
+`(clim-glass::start-seat-audio PORT :seat S)` gives a seat a `glass:headset`
+(`src/headset.lisp`): its own **mix out** and its own **microphone in**, on the ports
+beside its screen's — `5903 -> 5913 / 5914`, so the primary seat's numbers are the ones a
+one-seat desktop has always served and the WebRTC gateway does not notice. `add-wm-seat`
+does it for a new person by default.
+
+A window's pixels are painted **once** and composited per seat; a source's samples are
+pulled **once** and summed per seat. That is not an analogy for its own sake — a source
+is a *destructive pull*, so giving each seat its own mixer over the same sources would
+hand each of them alternate frames of the podcast. One clock pulls, and each seat's
+`glass:mix` sums what it wants at the gain it chose. The microphone is nobody else's
+business and is in no mix at all; the ear follows its own seat's microphone; and
+**dictation types on that seat's keyboard**, so the words land in the window *that* seat
+has focused — `glass:*key-injector*` cannot answer that question, since the last RFB
+listener to start owned it, which is what the primary seat now keeps.
 
 `backend/inspect/seat-gate.lisp` holds two seats on one session and checks all of the
-above from the pixels.
+above from the pixels; `backend/inspect/seat-audio-gate.lisp` checks the keyboard, the
+two microphones and the dictation routing; `backend/inspect/seat-dictation-e2e.lisp`
+runs it for real — two sentences synthesised by chord, pushed into two microphone ports,
+transcribed by two stave recognizers, typed into two windows, neither one's words in the
+other's.
 
 Also a **message-port** backend (`clim-glass:make-message-port`) + **compositor**
 that run each app as an isolated actor drawing to a shared display over a mailbox —

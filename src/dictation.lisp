@@ -31,6 +31,18 @@
 ;;;;      becomes a loop: chord speaks, the ear transcribes it, dictation types it into the
 ;;;;      focused window.  So dictation is deaf while the session is speaking, and for a moment
 ;;;;      after (the tail of an utterance arrives after the audio that ended it).
+;;;;
+;;;; ---- and WHOSE window ------------------------------------------------------------------
+;;;;
+;;;; With seats there is a fourth, and it was wrong here before it was written down: WHERE the
+;;;; words go.  *KEY-INJECTOR* is filled by SERVE, so on a two-seat desktop it holds whichever
+;;;; seat's listener started LAST — and dictation from the first seat's microphone typed into the
+;;;; second seat's focused window.  Both halves of that are per-seat: the ear hears one person's
+;;;; microphone, and the keyboard it types on is that person's, pointed at the window THEY have
+;;;; focused.  So a DICTATION is an object with an ear and an injector, one per seat, and the
+;;;; session's — the one a one-seat desktop has and the one the Listen window switches on — is
+;;;; the same object with the injector left NIL, meaning "the session's keyboard", which is
+;;;; exactly what *KEY-INJECTOR* is when there is only one person here.
 
 (in-package #:glass)
 
@@ -45,9 +57,43 @@ shorter than that gap does not guard anything at all — the guard would expire 
 guards against arrives — which is exactly how this was first written and exactly how the gate
 caught it.")
 
+;;; ---- one person's dictation --------------------------------------------------
+
+(defvar *dictation-key* "dictation"
+  "The key a dictation registers under on its ear.  Named, and re-registering replaces, so
+switching dictation on twice types everything once.")
+
+(defclass dictation ()
+  ((name    :initarg :name    :initform "dictation" :accessor dict-name)
+   (ear     :initarg :ear     :initform nil :accessor dict-ear)
+   ;; The keyboard these words are typed on: a function (DOWN-P KEYSYM), which is precisely the
+   ;; :ON-KEY a seat's RFB listener was started with, so a dictated key takes the identical route
+   ;; that seat's typed keys take — through ITS focus.  NIL means the session's *KEY-INJECTOR*,
+   ;; which is the right answer when there is one person and the only one available to a caller
+   ;; that has no seat.
+   (injector :initarg :injector :initform nil :accessor dict-injector)
+   (key     :initarg :key     :initform *dictation-key* :accessor dict-key)
+   (on      :initform nil :accessor dict-on)
+   (typed   :initform 0   :accessor dict-typed)
+   (muted   :initform 0   :accessor dict-muted)
+   (last    :initform nil :accessor dict-last)
+   (quiet-until :initform 0 :accessor dict-quiet-until)
+   (watcher :initform nil :accessor dict-watcher))
+  (:documentation "One person's speech reaching one person's keyboard: an ear, an injector,
+   and the guard that keeps the desktop from typing what it said itself."))
+
+(defmethod print-object ((d dictation) stream)
+  (print-unreadable-object (d stream :type t)
+    (format stream "~s ~:[off~;on~] ~d typed" (slot-value d 'name) (slot-value d 'on)
+            (slot-value d 'typed))))
+
+(defvar *session-dictation* nil
+  "The session's dictation — the primary seat's, and the one a one-seat desktop has.")
+
 (defvar *dictating* nil
-  "True while the ear is typing what it hears.  Read it rather than a window's button: the switch
-is session-wide, because the keyboard is.")
+  "True while the SESSION's ear is typing what it hears.  Read it rather than a window's button:
+the Listen window's switch is this one.  A further seat's dictation is its own object and does
+not touch this, for the same reason its clipboard is not the session's.")
 
 (defvar *dictation-typed* 0
   "Utterances typed since the last START-DICTATION.  The honest counter — an utterance suppressed
@@ -60,10 +106,6 @@ them silently — makes a real dictation failure look identical to the guard doi
 (defvar *dictation-last* nil
   "The last text dictation actually typed, or NIL.  For a status line, and for a test that wants
 to know what landed without racing the app it landed in.")
-
-(defvar *dictation-key* "dictation"
-  "The key this registers under on the ear.  Named, and re-registering replaces, so switching
-dictation on twice types everything once.")
 
 ;;; ---- what gets typed --------------------------------------------------------
 
@@ -88,18 +130,16 @@ words were names, and inventing that would be inventing a fact."
 ;;; ---- when it is safe to type ------------------------------------------------
 
 (defvar *dictation-quiet-until* 0
-  "INTERNAL-REAL-TIME before which dictation stays deaf.  Pushed forward by the watcher below for
-as long as the voice is talking, so it covers the tail after the voice stops as well as the
-speech itself.")
+  "The SESSION dictation's quiet window, mirrored out of the object for anything that reads it.")
 
 (defvar *dictation-watcher* nil
-  "The thread that keeps *DICTATION-QUIET-UNTIL* honest.")
+  "The session dictation's watcher thread.")
 
 (defparameter *dictation-watch-step* 0.1d0
   "How often the watcher samples the voice.  It has to be well under a sentence: the whole job is
 to have SEEN the voice live at some point during it.")
 
-(defun %dictation-watch ()
+(defun %dictation-watch (d)
   "Push the quiet window forward for as long as the desktop is speaking.
 
 This exists because of the order events actually happen in.  The guard's natural home is the
@@ -112,11 +152,11 @@ and needs no hook inside the optional :glass/speech system.
 Catches SERIOUS-CONDITION around the whole body: under --disable-debugger an unhandled condition
 on any thread quits the process, and a desktop must not be lost to its dictation watchdog."
   (handler-case
-      (loop while *dictating*
+      (loop while (dict-on d)
             do (when (%dictation-speaking-p)
-                 (setf *dictation-quiet-until*
-                       (+ (get-internal-real-time)
-                          (round (* *dictation-tail-seconds* internal-time-units-per-second)))))
+                 (%dict-set-quiet d (+ (get-internal-real-time)
+                                       (round (* *dictation-tail-seconds*
+                                                 internal-time-units-per-second)))))
                (sleep *dictation-watch-step*))
     (serious-condition (e)
       (ignore-errors
@@ -132,81 +172,135 @@ desktop with no voice cannot hear itself, so the answer there is NIL and the gua
   (let ((sym (find-symbol "SPEAKING-P" "GLASS")))
     (and sym (fboundp sym) (funcall sym) t)))
 
-(defun %dictation-deaf-p ()
+(defun %dictation-deaf-p (d)
   "True if this utterance must be dropped rather than typed.
 
 Reads the window the watcher maintains rather than sampling the voice here, for the reason given
 in %DICTATION-WATCH: at the moment an utterance lands, the voice that produced it stopped talking
 a second and a half ago.  The check that looks obvious is the one that never fires."
-  (< (get-internal-real-time) *dictation-quiet-until*))
+  (< (get-internal-real-time) (dict-quiet-until d)))
 
-(defun %dictation-hear (text)
+;;; The session dictation's state is also four special variables, because the Listen window, the
+;;; control socket and the gates read them and a one-seat desktop must go on meaning what it
+;;; meant.  They are a MIRROR of the object and never the storage — a further seat writes its own
+;;; object and leaves these alone, which is what stops a second person's dictation from making
+;;; the first person's window say it is dictating.
+(defun %dict-session-p (d) (eq d *session-dictation*))
+
+(defun %dict-set-quiet (d until)
+  (setf (dict-quiet-until d) until)
+  (when (%dict-session-p d) (setf *dictation-quiet-until* until)))
+
+(defun %dict-mirror (d)
+  (when (%dict-session-p d)
+    (setf *dictating* (dict-on d)
+          *dictation-typed* (dict-typed d)
+          *dictation-muted* (dict-muted d)
+          *dictation-last* (dict-last d))))
+
+(defun %dictation-hear (d text)
   "One finished utterance, from the ear's decode thread.  Type it, or record that we did not.
 
 Runs PASTE-TEXT asynchronously, which matters more here than it does for a paste: this is the
 thread that decodes audio, and typing 60 characters at *PASTE-KEY-DELAY* holds it for a quarter
-of a second — a quarter second in which the queue behind it fills with the next thing said."
+of a second — a quarter second in which the queue behind it fills with the next thing said.
+
+The injector is THIS dictation's, so the keys land in the window ITS seat has focused.  Passing
+NIL is not a failure to route: it is the session's keyboard, which is the only one a desktop with
+one person has."
   (cond
-    ((not *dictating*) nil)
-    ((%dictation-deaf-p)
-     (incf *dictation-muted*)
+    ((not (dict-on d)) nil)
+    ((%dictation-deaf-p d)
+     (incf (dict-muted d))
+     (%dict-mirror d)
      nil)
     (t (let ((typed (dictation-text text)))
          (when (plusp (length typed))
-           (setf *dictation-last* typed)
-           (incf *dictation-typed*)
-           (paste-text typed)
+           (setf (dict-last d) typed)
+           (incf (dict-typed d))
+           (%dict-mirror d)
+           (paste-text typed :injector (dict-injector d))
            typed)))))
 
 ;;; ---- the switch --------------------------------------------------------------
 
-(defun start-dictation (&key (ear *session-ears*))
-  "Type what the desktop hears into whatever has focus.  Returns the EAR, or NIL if there is none.
+(defun start-dictation (&key (ear *session-ears*) injector dictation name)
+  "Type what an ear hears into whatever the person it belongs to has focused.  Returns the
+DICTATION, or NIL if there is no ear.
 
 Does NOT start the ear: an ear is a quarter of a gigabyte of weights and a sink on the mix, and
 deciding to have one is a bigger decision than deciding where its words go.  Callers that want
 both call START-LISTENING first — the Listen window's Dictate button does.
 
+INJECTOR is the keyboard to type on — a seat's :ON-KEY.  NIL means the session's, which is what
+one person has.  DICTATION reuses an existing object (a seat holds its own); with none, the
+session's is used and created on demand, so the no-argument call is unchanged.
+
 Idempotent.  Registering under a fixed key means a second call replaces the first rather than
 installing a second listener that types every word twice."
   (let ((ear (or ear *session-ears*)))
     (when ear
-      (setf *dictating* t *dictation-typed* 0 *dictation-muted* 0 *dictation-last* nil
-            ;; deaf for one tail-length at the start: whatever was already in flight when the
-            ;; switch was thrown was heard before anyone asked for it to be typed
-            *dictation-quiet-until* (+ (get-internal-real-time)
-                                       (round (* *dictation-tail-seconds*
-                                                 internal-time-units-per-second))))
-      (hearing-listen *dictation-key* #'%dictation-hear ear)
-      (unless (and *dictation-watcher* (sb-thread:thread-alive-p *dictation-watcher*))
-        (setf *dictation-watcher*
-              (sb-thread:make-thread #'%dictation-watch :name "glass-dictation-watch")))
-      ear)))
+      (let ((d (or dictation
+                   (if (eq ear *session-ears*)
+                       (or *session-dictation*
+                           (setf *session-dictation*
+                                 (make-instance 'dictation :name "session" :ear ear)))
+                       (make-instance 'dictation :name (or name "seat") :ear ear)))))
+        (setf (dict-ear d) ear
+              (dict-on d) t
+              (dict-typed d) 0
+              (dict-muted d) 0
+              (dict-last d) nil)
+        (when injector (setf (dict-injector d) injector))
+        ;; deaf for one tail-length at the start: whatever was already in flight when the
+        ;; switch was thrown was heard before anyone asked for it to be typed
+        (%dict-set-quiet d (+ (get-internal-real-time)
+                              (round (* *dictation-tail-seconds*
+                                        internal-time-units-per-second))))
+        (%dict-mirror d)
+        (hearing-listen (dict-key d) (lambda (text) (%dictation-hear d text)) ear)
+        (unless (and (dict-watcher d) (sb-thread:thread-alive-p (dict-watcher d)))
+          (setf (dict-watcher d)
+                (sb-thread:make-thread (lambda () (%dictation-watch d))
+                                       :name "glass-dictation-watch")))
+        (when (%dict-session-p d) (setf *dictation-watcher* (dict-watcher d)))
+        d))))
 
-(defun stop-dictation (&key (ear *session-ears*))
+(defun stop-dictation (&key (ear *session-ears*) dictation)
   "Stop typing what is heard.  The ear keeps listening — the transcript is still worth having,
 and this is only about where it goes.  Returns T if dictation had been on."
-  (let ((was *dictating*))
-    (setf *dictating* nil)              ; the watcher's loop condition — it retires on its own
-    (hearing-unlisten *dictation-key* (or ear *session-ears*))
-    (let ((th *dictation-watcher*))
-      (setf *dictation-watcher* nil)
-      (when th (ignore-errors (sb-thread:join-thread th :timeout 2))))
-    (and was t)))
+  (let ((d (or dictation *session-dictation*)))
+    (if (null d)
+        nil
+        (let ((was (dict-on d)))
+          (setf (dict-on d) nil)        ; the watcher's loop condition — it retires on its own
+          (%dict-mirror d)
+          (hearing-unlisten (dict-key d) (or (dict-ear d) ear *session-ears*))
+          (let ((th (dict-watcher d)))
+            (setf (dict-watcher d) nil)
+            (when (%dict-session-p d) (setf *dictation-watcher* nil))
+            (when th (ignore-errors (sb-thread:join-thread th :timeout 2))))
+          (and was t)))))
 
-(defun dictating-p ()
-  "True if speech is currently reaching the keyboard.  Both halves have to be true — dictation
+(defun dictating-p (&optional (dictation *session-dictation*))
+  "True if speech is currently reaching a keyboard.  Both halves have to be true — dictation
 switched on, and something to type into — so a desktop with no server running answers NIL."
-  (and *dictating* *key-injector* t))
+  (let ((d dictation))
+    (and d (dict-on d) (or (dict-injector d) *key-injector*) t)))
 
-(defun dictation-report ()
+(defun dictation-report (&optional (dictation *session-dictation*))
   "One line: on or off, what it has typed, and what it held back.
 
 `on, no keyboard' is called out rather than folded into `on' because it is the failure that looks
 most like success — dictation switched on, the ear hearing perfectly, and every word going
 nowhere because no server ever filled *KEY-INJECTOR*."
-  (format nil "dictation: ~a, ~d typed, ~d muted~@[ — last ~s~]"
-          (cond ((not *dictating*) "off")
-                ((not *key-injector*) "on but NO KEYBOARD (no server running)")
-                (t "on"))
-          *dictation-typed* *dictation-muted* *dictation-last*))
+  (let ((d dictation))
+    (if (null d)
+        "dictation: off"
+        (format nil "dictation~@[ [~a]~]: ~a, ~d typed, ~d muted~@[ — last ~s~]"
+                (unless (%dict-session-p d) (dict-name d))
+                (cond ((not (dict-on d)) "off")
+                      ((not (or (dict-injector d) *key-injector*))
+                       "on but NO KEYBOARD (no server running)")
+                      (t "on"))
+                (dict-typed d) (dict-muted d) (dict-last d)))))

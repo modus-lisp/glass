@@ -159,6 +159,36 @@ arithmetic (resample / gain / sum) is reed's; this is the session policy on top.
 Gate: `sbcl --non-interactive --load inspect/audio-gate.lisp` (29 checks; the
 load-bearing ones are the ones a single-listener test cannot make).
 
+### One bus, a mix per person (`:glass/headset`)
+
+A session with two **seats** (two people watching, see
+[backend/README](backend/README.md)) has two of everything a person owns, and
+sound is no exception: *my mix is not yours*. It splits the way the screen does.
+
+```lisp
+(defparameter *b* (glass:make-headset :name "seat-b" :rfb-port 5923))  ; -> 5933 out, 5934 in
+(glass:mix-mute (glass:headset-mix *b*) "podcast")        ; only for this person
+(setf (glass:mix-source-gain (glass:headset-mix *b*) "music") 0.25d0)
+(glass:speak "your build finished" :audience (list (glass:headset-mix *b*)))
+```
+
+A window's pixels are painted **once** and composited per seat; a source's frame
+is pulled **once** and summed per seat. That is forced rather than pretty: a
+source is a *destructive* pull, so a mixer per seat would give each of them
+alternate frames of the podcast — double speed, half missing, on both screens.
+So the mixer is a **bus** with one clock, a `glass:mix` is one listener's
+composite (its own selection, gains, ring, sinks), and the mixer's default mix
+*is* the session's — a one-seat desktop has exactly one and is exactly the old
+code path, ports and all (`5903 -> 5913 / 5914`).
+
+The **microphone** is the one thing that never joins a mix — it would echo back
+to the phone that spoke and be heard by somebody who did not dial in for it — so
+each seat has its own port, its own ear behind it, and its own dictation, typing
+on **that seat's** keyboard into the window that seat has focused. A source may
+also name an **audience**, which is how one voice reads one person's selection to
+that person without a second speech engine. Gate:
+`inspect/headset-gate.lisp` (39 checks, all on samples over real sockets).
+
 ## The selection (`:glass/clipboard`)
 
 The third thing a session has exactly one of, after a screen and a sound: what

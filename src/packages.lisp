@@ -35,34 +35,49 @@
    #:*key-injector* #:*paste-key-delay* #:*paste-max-chars* #:*paste-chord*
    ;; RFB cut text (the transport half, in :glass)
    #:send-cut-text #:read-client-cut-text
-   ;; audio (the :glass/audio system; reed-backed) — one session mix, many listeners
+   ;; audio (the :glass/audio system; reed-backed) — one bus of sources, a mix per listener
    #:make-mixer #:mixer #:mixer-p #:mixer-start #:mixer-stop #:mixer-tick #:mixer-report
    #:mixer-rate #:mixer-frame-samples #:mixer-seq #:mixer-level #:mixer-late #:mixer-running
    #:mixer-add-source #:mixer-remove-source #:mixer-sources #:mixer-play #:audio-tone
-   #:mixer-source #:mixer-source-p #:src-id #:src-name #:src-gain #:src-frames
+   #:mixer-source #:mixer-source-p #:src-id #:src-name #:src-gain #:src-frames #:src-audience
    #:mixer-subscribe #:mixer-unsubscribe #:sink #:sink-p #:sink-next-frame #:sink-source
-   #:sink-rate #:sink-frames #:sink-drops #:sink-underruns #:sink-gain
+   #:sink-rate #:sink-frames #:sink-drops #:sink-underruns #:sink-gain #:sink-mix #:sink-mixer
+   #:sink-unsubscribe
+   ;; one listener's composite of those sources — what a SEAT gets one of
+   #:mix #:mix-p #:make-mix #:remove-mix #:as-mix #:mix-name #:mix-bus #:mix-seq #:mix-level
+   #:mix-sinks #:mix-source-gain #:mix-mute #:mix-unmute #:mix-hears-p #:mix-report
+   #:mixer-default-mix #:mixer-default #:mixer-mixes #:mixer-find-source #:mixer-capacity
    #:*mixer-rate* #:*mixer-frame-ms* #:session-mixer #:*session-mixer* #:mixer-add-file
    ;; the mix over a socket (the :glass/audio-stream system) — server and listener
    #:start-audio-stream #:stop-audio-stream #:audio-stream #:audio-stream-p #:audio-stream-report
-   #:audio-stream-port #:audio-stream-mixer #:*audio-stream-port* #:start-session-audio
+   #:audio-stream-port #:audio-stream-mixer #:audio-stream-mix #:audio-stream-running
+   #:*audio-stream-port*
+   #:start-session-audio #:seat-audio-port #:seat-mic-port #:*session-audio-stream*
+   #:*audio-port-offset* #:*mic-port-offset*
    #:make-audio-tap #:audio-tap #:audio-tap-p #:tap-next-frame #:tap-source #:tap-stop
    #:tap-report #:audio-tap-connected #:audio-tap-rate #:audio-tap-frames #:audio-tap-drops
    #:audio-tap-underruns #:audio-tap-reconnects
    ;; a peer's microphone, inbound (the :glass/mic-stream system) — receiver and sender
    #:start-mic-stream #:stop-mic-stream #:start-session-mic #:mic-stream #:mic-stream-p
    #:mic-stream-port #:mic-stream-report #:*mic-stream-port* #:*mic-rate* #:*mic-live-seconds*
-   #:*mic-gap-frames* #:session-mic #:*session-mic-stream*
+   #:*mic-gap-frames* #:session-mic #:*session-mic-stream* #:stream-mic #:mic-stream-current
    #:mic #:mic-p #:mic-next-frame #:mic-source #:mic-live-p #:mic-report #:mic-name #:mic-rate
    #:mic-frames #:mic-received #:mic-drops #:mic-underruns
    #:make-mic-sender #:mic-send #:mic-feed #:mic-sender-stop #:mic-sender-report
    #:mic-sender #:mic-sender-p #:mic-sender-connected #:mic-sender-sent #:mic-sender-dropped
    #:mic-sender-offered #:mic-sender-reconnects
+   ;; one person's audio (the :glass/headset system) — the audio half of a SEAT
+   #:headset #:make-headset #:stop-headset #:headset-report #:headset-listen
+   #:headset-stop-listening #:headset-dictate #:headset-stop-dictating
+   #:headset-name #:headset-mix #:headset-mixer #:headset-mic #:headset-ears #:headset-audio
+   #:headset-dictation #:headset-injector #:headset-audio-port #:headset-mic-port
+   #:headset-primary-p
    ;; the voice (the :glass/speech system; chord-backed) — one speaker on the session mix
    #:speak #:hush #:speaking-p #:make-speaker #:session-speaker #:stop-speaker #:speech-report
    #:speaker #:speaker-p #:*session-speaker* #:*speech-voice* #:*speech-gain* #:*speech-gap-ms*
    ;; the ear (the :glass/hearing system; stave-backed) — one sink on the same mix
    #:start-listening #:stop-listening #:listening-p #:make-ears #:ears #:ears-p
+   #:ear-mix #:ear-mic-stream #:ear-rec #:ear-listening-to
    #:hearing-text #:hearing-partial #:hearing-heard #:hearing-clear #:hearing-level
    #:hearing-ready-p #:hearing-listen #:hearing-unlisten
    #:hearing-report #:*session-ears* #:*hearing-models* #:*hearing-rate* #:*hearing-threshold*
@@ -72,7 +87,9 @@
    ;; into the focused window through the same *KEY-INJECTOR* a clipboard paste goes through
    #:start-dictation #:stop-dictation #:dictating-p #:dictation-text #:dictation-report
    #:*dictating* #:*dictation-tail-seconds* #:*dictation-typed* #:*dictation-muted*
-   #:*dictation-last*
+   #:*dictation-last* #:*session-dictation*
+   #:dictation #:dict-name #:dict-ear #:dict-injector #:dict-on #:dict-typed #:dict-muted
+   #:dict-last
    ;; standing perf counters (read a snapshot over the control socket)
    #:*perf-on* #:perf-reset #:perf-report #:perf-record-send #:perf-record-composite
    #:*send-lag* #:*send-queue*))
