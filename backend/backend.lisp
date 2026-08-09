@@ -388,16 +388,98 @@
         (setf (glass-port-fb port) (glass:make-framebuffer w h))
         (start-glass-server port)))))
 
+;;; ---- a pop-up belongs to a window, and every seat holds that window somewhere ----
+;;;
+;;; Pull-downs, submenus, dialogs and tooltips are UNMANAGED mirrors: session-wide
+;;; windows with ONE position, placed by McCLIM from the owning frame's sheet
+;;; transformation.  That transformation follows whoever is DRIVING McCLIM
+;;; (clim-token.lisp), so a pop-up's own position is expressed in the DRIVER's
+;;; arrangement — B presses "File" on its copy of the window at 430,300 and the menu is
+;;; correctly placed at 430,325.  On a seat holding that same window at 120,140 the menu
+;;; then floats over bare workspace with no window under it.
+;;;
+;;; The cure is a per-seat DRAW OFFSET: how far this seat's copy of the OWNING window is
+;;; from where McCLIM believes that window to be.  It is zero for the driver BY
+;;; CONSTRUCTION — CLIM-RESYNC-GEOMETRY aims GLASS-MIRROR-CLIM-X/Y at the driver's view
+;;; on every acquisition, and WM-SYNC-SHEET keeps it there — and zero for everybody when
+;;; nothing has diverged, so a one-seat desktop and an undiverged two-seat one draw
+;;; exactly the pixels they drew before.
+;;;
+;;; THIS IS A DRAWING QUESTION AND ONLY A DRAWING QUESTION.  The pointer paths that a
+;;; posted pop-up runs through — GRAB-FRAME-LEAF-AT and ROUTE-TO-GRABBED-SHEET — are
+;;; reachable only by the seat CLIM has GRABBED the pointer for, which is the driver
+;;; (PORT-GRAB-POINTER records the grab on CLIM-TOKEN-SEAT, and GLASS-ON-POINTER's grab
+;;; branch additionally requires CLIM-TOKEN-CLAIM to succeed).  The driver's offset is
+;;; zero, so those two would compute the same numbers whether they applied this or not,
+;;; and they are left alone: the delicate menu-dismiss routing is not touched.
+
+(defun mirror-frame (mirror)
+  "The CLIM application frame MIRROR's sheet belongs to, or NIL."
+  (when-let ((sheet (glass-mirror-sheet mirror)))
+    (ignore-errors (pane-frame sheet))))
+
+(defun clim-popup-owner (mirror &optional port)
+  "The MANAGED window a pop-up MIRROR hangs off, or NIL if it has none.
+
+   CLIM pop-ups carry no owner link — a pull-down is simply another top-level sheet —
+   so it is derived the way GRAB-FRAME-LEAF-AT already derives it: BY FRAME.  A menu
+   bar and every pull-down and submenu it opens are separate mirrors of the SAME
+   application frame, and that frame's managed window is the one the person pressed.
+   Where a frame somehow has more than one managed window the frontmost wins (greatest
+   own z), which is the one the pop-up was most plausibly opened from; and a pop-up
+   whose frame has no managed window at all answers NIL, which is what makes such a
+   pop-up draw exactly where it always did.
+
+   Note that a SUBMENU answers with the managed window too, not with the pull-down that
+   opened it — so a chain of pop-ups is offset once each, never once per link."
+  (when (and (typep mirror 'glass-mirror) (not (glass-mirror-managed mirror)))
+    (when-let* ((sheet (glass-mirror-sheet mirror))
+                (frame (ignore-errors (pane-frame sheet)))
+                (port  (or port (ignore-errors (port sheet)))))
+      (let ((best nil))
+        (dolist (m (glass-port-mirrors port) best)
+          (when (and (typep m 'glass-mirror) (glass-mirror-managed m) (not (eq m mirror))
+                     (eq (mirror-frame m) frame)
+                     (or (null best) (> (window-own-z m) (window-own-z best))))
+            (setf best m)))))))
+
+(defun seat-popup-offset (seat window)
+  "(values dx dy): how far WINDOW's pixels must be shifted on SEAT's screen so that a
+   pop-up lands on SEAT's copy of the window that opened it.  Zero for everything that
+   is not a pop-up with a managed owner, and zero for the seat driving McCLIM."
+  (let ((owner (clim-popup-owner window (and seat (seat-port seat)))))
+    (if owner
+        (values (- (seat-window-x seat owner) (glass-mirror-clim-x owner))
+                (- (seat-window-y seat owner) (glass-mirror-clim-y owner)))
+        (values 0 0))))
+
+(defun seat-draw-x (seat window)
+  "Where WINDOW's content is DRAWN on SEAT's screen.  SEAT-WINDOW-X for everything a
+   seat can arrange for itself; SEAT-WINDOW-X plus the pop-up offset for the transient
+   windows it cannot, which have one position and must follow their owner per seat."
+  (multiple-value-bind (dx dy) (seat-popup-offset seat window)
+    (declare (ignore dy))
+    (+ (seat-window-x seat window) dx)))
+
+(defun seat-draw-y (seat window)
+  (multiple-value-bind (dx dy) (seat-popup-offset seat window)
+    (declare (ignore dx))
+    (+ (seat-window-y seat window) dy)))
+
 (defun blit-mirror (mirror fb &optional seat)
   "Composite one mirror's image into FB at the mirror's screen position FOR SEAT
    (NIL = the window's own position), honoring FB's clip box — so a damage-limited
    recomposite (McCLIM repaint) only touches the changed region, like blit-fb does for
-   surfaces."
+   surfaces.
+
+   The position is the DRAWN one (SEAT-DRAW-X): identical to SEAT-WINDOW-X for every
+   window a seat arranges for itself, and shifted onto this seat's copy of the owning
+   window for a pop-up, which has only one."
   (when-let ((image (mcclim-render::image-mirror-image mirror)))
     (mcclim-render::with-image-locked (mirror)
       (let* ((arr (climi::pattern-array image))
              (ih (array-dimension arr 0)) (iw (array-dimension arr 1))
-             (ox (seat-window-x seat mirror)) (oy (seat-window-y seat mirror))
+             (ox (seat-draw-x seat mirror)) (oy (seat-draw-y seat mirror))
              (dpx (glass:fb-pixels fb)) (fw (glass:fb-width fb)) (fh (glass:fb-height fb))
              (clip (glass:fb-clip fb))
              (cx0 (if clip (first clip) 0)) (cy0 (if clip (second clip) 0))
@@ -470,14 +552,29 @@
    Content damage is the one kind that is session-wide: one window painted itself, and
    everybody watching has to see it.  Where that lands on a screen is not, because each
    seat holds the window somewhere else, so the box is carried in the window's own
-   coordinates and converted per seat at the last moment."
+   coordinates and converted per seat at the last moment — through SEAT-DRAW-X, the same
+   arithmetic BLIT-MIRROR draws through, so a pop-up shifted onto this seat's copy of its
+   owner damages the rectangle it is actually drawn in and not the one the driver sees."
   (dolist (seat (glass-port-seats port))
     (seat-accumulate-damage
      seat
      (if local-box
          (destructuring-bind (lx ly lw lh) local-box
-           (list (+ (seat-window-x seat window) lx) (+ (seat-window-y seat window) ly) lw lh))
+           (list (+ (seat-draw-x seat window) lx) (+ (seat-draw-y seat window) ly) lw lh))
          (wm-window-box window seat)))))
+
+(defun port-damage-popups (port)
+  "Mark every posted pop-up's CURRENT screen rectangle as damaged on every seat.
+
+   Called on both sides of anything that moves a pop-up WITHOUT repainting it: its
+   position is derived from its owner's place on each screen and from which seat
+   McCLIM's geometry follows, and neither of those is a repaint of the pop-up.  Called
+   before the change it erases where the pop-up was; called after, it draws where it
+   now is.  Nothing at all on a desktop with no pop-up open, which is nearly always."
+  (dolist (m (glass-port-mirrors port))
+    (when (and (typep m 'glass-mirror) (not (glass-mirror-managed m))
+               (clim-popup-owner m port))
+      (port-damage-window port m))))
 
 (defun port-damage-all (port)
   "Mark every seat's whole screen as needing a rebuild on the next tick."
@@ -582,7 +679,7 @@
   (let ((local (%mirror-dirty-local mirror)))
     (if (consp local)
         (destructuring-bind (bx by bw bh) local
-          (list (+ (seat-window-x seat mirror) bx) (+ (seat-window-y seat mirror) by) bw bh))
+          (list (+ (seat-draw-x seat mirror) bx) (+ (seat-draw-y seat mirror) by) bw bh))
         local)))
 
 (defun %mirror-force-output (port mirror)

@@ -86,6 +86,19 @@ same one all session. Which seat it is, is a **token** (`backend/clim-token.lisp
   forth for free, and the second seat's pull-downs land under the second seat's pointer.
   The window's *own* position is left alone, so taking the token never moves anybody
   else's windows.
+- **…and the pop-up it places goes with the *window*, on every screen.** A pull-down is a
+  session-wide *unmanaged* mirror with one position, and that position is expressed in
+  the driver's arrangement — so a menu opened on the driver's copy of a window at 430,300
+  used to float over bare workspace on a seat holding that same window at 120,140. Every
+  seat now draws an unmanaged mirror at a **draw offset** (`seat-draw-x`): its own copy of
+  the window that posted it, minus where McCLIM believes that window to be. The offset is
+  zero for the driver by construction and zero for everybody when nothing has diverged, so
+  it is a *drawing* correction only — the pointer routing a posted menu runs through
+  (`grab-frame-leaf-at`, `route-to-grabbed-sheet`) is reachable only by the seat CLIM has
+  grabbed the pointer for, which is the driver, and is untouched.
+  `backend/inspect/popup-attach-gate.lisp` checks it, chained submenus included, and
+  proves the absence of trails by comparing the damage-limited screen against a full
+  rebuild.
 - **Letting go of it.** It goes **free** when the holder's pointer leaves every CLIM
   window, when the holder has been silent for `*clim-token-idle*` (15 s), or when the
   holder's last viewer disconnects. A *free* token is taken silently by the next input

@@ -81,7 +81,7 @@
 (declaim (ftype function enqueue composite-seat
                 glass-port-mirrors glass-mirror-sheet glass-mirror-managed
                 glass-mirror-clim-x glass-mirror-clim-y
-                glass-port-default-seat wm-surface-p))
+                glass-port-default-seat wm-surface-p port-damage-popups))
 
 ;;; ---- knobs ------------------------------------------------------------------
 
@@ -188,12 +188,21 @@
    read of the window itself — the common case is a loop over the CLIM windows doing
    arithmetic and nothing else."
   (let ((tok (glass-port-clim-token port)) (scanned 0) (moved 0))
+    ;; A posted pop-up is drawn relative to where each seat holds the window that opened
+    ;; it, MEASURED AGAINST WHAT CLIM BELIEVES (GLASS-MIRROR-CLIM-X/Y) — so moving what
+    ;; CLIM believes moves the pop-up on every screen, without the pop-up repainting.
+    ;; Damage where it is now, then where it ends up.  A handoff cannot normally happen
+    ;; with a pull-down posted (the token is PINNED by the grab), so this is for the ways
+    ;; a pin ends without the menu doing: CLIM-TOKEN-SEAT-GONE, chiefly.  Both calls are
+    ;; a no-op walk of the mirror list when nothing is posted.
+    (port-damage-popups port)
     (dolist (m (glass-port-mirrors port))
       (when (and (typep m 'glass-mirror) (glass-mirror-managed m) (glass-mirror-sheet m))
         (incf scanned)
         (let ((x (seat-window-x seat m)) (y (seat-window-y seat m)))
           (unless (and (eql x (glass-mirror-clim-x m)) (eql y (glass-mirror-clim-y m)))
             (when (clim-sheet-goto port m x y) (incf moved))))))
+    (when (plusp moved) (port-damage-popups port))
     (incf (token-resync-scans tok) scanned)
     (incf (token-resyncs tok) moved)
     moved))

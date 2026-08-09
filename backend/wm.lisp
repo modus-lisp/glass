@@ -824,14 +824,20 @@
 
 (defun wm-window-box (obj &optional seat)
   "(x y w h) of OBJ's whole decorated window — title bar + border + content — AS SEAT
-   HOLDS IT (NIL = the window's own position), for damage accounting."
+   HOLDS IT (NIL = the window's own position), for damage accounting.
+
+   The position is SEAT-DRAW-X, i.e. where the pixels actually land on THAT screen.  For
+   every window a seat arranges for itself that is SEAT-WINDOW-X exactly; for a pop-up —
+   one position, session-wide, placed in the CLIM driver's arrangement — it is that
+   position shifted onto this seat's copy of the window that opened it.  Damage and
+   occlusion both come through here, so both follow the pixels rather than the slot."
   (multiple-value-bind (cx cy cw ch)
       (if (wm-surface-p obj)
-          (values (seat-window-x seat obj) (seat-window-y seat obj)
+          (values (seat-draw-x seat obj) (seat-draw-y seat obj)
                   (glass:fb-width (wm-surface-fb obj)) (glass:fb-height (wm-surface-fb obj)))
           (when-let ((img (mcclim-render::image-mirror-image obj)))
             (multiple-value-bind (w h) (image-wh img)
-              (values (seat-window-x seat obj) (seat-window-y seat obj) w h))))
+              (values (seat-draw-x seat obj) (seat-draw-y seat obj) w h))))
     (when cx
       (list (- cx +wm-border+) (- cy +wm-titleh+ +wm-border+)
             (+ cw (* 2 +wm-border+)) (+ +wm-titleh+ ch (* 2 +wm-border+))))))
@@ -870,15 +876,36 @@
    no-CopyRect client (macOS) re-encoding the whole window backs it up and trips
    wireframe.  Tune live over the control socket.")
 
+(defun wm-owned-popup-boxes (port owner &optional seat)
+  "The (x y w h) boxes, on SEAT's screen, of the pop-ups OWNER has posted.  Empty on a
+   desktop with no menu open, which is nearly always — so the drag paths below union in
+   nothing and compute exactly the boxes they always did.
+
+   A pop-up is drawn relative to the seat's copy of its owner (SEAT-DRAW-X), so moving
+   the owner moves the pop-up on that screen without the pop-up repainting: asked before
+   and after the move, this is what says which pixels the move dirtied."
+  (let ((boxes '()))
+    (dolist (m (glass-port-mirrors port) boxes)
+      (when (and (typep m 'glass-mirror) (not (glass-mirror-managed m))
+                 (eq (clim-popup-owner m port) owner))
+        (when-let ((b (wm-window-box m seat))) (push b boxes))))))
+
 (defun wm-drag-move-opaque (port obj ncx ncy &optional seat)
   "Opaque move step: move the real window to content-position (NCX,NCY) on SEAT's screen
    and composite old+new with a CopyRect hint (near-free on a client that can CopyRect)."
   (let* ((seat (port-seat port seat))
-         (old (wm-window-box obj seat)))
+         (old (wm-window-box obj seat))
+         (old-pops (wm-owned-popup-boxes port obj seat)))
     (wm-move obj ncx ncy seat)
-    (let ((new (wm-window-box obj seat)))
-      (composite-seat seat (wm-box-union (list old new))
-                      (when (and old new)
+    (let ((new (wm-window-box obj seat))
+          (new-pops (wm-owned-popup-boxes port obj seat)))
+      ;; No CopyRect while a pop-up of this window is posted: the copy would drag the
+      ;; menu's pixels along with the window's.  The diff of the (now larger) damage box
+      ;; would repair that in the same update, but a menu is open for a second or two and
+      ;; refusing costs nothing measurable — it is the same trade WM-COMPOSITE-SCROLL's
+      ;; occlusion guard makes, and for the same reason.
+      (composite-seat seat (wm-box-union (list* old new (append old-pops new-pops)))
+                      (when (and old new (null old-pops) (null new-pops))
                         (list (first old) (second old) (first new) (second new)
                               (third old) (fourth old)))))))
 
@@ -911,10 +938,13 @@
    last outline, and the window's NEW box.  The one time the moved content is re-sent."
   (let* ((seat (port-seat port seat))
          (old (wm-window-box obj seat))       ; real position BEFORE the move (the ghost source)
+         (old-pops (wm-owned-popup-boxes port obj seat))
          (wire (seat-drag-wire-box seat)))
     (wm-move obj ncx ncy seat)
     (setf (seat-drag-wire seat) nil (seat-drag-wire-box seat) nil)
-    (composite-seat seat (wm-box-union (list old wire (wm-window-box obj seat))))))
+    (composite-seat seat (wm-box-union (list* old wire (wm-window-box obj seat)
+                                             (append old-pops
+                                                     (wm-owned-popup-boxes port obj seat)))))))
 
 (defun wm-pos-x (obj &optional seat) (seat-window-x seat obj))
 (defun wm-pos-y (obj &optional seat) (seat-window-y seat obj))
