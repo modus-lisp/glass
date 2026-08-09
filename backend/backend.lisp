@@ -193,12 +193,19 @@
 (defclass glass-mirror (mcclim-render::image-mirror-mixin)
   ((x    :initform 0   :accessor glass-mirror-x)             ; content screen position
    (y    :initform 0   :accessor glass-mirror-y)
-   ;; Where McCLIM'S SHEET TRANSFORMATION currently puts this window — which is the seat
+   ;; Where McCLIM'S SHEET TRANSFORMATION HAS BEEN TOLD to put this window — the seat
    ;; DRIVING McCLIM's view of it, and not necessarily the window's own position above.
    ;; They were one pair of slots, and that is precisely why a second seat could not take
    ;; over the geometry: aiming the sheet at its arrangement also rewrote the window's own
    ;; position and made the first seat's screen jump.  Compared against on every token
    ;; acquisition, which is what makes an unchanged layout cost nothing to resync.
+   ;;
+   ;; TOLD, not observed: the value is the target of the last move ENQUEUED for this
+   ;; mirror, so while the event queue is behind it is a few milliseconds AHEAD of the
+   ;; sheet — which is the answer every reader here wants.  Written by CLIM-SHEET-GOTO
+   ;; (driver-follow moves, at request time) and by SET-MIRROR-GEOMETRY (everything
+   ;; McCLIM does on its own account), never by both for the same move.  The full
+   ;; statement, and the race that came of a third writer, are in clim-token.lisp.
    (clim-x :initform 0 :accessor glass-mirror-clim-x)
    (clim-y :initform 0 :accessor glass-mirror-clim-y)
    (main :initform nil :accessor glass-mirror-main)          ; owns the fb + the RFB server?
@@ -1097,18 +1104,26 @@
       ;; Managed windows are positioned by moving their SHEET (realize-mirror / wm-move),
       ;; so McCLIM's region already carries the WM slot; just read it back here.
       ;;
-      ;; Two slots now, because McCLIM's geometry follows whichever seat is DRIVING it and
-      ;; the window's own position is the session's arrangement.  CLIM-X/Y always records
-      ;; what CLIM believes.  X/Y — what every non-diverged seat is looking at — is left
-      ;; alone when this update IS the aim-at-the-driver write (CLIM-SHEET-GOTO binds the
-      ;; special), or a second seat taking the token would drag the first seat's windows
-      ;; across its screen.
-      (when (typep mirror 'glass-mirror)
+      ;; Two slots, because McCLIM's geometry follows whichever seat is DRIVING it and the
+      ;; window's own position is the session's arrangement.
+      ;;
+      ;; This is one of exactly two writers of CLIM-X/Y (clim-token.lisp states the
+      ;; invariant and names the other): it records the moves McCLIM makes ON ITS OWN
+      ;; ACCOUNT — realising a mirror, a resize, posting a pop-up — where CLIM is telling
+      ;; US where it put something.  When the update IS the aim-at-the-driver write it
+      ;; writes NEITHER pair: CLIM-SHEET-GOTO has already recorded the target, and this
+      ;; apply may be running a request that a later one has since superseded, so writing
+      ;; back here would stamp a stale position over a fresh one (the race this replaced:
+      ;; the next acquirer's resync then found nothing to move and drove on stale sheet
+      ;; geometry).  And X/Y — what every non-diverged seat is looking at — must be left
+      ;; alone regardless, or a second seat taking the token would drag the first seat's
+      ;; windows across its screen.
+      (when (and (typep mirror 'glass-mirror)
+                 (not (eq mirror *clim-geometry-follows-driver*)))
         (setf (glass-mirror-clim-x mirror) (floor x1)
-              (glass-mirror-clim-y mirror) (floor y1))
-        (unless *clim-geometry-follows-driver*
-          (setf (glass-mirror-x mirror) (floor x1)
-                (glass-mirror-y mirror) (floor y1)))))
+              (glass-mirror-clim-y mirror) (floor y1)
+              (glass-mirror-x mirror) (floor x1)
+              (glass-mirror-y mirror) (floor y1))))
     (values x1 y1 x2 y2)))
 ;; McCLIM asks the PORT for the modifier state, having one keyboard; the answer is the
 ;; modifier state of the seat currently driving McCLIM.

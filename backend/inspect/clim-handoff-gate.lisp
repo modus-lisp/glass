@@ -17,7 +17,8 @@
 ;;;;   5. a handoff never happens mid-gesture: it is deferred and applied at the end
 ;;;;   6. the token goes free on pointer-exit, on idle, and on disconnect, and a free
 ;;;;      token is taken silently
-;;;;   7. two seats alternating does not churn geometry resyncs
+;;;;   7. two seats alternating does not churn geometry resyncs, and does not DROP one
+;;;;      either — under sustained thrash, with the event queue behind
 ;;;;   8. native surfaces are still per-seat: both seats type into two terminals at once
 ;;;;   9. the holder indicator, off and on
 ;;;;
@@ -431,6 +432,42 @@
                    n (- (token-resyncs tok) r0))
             (note "~,3f ms total, ~,4f ms per handoff — a sheet-transformation write each"
                   ms (/ ms n))))
+        ;; …and the same round SUSTAINED.  The round above runs once, early, on a queue
+        ;; with nothing in it, and passes under any discipline at all.  What it cannot see
+        ;; is a BACKLOG: an aim-at-the-driver move still waiting to be applied when the
+        ;; next seat claims the token.  That is the state in which a second writer of
+        ;; GLASS-MIRROR-CLIM-X/Y is fatal — an apply that has been superseded stamps its
+        ;; own target back over the fresh one, the next acquirer's diff finds nothing to
+        ;; move, and that seat drives on with McCLIM's sheet still pointed at the other
+        ;; person's window.  So run the round over and over and require EVERY one whole;
+        ;; before the invariant had one writer, most rounds came up one or two short.
+        (let ((rounds 25) (n 100) (short 0) (missed 0) (worst 100))
+          (dotimes (r rounds)
+            (let ((r0 (token-resyncs tok)))
+              (dotimes (i n)
+                (let ((s (if (evenp i) b a)))
+                  (click port s (+ (seat-window-x s m) 40) (+ (seat-window-y s m) 120))))
+              (let ((moved (- (token-resyncs tok) r0)))
+                (setf worst (min worst moved))
+                (unless (= moved n) (incf short) (incf missed (- n moved))))))
+          (check (zerop short)
+                 "sustained: ~d rounds x ~d handoffs, every round moved all ~d ~
+                  (~d short round~:p, ~d handoff~:p missed, worst round ~d)"
+                 rounds n n short missed worst))
+        ;; What all that counting is ABOUT: when the queue finally drains, McCLIM's own
+        ;; arithmetic — the transformation it places pull-downs THROUGH — must land on the
+        ;; last driver's window and agree with what we recorded for it.  A resync that was
+        ;; skipped shows up here as a driver reading somebody else's geometry.
+        (drain port 0.5)
+        (let ((last (or (clim-token-holder port) a)))
+          (multiple-value-bind (sx sy) (clim-screen-position sheet)
+            (check (and (= sx (seat-window-x last m)) (= sy (seat-window-y last m)))
+                   "…and the drained queue left McCLIM on the LAST driver's position ~
+                    (~a holds it at ~d,~d; McCLIM says ~d,~d)"
+                   (seat-name last) (seat-window-x last m) (seat-window-y last m) sx sy)
+            (check (and (= sx (glass-mirror-clim-x m)) (= sy (glass-mirror-clim-y m)))
+                   "…with the record and the sheet agreeing once nothing is in flight ~
+                    (recorded ~d,~d)" (glass-mirror-clim-x m) (glass-mirror-clim-y m))))
         (note "token: ~a" (clim-token-report port))
 
         ;; ================= 8. native surfaces are untouched ====================

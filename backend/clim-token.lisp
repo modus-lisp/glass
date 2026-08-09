@@ -127,7 +127,14 @@
    (deferrals    :initform 0 :accessor token-deferrals)     ; a press refused mid-gesture
    (releases     :initform 0 :accessor token-releases)      ; went FREE
    (resync-scans :initform 0 :accessor token-resync-scans)  ; CLIM windows examined on acquire
-   (resyncs      :initform 0 :accessor token-resyncs))      ; …of those, actually moved
+   (resyncs      :initform 0 :accessor token-resyncs)       ; …of those, actually moved
+   ;; Serialises the whole of "aim McCLIM at a seat's arrangement" — see the geometry
+   ;; section below.  Held across a resync's read-compare-write scan and across each
+   ;; CLIM-SHEET-GOTO's record-and-enqueue, so that the recorded position and the order
+   ;; of the enqueued moves cannot disagree when two seats claim the token at once.
+   ;; Recursive because a resync's scan calls CLIM-SHEET-GOTO from inside itself.
+   (geometry-lock :initform (sb-thread:make-mutex :name "glass-clim-geometry")
+                  :reader token-geometry-lock))
   (:documentation
    "Which seat drives McCLIM, and the bookkeeping that lets it change hands without
     changing hands in the middle of a gesture.  A class for the reason everything
@@ -147,34 +154,78 @@
 
 ;;; ---- geometry: what McCLIM believes, vs what a seat sees ---------------------
 ;;;
-;;; A managed mirror now carries TWO positions.  GLASS-MIRROR-X/Y is the window's OWN
+;;; A managed mirror carries TWO positions.  GLASS-MIRROR-X/Y is the window's OWN
 ;;; position — the session default, what a seat sees until it moves the window, and what
-;;; the home seat writes.  GLASS-MIRROR-CLIM-X/Y is where MCCLIM'S SHEET TRANSFORMATION
-;;; currently puts it, which is the driver's view and nobody else's.
+;;; the home seat writes.  GLASS-MIRROR-CLIM-X/Y is McCLIM's, the driver's view and
+;;; nobody else's.
 ;;;
 ;;; They were the same slot, which is exactly why the geometry could not travel: writing
 ;;; the sheet to point at a second seat's arrangement also rewrote the window's own
-;;; position, and the FIRST seat's screen jumped.  This special is how the write is told
-;;; apart: bound while (and only while) we are aiming McCLIM at the driver's view.
+;;; position, and the FIRST seat's screen jumped.  The special below is how the write is
+;;; told apart: bound while (and only while) we are aiming McCLIM at the driver's view.
+;;;
+;;; ---- THE INVARIANT, and who is allowed to write it --------------------------
+;;;
+;;; GLASS-MIRROR-CLIM-X/Y IS THE POSITION McCLIM'S SHEET TRANSFORMATION HAS BEEN TOLD TO
+;;; BE AT — the target of the LAST move enqueued for that mirror, which the event thread
+;;; will have applied by the time the mailbox drains.  It is where the window's
+;;; pull-downs will be placed from, asked at REQUEST time rather than at APPLY time.  It
+;;; is not a cache of the sheet: for the few milliseconds the queue is behind, it is
+;;; AHEAD of the sheet, deliberately, and everything that reads it wants the answer that
+;;; is about to be true (a resync must not re-request a move already in flight; a pop-up
+;;; offset must land where the owner is going).
+;;;
+;;; EXACTLY TWO WRITERS, and they never overlap:
+;;;
+;;;   CLIM-SHEET-GOTO writes it for every driver-follow move, at the moment the move is
+;;;     requested, and is the ONLY writer for those.  Record and enqueue happen together
+;;;     under the token's GEOMETRY-LOCK, and the mailbox is FIFO with a single consumer,
+;;;     so the recorded position is always the target of the closure that will run last.
+;;;
+;;;   SET-MIRROR-GEOMETRY writes it for every move that does NOT come from here — a
+;;;     mirror being realised, a resize, a pop-up McCLIM posts, McCLIM moving a sheet on
+;;;     its own account.  There CLIM is TELLING us where it put something, and there is
+;;;     no request outstanding to contradict.
+;;;
+;;; It used to have a third writer, and that was a race.  The enqueued closure calls
+;;; UPDATE-MIRROR-GEOMETRY, which re-enters SET-MIRROR-GEOMETRY, which wrote the slots
+;;; AGAIN — the same value, but at APPLY time, a queue's latency after the eager write.
+;;; Alternate two seats fast enough and a closure would run after a LATER request had
+;;; already been recorded, stamping the superseded target back over it; the next
+;;; acquirer's resync then diffed against a position McCLIM was not going to be at,
+;;; found nothing to move, and left that seat driving with stale sheet geometry — which
+;;; is precisely what puts a pull-down at the other person's window.  The apply closure
+;;; now APPLIES ONLY.  There is no stale write to order against a fresh one because
+;;; there is no second write at all.
 
 (defvar *clim-geometry-follows-driver* nil
-  "True while McCLIM's sheet geometry is being pointed at the CLIM driver's view of a
-   window.  SET-MIRROR-GEOMETRY then records only what CLIM believes and leaves the
-   window's own position — the session default every other seat is reading — alone.")
+  "The MIRROR whose McCLIM geometry is being pointed at the CLIM driver's view right now,
+   or NIL.  Bound by CLIM-SHEET-GOTO's apply closure and read by SET-MIRROR-GEOMETRY,
+   which for that one mirror records NOTHING: not the window's own position (the session
+   default every other seat is reading, which must not move because somebody else took
+   the token) and not the CLIM position either (already recorded, possibly by a LATER
+   request than this one — see the invariant above).  A mirror and not a T so that a
+   nested update of some OTHER mirror during the same call is still an ordinary write.")
 
 (defun clim-sheet-goto (port mirror x y)
-  "Put McCLIM's idea of MIRROR's window at (X,Y): set the sheet transformation and
-   update the mirror geometry, on the EVENT THREAD (both touch sheet state).  Records
-   the new CLIM position immediately, before the event runs, so a second claim in the
-   same breath does not enqueue the same move twice."
+  "Aim McCLIM's idea of MIRROR's window at (X,Y).  Records the target and enqueues the
+   apply; answers T if there was a sheet to aim.
+
+   The write is here and the apply is on the event thread, because the sheet
+   transformation and UPDATE-MIRROR-GEOMETRY are sheet state and only the event thread
+   may touch it — but the RECORD cannot wait for the queue, or a second claim in the
+   same breath would enqueue the same move twice.  So: record now, apply later, and
+   under the geometry lock so that the last request recorded is the last request
+   enqueued.  The closure does not write the record back; see the invariant above."
   (when-let ((sheet (glass-mirror-sheet mirror)))
-    (setf (glass-mirror-clim-x mirror) x
-          (glass-mirror-clim-y mirror) y)
-    (enqueue port (lambda ()
-                    (let ((*clim-geometry-follows-driver* t))
-                      (setf (sheet-transformation sheet)
-                            (make-translation-transformation x y))
-                      (climi::update-mirror-geometry sheet))))
+    (sb-thread:with-recursive-lock ((token-geometry-lock (glass-port-clim-token port)))
+      (setf (glass-mirror-clim-x mirror) x
+            (glass-mirror-clim-y mirror) y)
+      (enqueue port (lambda ()
+                      (let ((*clim-geometry-follows-driver* mirror))
+                        (setf (sheet-transformation sheet)
+                              (make-translation-transformation x y))
+                        (climi::update-mirror-geometry sheet)))))
     t))
 
 (defun clim-resync-geometry (port seat)
@@ -182,29 +233,38 @@
    windows had to move.
 
    Only windows whose view actually DIVERGES cost anything: the comparison is against
-   GLASS-MIRROR-CLIM-X/Y, what CLIM believes right now, so two seats holding the desktop
-   the same way hand the token back and forth for free.  And copy-on-write means a seat
-   that has moved nothing has no SEAT-VIEW records at all, so SEAT-WINDOW-X is a slot
-   read of the window itself — the common case is a loop over the CLIM windows doing
-   arithmetic and nothing else."
+   GLASS-MIRROR-CLIM-X/Y, where McCLIM has been told to put the window, so two seats
+   holding the desktop the same way hand the token back and forth for free.  And
+   copy-on-write means a seat that has moved nothing has no SEAT-VIEW records at all, so
+   SEAT-WINDOW-X is a slot read of the window itself — the common case is a loop over the
+   CLIM windows doing arithmetic and nothing else.
+
+   The diff is an optimisation and not a correctness condition — resyncing every window
+   unconditionally would be correct too, just wasteful — but it is only SOUND while the
+   thing it diffs against means what the invariant above says it means.  It stopped
+   meaning that when a superseded apply could write it back, and the diff then skipped
+   moves that were needed."
   (let ((tok (glass-port-clim-token port)) (scanned 0) (moved 0))
-    ;; A posted pop-up is drawn relative to where each seat holds the window that opened
-    ;; it, MEASURED AGAINST WHAT CLIM BELIEVES (GLASS-MIRROR-CLIM-X/Y) — so moving what
-    ;; CLIM believes moves the pop-up on every screen, without the pop-up repainting.
-    ;; Damage where it is now, then where it ends up.  A handoff cannot normally happen
-    ;; with a pull-down posted (the token is PINNED by the grab), so this is for the ways
-    ;; a pin ends without the menu doing: CLIM-TOKEN-SEAT-GONE, chiefly.  Both calls are
-    ;; a no-op walk of the mirror list when nothing is posted.
-    (port-damage-popups port)
-    (dolist (m (glass-port-mirrors port))
-      (when (and (typep m 'glass-mirror) (glass-mirror-managed m) (glass-mirror-sheet m))
-        (incf scanned)
-        (let ((x (seat-window-x seat m)) (y (seat-window-y seat m)))
-          (unless (and (eql x (glass-mirror-clim-x m)) (eql y (glass-mirror-clim-y m)))
-            (when (clim-sheet-goto port m x y) (incf moved))))))
-    (when (plusp moved) (port-damage-popups port))
-    (incf (token-resync-scans tok) scanned)
-    (incf (token-resyncs tok) moved)
+    ;; The whole read-compare-write scan is one atomic aim, so two seats claiming the
+    ;; token at once cannot each conclude the other's move is unnecessary.
+    (sb-thread:with-recursive-lock ((token-geometry-lock tok))
+      ;; A posted pop-up is drawn relative to where each seat holds the window that opened
+      ;; it, MEASURED AGAINST WHAT CLIM BELIEVES (GLASS-MIRROR-CLIM-X/Y) — so moving what
+      ;; CLIM believes moves the pop-up on every screen, without the pop-up repainting.
+      ;; Damage where it is now, then where it ends up.  A handoff cannot normally happen
+      ;; with a pull-down posted (the token is PINNED by the grab), so this is for the ways
+      ;; a pin ends without the menu doing: CLIM-TOKEN-SEAT-GONE, chiefly.  Both calls are
+      ;; a no-op walk of the mirror list when nothing is posted.
+      (port-damage-popups port)
+      (dolist (m (glass-port-mirrors port))
+        (when (and (typep m 'glass-mirror) (glass-mirror-managed m) (glass-mirror-sheet m))
+          (incf scanned)
+          (let ((x (seat-window-x seat m)) (y (seat-window-y seat m)))
+            (unless (and (eql x (glass-mirror-clim-x m)) (eql y (glass-mirror-clim-y m)))
+              (when (clim-sheet-goto port m x y) (incf moved))))))
+      (when (plusp moved) (port-damage-popups port))
+      (incf (token-resync-scans tok) scanned)
+      (incf (token-resyncs tok) moved))
     moved))
 
 ;;; ---- asking the token ---------------------------------------------------------
