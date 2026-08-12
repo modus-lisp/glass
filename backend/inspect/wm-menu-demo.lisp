@@ -7,7 +7,7 @@
 (handler-bind ((warning #'muffle-warning))
   (let ((*standard-output* (make-broadcast-stream)))
     (ql:quickload '(:glass :zpng :chipz)) (require :sb-concurrency)
-    (asdf:load-asd "/home/claude/glass/backend/mcclim-glass.asd")
+    (asdf:load-asd (merge-pathnames "../mcclim-glass.asd" *load-truename*))
     (asdf:load-system :mcclim-glass)))
 
 (defpackage #:wmenu (:use #:cl)) (in-package #:wmenu)

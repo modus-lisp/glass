@@ -32,7 +32,7 @@
   (let ((*standard-output* (make-broadcast-stream)))
     (ql:quickload '(:glass)) (require :sb-concurrency)
     (ignore-errors (asdf:load-system :glass/speech))
-    (asdf:load-asd "/home/claude/glass/backend/mcclim-glass.asd")
+    (asdf:load-asd (merge-pathnames "../mcclim-glass.asd" *load-truename*))
     (asdf:load-system :mcclim-glass)))
 
 (defpackage #:glass-selmenu-gate (:use #:cl)) (in-package #:glass-selmenu-gate)

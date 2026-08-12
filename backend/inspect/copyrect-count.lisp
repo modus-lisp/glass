@@ -11,7 +11,7 @@
 (handler-bind ((warning #'muffle-warning))
   (let ((*standard-output* (make-broadcast-stream)))
     (ql:quickload '(:glass :glass/term :pigment :sb-concurrency))
-    (asdf:load-asd "/home/claude/glass/backend/mcclim-glass.asd")
+    (asdf:load-asd (merge-pathnames "../mcclim-glass.asd" *load-truename*))
     (asdf:load-system :mcclim-glass)))
 
 (defpackage #:cr (:use #:cl)) (in-package #:cr)

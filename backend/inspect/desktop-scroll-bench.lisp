@@ -33,7 +33,7 @@
   (let ((*standard-output* (make-broadcast-stream)))
     (ql:quickload '(:glass :mcclim :mcclim-render :sb-concurrency :pigment))
     (asdf:load-system :loom/glass)
-    (asdf:load-asd "/home/claude/glass/backend/mcclim-glass.asd")
+    (asdf:load-asd (merge-pathnames "../mcclim-glass.asd" *load-truename*))
     (asdf:load-system :mcclim-glass)))
 (handler-bind ((warning #'muffle-warning))
   (let ((*standard-output* (make-broadcast-stream)))

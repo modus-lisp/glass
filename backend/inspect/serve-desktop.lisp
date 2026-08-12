@@ -17,7 +17,7 @@
     (ignore-errors (asdf:load-system :warren))                ; the file browser (optional)
     (ignore-errors (asdf:load-system :glass/audio-stream))    ; the session's sound (optional)
     (ignore-errors (asdf:load-system :glass/speech))          ; and its voice, via chord (optional)
-    (asdf:load-asd "/home/claude/glass/backend/mcclim-glass.asd")
+    (asdf:load-asd (merge-pathnames "../mcclim-glass.asd" *load-truename*))
     (asdf:load-system :mcclim-glass)
     (ignore-errors (asdf:load-system :mcclim-glass/speak))))  ; type-and-say window (optional)
 

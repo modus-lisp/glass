@@ -14,7 +14,7 @@
   (let ((*standard-output* (make-broadcast-stream)))
     (ql:quickload '(:mcclim :mcclim-render :glass :chipz))
     (require :sb-concurrency)
-    (asdf:load-asd "/home/claude/glass/backend/mcclim-glass.asd")
+    (asdf:load-asd (merge-pathnames "../mcclim-glass.asd" *load-truename*))
     (asdf:load-system :mcclim-glass)))
 
 (defpackage #:glass-resize (:use #:cl))

@@ -11,7 +11,7 @@
     (ql:quickload '(:glass :zpng :chipz))
     (asdf:load-system :loom/glass)                     ; the optional browser backend
     (require :sb-concurrency)
-    (asdf:load-asd "/home/claude/glass/backend/mcclim-glass.asd")
+    (asdf:load-asd (merge-pathnames "../mcclim-glass.asd" *load-truename*))
     (asdf:load-system :mcclim-glass)))
 
 (defpackage #:wbrz (:use #:cl)) (in-package #:wbrz)

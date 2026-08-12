@@ -11,7 +11,7 @@
   (let ((*standard-output* (make-broadcast-stream)))
     (ql:quickload '(:mcclim :mcclim-render :glass :zpng :chipz :clim-examples :clim-listener :clouseau))
     (require :sb-concurrency)
-    (asdf:load-asd "/home/claude/glass/backend/mcclim-glass.asd")
+    (asdf:load-asd (merge-pathnames "../mcclim-glass.asd" *load-truename*))
     (asdf:load-system :mcclim-glass)))
 
 (defpackage #:glass-stock (:use #:cl))

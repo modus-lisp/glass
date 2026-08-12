@@ -10,7 +10,7 @@
   (let ((*standard-output* (make-broadcast-stream)))
     (ql:quickload '(:glass :zpng :chipz :clim-examples :clim-listener))
     (require :sb-concurrency)
-    (asdf:load-asd "/home/claude/glass/backend/mcclim-glass.asd")
+    (asdf:load-asd (merge-pathnames "../mcclim-glass.asd" *load-truename*))
     (asdf:load-system :mcclim-glass)))
 
 (defpackage #:wsub (:use #:cl)) (in-package #:wsub)
