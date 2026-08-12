@@ -108,10 +108,14 @@ shrinks rather than gets rediscovered.
 1. **`~/quicklisp/setup.lisp` is hardcoded** in 54 scripts. A `LISP`-style
    environment variable, or falling back to an already-loaded ASDF, would let the
    scripts run against any Quicklisp (or none).
-2. **No setup step links the sibling repos.** Every developer wires
-   `local-projects/` by hand, and the failure mode — a `SYSTEM-NOT-FOUND` deep in a
-   quickload — does not say which repo is missing or where to get it.
+2. **Nothing links the sibling repos for a REPL.** The scripts under `inspect/`
+   and `backend/inspect/` no longer need it — each registers the whole workspace
+   with ASDF, derived from its own `*load-truename*` — but working from your own
+   REPL still means wiring `local-projects/` (or a `CL_SOURCE_REGISTRY`) by hand,
+   and the failure mode, a `SYSTEM-NOT-FOUND` deep in a quickload, does not say
+   which repo is missing or where to get it.
 3. **`backend/mcclim-glass.asd` is invisible to ASDF** unless a script loads it.
+   `glass.asd` does not reference it, so the same REPL caveat applies.
 4. **`:glass/hearing` cannot be built from the public repos.** It depends on
    `stave`, and there is no `github.com/modus-lisp/stave` — the org's repo list
    does not include it and `api.github.com/repos/modus-lisp/stave` is a 404. So a
