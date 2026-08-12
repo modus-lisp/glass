@@ -121,10 +121,12 @@ shrinks rather than gets rediscovered.
    does not include it and `api.github.com/repos/modus-lisp/stave` is a 404. So a
    full org sync still leaves this one system unbuildable. Either stave is private
    / unpublished, or the dependency needs to name where it actually comes from.
-5. **`scribe` defines a `DEFLATE` package** that collides with the Quicklisp
-   `deflate` system pulled in by McCLIM's PNG path. The load survives only because
-   every script wraps it in `(handler-bind ((warning #'muffle-warning)) …)`; a
-   plain `(asdf:load-system :mcclim-glass)` fails on the package-variance warning.
-6. **The `*wav*` fixture in the audio gates** points at a path inside stave's
+5. **The `*wav*` fixture in the audio gates** points at a path inside stave's
    checkout, unlike the voice and ears models it has no environment-variable
    override.
+
+*Fixed since this list was written:* scribe used to define a `DEFLATE` package
+that collided with the Quicklisp `deflate` system McCLIM pulls in through
+opticl → retrospectiff, so `(asdf:load-system :mcclim-glass)` failed on the
+package-variance warning unless it was muffled. scribe now uses
+[cram](https://github.com/modus-lisp/cram)'s inflate and its own copy is gone.
