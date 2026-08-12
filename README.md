@@ -230,6 +230,10 @@ or from a REPL: `(asdf:load-system "glass/test")` then `(glass/test:run-tests)` 
 returns `T` iff every check passes. It serves a known pattern to an in-process
 RFB client and asserts the received pixels are exactly what was drawn.
 
+[docs/RUNNING.md](docs/RUNNING.md) covers the three ways to bring a session up — the
+self-test, a bare framebuffer, the full desktop — along with what a fresh checkout
+needs on its ASDF path and which rough edges still want hands.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
