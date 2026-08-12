@@ -669,7 +669,14 @@
          (cell-h (+ asc desc 1))
          ;; setsid -c makes the pty the controlling terminal: real job control,
          ;; no "cannot set process group" warning, and readline echoes normally.
-         (proc (sb-ext:run-program "/usr/bin/setsid" (list "-c" shell "--norc" "-i")
+         ;; It is util-linux, so it is simply absent on macOS and the BSDs; there
+         ;; we exec the shell directly and lose only the job-control niceties
+         ;; (bash may say "cannot set terminal process group" — the pty still
+         ;; reads and writes normally).  A missing setsid used to be a hard
+         ;; error, which took the whole desktop down with it.
+         (setsid (find-if #'probe-file '("/usr/bin/setsid" "/bin/setsid")))
+         (argv (if setsid (list "-c" shell "--norc" "-i") (list "--norc" "-i")))
+         (proc (sb-ext:run-program (or setsid shell) argv
                                    :pty t :wait nil
                                    :external-format :latin-1   ; read raw bytes; we UTF-8 decode
                                    :environment (list "TERM=xterm-256color" "PS1=\\w $ "
