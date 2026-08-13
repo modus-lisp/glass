@@ -114,3 +114,59 @@ There is also a **bootstrap** question with no clever answer: a seat with no tra
 reached, so the first seat's transport has to be arranged locally, by the launcher. That is fine —
 it is the same reason `desktop-5903.lisp` exists — but it means "no listener by default" is a
 default, not an invariant.
+
+## What met the code
+
+Written before the code, and the code disagreed in four places. Recorded here rather than quietly
+fixed above, because a note that edits itself to have been right teaches nothing.
+
+**1. A seat's `port-num` was never the conflation.** The argument above puts two things side by
+side — `run-wm` serves, and `port-num` defaults to 5900 — as though they were one fault. They are
+not. Nothing has ever listened because a seat exists: `add-seat` opens no socket, and
+`seat-gate.lisp` has been running two seats with no sockets at all since seats were built. The
+default port is a *setting* — the port this seat serves on **if** it serves, and the number the
+audio ports are derived from — and it is still 5900 after this change. The whole conflation was one
+line, `start-glass-server` inside `run-wm`, and that is the line that moved.
+
+**2. Closing a listener is not `socket-close`, and this is the trap the model hides.** The note
+says a seat "opens one" and treats closing as the same act backwards. It is not. A thread parked in
+`accept()` holds the open file description, so `socket-close` drops this process's descriptor and
+the kernel goes on listening: the port stays bound, `ss -ltn` still shows it, and a client still
+connects. A seat that closed its transport that way would have *believed* it had stopped serving
+while remaining reachable — the exact posture this note exists to abolish, now with a slot saying
+otherwise. `shutdown()` first is what the parked accept notices. See `GLASS:CLOSE-LISTENER`; the
+gate asks the operating system rather than the object, which is why it caught it.
+
+**3. `run-wm`'s name did not have to stop being true, and the launchers do not need two calls.**
+The migration section predicts that cost and offers to pay it. It is avoidable and it was not paid:
+"run a session and expose the home seat" is a perfectly honest description of a convenience, so
+`run-wm` keeps it, keeps its argument list, keeps its ordering (the listener still comes up before
+the first window is spawned, which is observable to anybody connecting during startup), and
+`desktop-5903.lisp` needs **no diff at all**. The split is underneath — `MAKE-WM-SESSION`,
+`START-WM-SESSION`, `RUN-WM-LOOP`, and `RUN-SESSION` for a session that serves nothing — where a
+caller who wants the two things separately can reach them and a caller who wants the old one is not
+made to care.
+
+**4. A seat's keyboard belonged to the seat, not to its listener.** `SEAT-INJECTOR` — the callback
+anything typing *for* this seat uses, dictation included — was made by `START-SEAT-SERVER`, which
+was fine while a seat and a listener arrived together and is wrong the moment they do not: a seat
+that serves nothing would have had no hands, and a seat with two transports would have grown two
+keyboards. It is made by `ADD-SEAT` now. Nothing in the note predicts this, and it is the one place
+where separating the two exposed something that was already leaning on their being one.
+
+### Built, and not built
+
+Built: seats have identities (opaque in core, minted and persisted by `:glass/nostr`, keyed by seat
+name so a seat survives a restart as the same destination), and serving is a seat's decision
+(`OPEN-SEAT-TRANSPORT` / `CLOSE-SEAT-TRANSPORT`, a seat may hold several or none).
+
+Not built, and still wanted, in the order the note argues for them: **per-seat admission** (the
+`invoker` becoming a principal), and **capture internal to the seat** (which is what makes the VNC
+password stop breaking video). Nothing above should block either. Still deliberately refused:
+signing and verification — the places a signature would go are marked in `backend/seat.lisp` and
+`src/nostr.lisp` and nothing else about them is built.
+
+The bind address is now a parameter (`CLIM-GLASS:*SEAT-BIND-ADDRESS*`, and `:address` on `run-wm`
+and `open-seat-transport`) whose default is unchanged: `0.0.0.0`, every interface, exactly what
+glass has always bound. Closing the hole the note opens with is one word — `:address "127.0.0.1"`
+in a launcher — and it is deliberately left to whoever knows what is pointed at the box.
