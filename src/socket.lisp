@@ -89,6 +89,21 @@
     (ignore-errors (sb-posix:chmod (string-right-trim "/" (namestring dir)) *socket-dir-mode*))
     dir))
 
+(defun socket-sibling (path type)
+  "The socket file beside PATH, named for TYPE: `…/seat-0.rfb' -> `…/seat-0.audio'.
+
+   A DESKTOP AND THE PROCESS THAT CONNECTS TO IT MUST AGREE ON FOUR PATHS, and there are
+   only two honest ways to make them: type all four into both, or derive three from one.
+   Typed-in copies drift, which is the whole reason both ends of glass-audio/1 and
+   glass-mic/1 live in this repository rather than one each side of the wire.  So: derive,
+   from the one path a launcher and a gateway both already have to name.
+
+   It is the socket-file reading of a convention that already exists.  A seat's audio port
+   is its screen port + 10 and its microphone + 11 (*AUDIO-PORT-OFFSET*), read as arithmetic
+   rather than as a number typed into a startup script.  Arithmetic on a path is a name in
+   the same directory, and this is it."
+  (namestring (make-pathname :type (string-downcase (string type)) :defaults (pathname path))))
+
 (defconstant +sun-path-max+ 107
   "sun_path is 108 bytes including the terminator — a hard kernel limit, not a convention.
    A path over it is silently truncated by some libcs and rejected by others, so we reject

@@ -26,7 +26,7 @@
    #:listener-kind #:listener-endpoint #:listener-open-p #:listener-socket #:listener-path
    #:listener-port #:listener-address #:listener-mode #:listener-peer-policy #:listener-refused
    #:listener-accept #:accept-stream
-   #:runtime-dir #:socket-path #:*runtime-dir* #:*socket-file-mode* #:*socket-dir-mode*
+   #:runtime-dir #:socket-path #:socket-sibling #:*runtime-dir* #:*socket-file-mode* #:*socket-dir-mode*
    #:clear-stale-socket #:unix-socket-live-p
    #:peer-credentials #:peer-allowed-p #:peer-name #:socket-fd #:*peer-policy*
    #:open-connection #:parse-endpoint #:endpoint-string #:socket-unsent-bytes
