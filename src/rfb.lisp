@@ -34,63 +34,12 @@
 (defun skip (s n) (dotimes (i n) (read-byte s)))
 
 ;;; ---- transport --------------------------------------------------------------
-
-(defun tcp-listen (port &key (backlog 8) (address "0.0.0.0"))
-  "A listening TCP socket bound to PORT.
-
-   ADDRESS defaults to 0.0.0.0 — every interface — which is what it has always been and
-   what every caller in this tree gets unless it says otherwise.  It is a PARAMETER and
-   not a constant so that a caller who wants \"127.0.0.1\" can say so in one place; see
-   CLIM-GLASS:OPEN-SEAT-TRANSPORT, which passes it through for exactly that reason."
-  (let ((sock (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
-    (setf (sb-bsd-sockets:sockopt-reuse-address sock) t)
-    (sb-bsd-sockets:socket-bind sock (sb-bsd-sockets:make-inet-address address) port)
-    (sb-bsd-sockets:socket-listen sock backlog)
-    sock))
-
-(defun close-listener (sock)
-  "Stop a listening socket made by TCP-LISTEN, and MEAN IT.  T if there was one.
-
-   SOCKET-CLOSE ON ITS OWN DOES NOT STOP LISTENING.  A thread parked in SOCKET-ACCEPT
-   still holds the open file description, so close() drops this process's descriptor and
-   the kernel goes on accepting: the port stays bound, `ss -ltn' goes on showing it, and a
-   client can still connect.  That is not a subtlety anybody should have to rediscover —
-   it is the difference between a seat that has closed its transport and one that only
-   thinks it has.
-
-   SHUTDOWN is what the parked accept notices (it returns EINVAL on Linux and the accept
-   loop unwinds), so it comes first and the close comes after.  Errors from either are
-   ignored on purpose: a socket already shut down, or already closed, is the state being
-   asked for, and a listener that refuses to be closed twice is a worse object than one
-   that does nothing the second time."
-  (when sock
-    (ignore-errors (sb-bsd-sockets:socket-shutdown sock :direction :io))
-    (ignore-errors (sb-bsd-sockets:socket-close sock))
-    t))
-
-(defconstant +siocoutq+ #x5411 "Linux SIOCOUTQ: bytes in a socket's send queue not yet sent to the peer.")
-(defun socket-unsent-bytes (fd)
-  "Bytes queued in FD's TCP send buffer the client hasn't drained yet — the real
-   backlog when the sender out-produces a slow client.  0 on any error / non-Linux."
-  (handler-case
-      (sb-alien:with-alien ((n sb-alien:int 0))
-        (if (zerop (sb-alien:alien-funcall
-                    (sb-alien:extern-alien "ioctl"
-                      (function sb-alien:int sb-alien:int sb-alien:unsigned-long (* sb-alien:int)))
-                    fd +siocoutq+ (sb-alien:addr n)))
-            n 0))
-    (error () 0)))
-
-(defun accept-stream (listen)
-  (let ((sock (sb-bsd-sockets:socket-accept listen)))
-    ;; TCP_NODELAY: an interactive frame is small (a drag is ~1.6 KB), and with
-    ;; Nagle on, TCP holds each one up to ~40 ms waiting on the peer's ACK — which
-    ;; caps interactive updates at ~17-25 fps regardless of how fast we encode.
-    ;; VNC is request/response with tiny payloads, exactly Nagle's worst case, so
-    ;; every real VNC server disables it.
-    (setf (sb-bsd-sockets:sockopt-tcp-nodelay sock) t)
-    (sb-bsd-sockets:socket-make-stream
-     sock :input t :output t :element-type '(unsigned-byte 8) :buffering :full)))
+;;;
+;;; TCP-LISTEN, CLOSE-LISTENER, ACCEPT-STREAM and SOCKET-UNSENT-BYTES moved to
+;;; src/socket.lisp when a wire stopped being only a port: RFB is a stream protocol and
+;;; has no opinion about what carries it, which is what makes a UNIX-domain listener a
+;;; sibling of the TCP one rather than a case inside this file.  Nothing about the TCP
+;;; path changed.
 
 ;;; ---- RFB pixel format + handshake ------------------------------------------
 
@@ -963,13 +912,19 @@ its bytes would land in the middle of a rect."
 
    ADDRESS is the interface to bind, defaulting to 0.0.0.0 exactly as before.
 
-   LISTEN is an ALREADY-LISTENING socket (from TCP-LISTEN) to accept on instead of making
-   one.  It matters for the same reason CLOSE-LISTENER does: a caller that wants to be
-   able to STOP serving needs to hold the socket, and a socket created inside this
-   function is only reachable from the thread parked on it.  With LISTEN, the port is
-   bound and listening by the time the caller starts this function's thread — so \"is it
-   serving yet?\" is answered by the call that returned the socket, not by a sleep.  It is
-   closed on the way out either way."
+   LISTEN is an ALREADY-LISTENING socket or LISTENER (from TCP-LISTEN or OPEN-LISTENER) to
+   accept on instead of making one.  It matters for the same reason CLOSE-LISTENER does: a
+   caller that wants to be able to STOP serving needs to hold the socket, and a socket
+   created inside this function is only reachable from the thread parked on it.  With
+   LISTEN, the port is bound and listening by the time the caller starts this function's
+   thread — so \"is it serving yet?\" is answered by the call that returned the socket, not
+   by a sleep.  It is closed on the way out either way.
+
+   IT IS ALSO HOW RFB REACHES A UNIX SOCKET, and the whole of how: pass a UNIX-LISTENER and
+   this function is unchanged — PORT is then only a label for the log line.  RFB is bytes
+   on a stream (RFC 6143 specifies TCP but nothing in the protocol depends on it), so a
+   viewer connecting over a socket file gets the identical `RFB 003.008' and the identical
+   everything after it."
   (let ((listen (or listen (tcp-listen port :address address)))
         (live 0)
         (live-lock (sb-thread:make-mutex :name "glass-rfb-clients")))
@@ -978,8 +933,8 @@ its bytes would land in the middle of a rect."
     ;; gave us for client keys becomes the session's key injector: an injected key is
     ;; indistinguishable from a typed one, and nothing downstream needs to learn about pasting.
     (when (and on-key install-injector) (setf *key-injector* on-key))
-    (format *error-output* "~&glass: RFB server listening on port ~d (~dx~d)~%"
-            port (fb-width fb) (fb-height fb))
+    (format *error-output* "~&glass: RFB server listening on ~a (~dx~d)~%"
+            (listener-endpoint listen) (fb-width fb) (fb-height fb))
     (force-output *error-output*)
     (flet ((note-clients (delta)
              (let ((n (sb-thread:with-mutex (live-lock) (incf live delta))))

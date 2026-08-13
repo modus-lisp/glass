@@ -134,10 +134,12 @@ caller asking wants — the session's rate and clock — and a seat's mix is on 
   (mix-bus (audio-stream-mix srv)))
 
 (defun %audio-client-name (sock)
-  (or (ignore-errors
-       (multiple-value-bind (addr port) (sb-bsd-sockets:socket-peername sock)
-         (format nil "~{~d~^.~}:~d" (coerce addr 'list) port)))
-      "peer"))
+  "Who connected, for the log and for the sink's name.
+
+On a UNIX socket there IS no peername (it is an unnamed autobind address), and PEER-NAME
+answers with the thing that is both true and more useful than an address ever was — the
+peer's uid and pid, from SO_PEERCRED."
+  (peer-name sock))
 
 (defun %serve-audio-client (srv sock)
   "One connection: subscribe a private sink, announce it, then a frame per period until the peer
@@ -220,7 +222,8 @@ consumer's read pace must not become the rate at which the session is sampled."
         ;; its buffer exists to absorb.  Same judgement as the mixer's clock.
         (setf next (if (< (+ next tick) now) (+ now tick) (+ next tick)))))))
 
-(defun start-audio-stream (&key mixer mix (port *audio-stream-port*) (address "127.0.0.1") (lead 2))
+(defun start-audio-stream (&key mixer mix (port *audio-stream-port*) (address "127.0.0.1")
+                                path (peer-policy *peer-policy*) (lead 2))
   "Serve a mix on PORT: one MIXER-SUBSCRIBE per connection, 20 ms frames, forever.
 
 MIX is the composite to serve — one SEAT's, when a seat has one of its own.  MIXER (or neither)
@@ -232,19 +235,28 @@ mixer's clock and this connection's before a reader ever sees a gap.  It is late
 choosing to spend; 2 frames (40 ms) is enough for two clocks on one box, and a reader that adds
 its own queue on the far side should not need more.
 
+PATH serves the same mix on a UNIX-domain socket instead of a port: the same header, the same
+frames, the same protocol — `nc -U <path>' where it was `nc localhost 5913' — and access control
+the kernel enforces (mode 0600) rather than `you must already be on this box', which is what a
+loopback PORT actually means.  PEER-POLICY is who may connect (see GLASS:*PEER-POLICY*); it is meaningless
+on TCP, where there is nobody to ask about.
+
 Returns an AUDIO-STREAM; STOP-AUDIO-STREAM closes it.  Safe to call with no listeners and safe
 to leave running with none — the mix advances regardless, which is the point of it having its
 own clock."
   (let* ((target (as-mix (or mix mixer (session-mixer))))
-         (srv (%make-audio-stream :mix target :port port :lead lead
-                                  :socket (tcp-listen port :address address :backlog 4)
+         (listener (if path
+                       (open-listener :unix :path path :backlog 4 :peer-policy peer-policy)
+                       (open-listener :tcp :port port :address address :backlog 4)))
+         (srv (%make-audio-stream :mix target :port (if path 0 port) :lead lead
+                                  :socket listener
                                   :running t)))
     (setf (audio-stream-thread srv)
           (sb-thread:make-thread
            (lambda ()
              (loop while (audio-stream-running srv) do
                (handler-case
-                   (let ((sock (sb-bsd-sockets:socket-accept (audio-stream-socket srv))))
+                   (let ((sock (listener-accept (audio-stream-socket srv))))
                      (sb-thread:make-thread (lambda () (%serve-audio-client srv sock))
                                             :name "glass-audio-client"))
                  (serious-condition () (sleep 0.2)))))
@@ -253,7 +265,11 @@ own clock."
 
 (defun stop-audio-stream (srv)
   (setf (audio-stream-running srv) nil)
-  (ignore-errors (sb-bsd-sockets:socket-close (audio-stream-socket srv)))
+  ;; CLOSE-LISTENER, not SOCKET-CLOSE: a thread is parked in accept() on this socket, and a bare
+  ;; close leaves the kernel listening on the port (or the socket file in place).  This has always
+  ;; been the wrong call here; it became visible when the listener became an object that knows what
+  ;; closing means.  See GLASS:CLOSE-LISTENER.
+  (ignore-errors (close-listener (audio-stream-socket srv)))
   ;; A stopped stream is not there to be adopted: leaving it in *SESSION-AUDIO-STREAM* would
   ;; hand the next headset a closed socket to call the session's sound.  (STOP-MIC-STREAM has
   ;; always done the same for its half.)
@@ -262,8 +278,8 @@ own clock."
 
 (defun audio-stream-report (srv)
   (sb-thread:with-mutex ((audio-stream-lock srv))
-    (format nil "audio-stream :~d [~a] served=~d listening=~a clients=(~{~a~^ ~})"
-            (audio-stream-port srv) (mix-name (audio-stream-mix srv))
+    (format nil "audio-stream ~a [~a] served=~d listening=~a clients=(~{~a~^ ~})"
+            (listener-endpoint (audio-stream-socket srv)) (mix-name (audio-stream-mix srv))
             (audio-stream-served srv) (audio-stream-running srv)
             (mapcar (lambda (s) (format nil "~a@~d:~d/-~d/u~d" (sink-name s) (sink-rate s)
                                         (sink-frames s) (sink-drops s) (sink-underruns s)))
@@ -277,7 +293,7 @@ that is already answering: the desktop's startup script starts this one directly
 WebRTC gateway is connected to it), so a headset for the primary seat ADOPTS it rather than
 racing it.  A further seat's stream is its own and is not this.")
 
-(defun start-session-audio (&key (port *audio-stream-port*) (address "127.0.0.1") (lead 2)
+(defun start-session-audio (&key (port *audio-stream-port*) (address "127.0.0.1") path (lead 2)
                                  (file (sb-ext:posix-getenv "GLASS_AUDIO_MP3")) (gain 0.6d0) (loop t))
   "Everything a desktop needs to have a sound: the session mixer, started, serving on PORT.
 
@@ -300,9 +316,10 @@ yet make any noise, and the stream still runs."
                         file secs loop gain))
             (serious-condition (e)
               (format *error-output* "~&@@ audio: ~a not usable (~a) — the mix is silence~%" file e))))
-        (let ((srv (start-audio-stream :mixer m :port port :address address :lead lead)))
+        (let ((srv (start-audio-stream :mixer m :port port :address address :path path :lead lead)))
           (setf *session-audio-stream* srv)
-          (format *error-output* "~&@@ audio stream on ~a:~d — ~a~%" address port (mixer-report m))
+          (format *error-output* "~&@@ audio stream on ~a — ~a~%"
+                  (endpoint-string :host address :port port :path path) (mixer-report m))
           (finish-output *error-output*)
           srv))
     (serious-condition (e)
@@ -384,24 +401,27 @@ this returns forever."
 :source with no adapter."
   (lambda () (tap-next-frame tap)))
 
+(defun %tap-where (tap)
+  "Where this tap is pointed, as one phrase — a path or a host:port."
+  (endpoint-string :host (audio-tap-host tap) :port (audio-tap-port tap)))
+
 (defun %tap-say (tap fmt &rest args)
   (let ((log (audio-tap-log tap)))
     (when log (ignore-errors (funcall log (apply #'format nil fmt args))))))
 
 (defun %tap-session (tap)
   "One connection, from request to end of stream.  Signals on any failure; the caller reconnects."
-  (let ((sock (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp))
+  (let ((sock nil)
         (stream nil))
     (unwind-protect
          (progn
-           (sb-bsd-sockets:socket-connect
-            sock (sb-bsd-sockets:host-ent-address
-                  (sb-bsd-sockets:get-host-by-name (audio-tap-host tap)))
-            (audio-tap-port tap))
-           (ignore-errors (setf (sb-bsd-sockets:sockopt-tcp-nodelay sock) t))
-           (setf stream (sb-bsd-sockets:socket-make-stream sock :input t :output t
-                                                                :element-type '(unsigned-byte 8)
-                                                                :buffering :full))
+           ;; HOST carries the endpoint, both kinds: "127.0.0.1" is a hostname beside a port, and
+           ;; "unix:/…/audio.sock" (or a bare absolute path) is a socket file.  ONE STRING, because
+           ;; a caller's configuration is one string — an env var, a flag, a slot — and a second
+           ;; variable to keep in step with the first is a second thing to get wrong.  No value
+           ;; anybody already has starts with `/' or `unix:', so nothing already written changes.
+           (multiple-value-setq (sock stream)
+             (open-connection :host (audio-tap-host tap) :port (audio-tap-port tap)))
            (%write-ascii stream (format nil "glass-audio/1 rate=~d frame=~d gain=~,3f name=~a~%"
                                         (audio-tap-rate tap) (audio-tap-frame-samples tap)
                                         (audio-tap-gain tap) (audio-tap-name tap)))
@@ -416,7 +436,7 @@ this returns forever."
              (setf (audio-tap-rate tap) rate
                    (audio-tap-frame-samples tap) frame
                    (audio-tap-connected tap) t)
-             (%tap-say tap "connected to ~a:~d — ~a" (audio-tap-host tap) (audio-tap-port tap) hdr)
+             (%tap-say tap "connected to ~a — ~a" (%tap-where tap) hdr)
              (loop while (audio-tap-running tap) do
                (let ((got (read-sequence octets stream)))
                  (when (< got (length octets)) (return))         ; end of stream
@@ -441,8 +461,8 @@ first failure is reported and then nothing until something changes."
         (serious-condition (e)
           (unless complained
             (setf complained t)
-            (%tap-say tap "no audio from ~a:~d (~a) — silence until it answers"
-                      (audio-tap-host tap) (audio-tap-port tap) e))
+            (%tap-say tap "no audio from ~a (~a) — silence until it answers"
+                      (%tap-where tap) e))
           (incf (audio-tap-reconnects tap))))
       (when (audio-tap-running tap) (sleep 1)))))
 
@@ -471,8 +491,8 @@ silence, and the moment the desktop comes up audio starts."
   tap)
 
 (defun tap-report (tap)
-  (format nil "audio-tap ~a:~d ~a@~dHz rx=~d out=~d -~d u~d reconn=~d"
-          (audio-tap-host tap) (audio-tap-port tap)
+  (format nil "audio-tap ~a ~a@~dHz rx=~d out=~d -~d u~d reconn=~d"
+          (%tap-where tap)
           (if (audio-tap-connected tap) "up" "down")
           (audio-tap-rate tap) (audio-tap-received tap) (audio-tap-frames tap)
           (audio-tap-drops tap) (audio-tap-underruns tap) (audio-tap-reconnects tap)))

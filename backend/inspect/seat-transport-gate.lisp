@@ -296,6 +296,71 @@
          "…and `ss' shows it bound to 127.0.0.1 and not to 0.0.0.0")
   (close-seat-transport tr))
 
+;;; ---- and the same seat on a wire that is a FILE -------------------------------
+;;;
+;;; A UNIX-domain transport is a SIBLING of the TCP one — the same RFB, the same seat, the
+;;; same hands — and the whole of the difference is who the kernel lets near it.  A port on
+;;; 127.0.0.1 is reachable by every process of every uid on this box; a socket file at mode
+;;; 0600 is reachable by its owner, decided by the kernel on connect().  So the checks are
+;;; the same ones asked of the port, plus the one a port cannot answer at all: WHO.
+
+(banner "a seat can be carried by a socket file instead — and by both at once")
+
+(defparameter *sock-dir* (format nil "/tmp/glass-seat-sockets-~d/" (sb-posix:getpid)))
+(setf glass:*runtime-dir* *sock-dir*)          ; under /tmp: never a real desktop's runtime dir
+
+(defun unix-listening-p (path)
+  (plusp (length (string-trim '(#\Space #\Newline)
+                              (sh (format nil "ss -lxH 2>/dev/null | grep ~a || true" path))))))
+
+(defun unix-rfb-greeting (path)
+  "The twelve bytes an RFB server opens with, off a SOCKET FILE.  Same client, same read."
+  (handler-case
+      (multiple-value-bind (sock stream) (glass:open-connection :path path :timeout 3)
+        (unwind-protect
+             (let ((b (make-array 12 :element-type '(unsigned-byte 8))))
+               (read-sequence b stream)
+               (map 'string #'code-char b))
+          (ignore-errors (close stream))
+          (ignore-errors (sb-bsd-sockets:socket-close sock))))
+    (error () nil)))
+
+(defparameter *utr* (open-seat-transport *seat* :kind :rfb-unix))
+(check (eq (transport-kind *utr*) :rfb-unix) "the transport says what it is: ~a" (transport-kind *utr*))
+(check (equal (transport-path *utr*) (seat-socket-path *seat*))
+       "…and where: ~a — named after the SEAT, because a socket file's name is ours to choose"
+       (transport-path *utr*))
+(check (eql #o600 (logand (sb-posix:stat-mode (sb-posix:stat (transport-path *utr*))) #o777))
+       "…at mode 0600: owner-only, checked by the kernel on connect(), not by us")
+(check (unix-listening-p (transport-path *utr*)) "`ss -x' shows it listening")
+(check (equal (unix-rfb-greeting (transport-path *utr*)) (format nil "RFB 003.008~%"))
+       "…and a real client on it gets RFB 003.008 — the seat, on a wire nobody else can open")
+
+;; Both at once: same seat, same screen, same pair of hands, two doors.
+(defparameter *ttr* (open-seat-transport *seat* :port-num 5971 :address "127.0.0.1"))
+(check (and (os-listening-p 5971) (unix-listening-p (transport-path *utr*)))
+       "the seat holds BOTH: a port and a socket file, side by side")
+(check (equal (rfb-greeting 5971) (unix-rfb-greeting (transport-path *utr*)))
+       "…and the two wires answer identically — RFB cannot tell what is carrying it")
+(check (= 2 (length (seat-transports *seat*))) "…and the seat knows it has two")
+
+(let ((path (transport-path *utr*)))
+  (check (= 2 (close-seat-transports *seat*)) "CLOSE-SEAT-TRANSPORTS closes both")
+  (check (not (unix-listening-p path)) "…`ss -x' shows nothing")
+  (check (null (probe-file path))
+         "…the socket FILE is unlinked, or the next bind would fail with EADDRINUSE")
+  (check (null (unix-rfb-greeting path)) "…and a connection is refused")
+  (check (not (os-listening-p 5971)) "…and the port is down too"))
+
+(banner "…and the default did not move")
+(check (eq *seat-transport-kind* :rfb)
+       "*SEAT-TRANSPORT-KIND* is :RFB — a TCP port, exactly as before")
+(let ((tr (open-seat-transport *seat* :port-num 5971)))
+  (check (and (eq (transport-kind tr) :rfb) (os-listening-p 5971))
+         "…so a seat asked for a transport with nothing said still gets a port")
+  (close-seat-transport tr))
+(sh (format nil "rm -rf ~a" *sock-dir*))
+
 ;;; ==============================================================================
 (banner "nothing outside /tmp was written")
 ;;; ==============================================================================

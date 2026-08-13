@@ -571,16 +571,12 @@
 ;;; ---- handshake --------------------------------------------------------------
 
 (defun %tcp-connect (host port)
-  (let ((sock (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
-    (handler-case
-        (progn
-          (sb-bsd-sockets:socket-connect
-           sock (sb-bsd-sockets:make-inet-address host) port)
-          (setf (sb-bsd-sockets:sockopt-tcp-nodelay sock) t)
-          (values sock (sb-bsd-sockets:socket-make-stream
-                        sock :input t :output t
-                             :element-type '(unsigned-byte 8) :buffering :full)))
-      (error (e) (ignore-errors (sb-bsd-sockets:socket-close sock)) (error e)))))
+  "Connect to an RFB server.  HOST is an endpoint in either form — a hostname beside PORT, or
+   `unix:/path/to/rfb.sock' (or a bare absolute path) for a socket file.  RFB is a stream
+   protocol; a viewer over a socket file gets the identical bytes in the identical order, which
+   is why the whole of the difference is which socket gets made.  (Its name is now half a lie
+   and kept anyway: every caller in this tree and outside it says %TCP-CONNECT.)"
+  (glass:open-connection :host host :port port))
 
 (defun %handshake (r s)
   "RFB 3.8 up to ServerInit, then our SetPixelFormat and SetEncodings.  Security

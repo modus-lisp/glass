@@ -20,6 +20,16 @@
    #:fb-text #:text-width #:load-font #:default-font
    ;; server: (serve fb port &key on-key on-pointer on-resize name once wake)
    #:serve #:serve-one #:*desktop-name* #:tcp-listen #:close-listener #:make-wake #:wake-signal
+   ;; transports (src/socket.lisp) — a port anybody on the box can reach, or a socket file
+   ;; only its owner can open.  Siblings: everything above them is a stream protocol.
+   #:listener #:tcp-listener #:unix-listener #:open-listener #:unix-listen
+   #:listener-kind #:listener-endpoint #:listener-open-p #:listener-socket #:listener-path
+   #:listener-port #:listener-address #:listener-mode #:listener-peer-policy #:listener-refused
+   #:listener-accept #:accept-stream
+   #:runtime-dir #:socket-path #:*runtime-dir* #:*socket-file-mode* #:*socket-dir-mode*
+   #:clear-stale-socket #:unix-socket-live-p
+   #:peer-credentials #:peer-allowed-p #:peer-name #:socket-fd #:*peer-policy*
+   #:open-connection #:parse-endpoint #:endpoint-string #:socket-unsent-bytes
    ;; VNC authentication (from-scratch DES); *vnc-password* nil = open, string = required
    #:*vnc-password* #:*legacy-vnc-auth* #:vnc-auth-response #:vnc-auth-verify
    ;; clipboard (the :glass/clipboard system) — one session selection, many transports

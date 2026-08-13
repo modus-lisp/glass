@@ -2009,7 +2009,8 @@
 
 (defun run-wm (specs &key (port 5900) (width 1000) (height 720) menu
                           background (background-mode :cover)
-                          (address *seat-bind-address*))
+                          (address *seat-bind-address*)
+                          (kind *seat-transport-kind*) path)
   "Run a mini OPEN LOOK desktop over VNC.  Each spec is a decorated window:
    (FRAME-CLASS &key WIDTH HEIGHT) for a McCLIM app, or (:terminal &key COLS ROWS
    PPEM) for a shell terminal.  Right-click the workspace for a root menu; pass
@@ -2025,16 +2026,23 @@
 
    ADDRESS is the interface the home seat's listener binds, defaulting to
    *SEAT-BIND-ADDRESS* — 0.0.0.0, every interface, exactly as before.  Passing
-   \"127.0.0.1\" is the one-line opt-in to a desktop reachable only from this box."
+   \"127.0.0.1\" is the one-line opt-in to a desktop reachable only from this box.
+
+   KIND :RFB-UNIX (or a PATH) is the next line of that same opt-in and the end of it: the
+   home seat is then on a socket file only its owner can open, instead of a port every
+   process on the box can reach.  ADDRESS stops meaning anything, and so does the port —
+   which is the point.  The default is unchanged and deliberately so; see
+   *SEAT-TRANSPORT-KIND*."
   (let ((p (make-wm-session :port port :width width :height height :menu menu
                             :background background :background-mode background-mode)))
-    (open-seat-transport (port-seat p) :port-num port :address address)
+    (open-seat-transport (port-seat p) :port-num port :address address :kind kind :path path)
     (start-wm-session p specs)
     (run-wm-loop p)))
 
 (defun add-wm-seat (port &key port-num (width 1000) (height 720) name background
                               (background-mode :cover) (audio t) (serve t)
-                              (address *seat-bind-address*))
+                              (address *seat-bind-address*)
+                              (kind *seat-transport-kind*) path)
   "Attach a SECOND (third, …) person to a running desktop: a screen of their own at
    WIDTH x HEIGHT serving on PORT-NUM, with their own pointer, keyboard, focus, menu,
    clipboard, sound and arrangement of the SAME windows.
@@ -2066,7 +2074,8 @@
             (ignore-errors (wm-render-background seat background :mode background-mode))))
     ;; the transport first: it is what fills SEAT-INJECTOR, which is the keyboard this
     ;; seat's dictation types on
-    (when serve (open-seat-transport seat :port-num port-num :address address))
+    (when serve (open-seat-transport seat :port-num port-num :address address
+                                          :kind kind :path path))
     (when audio (start-seat-audio port :seat seat))
     (composite-seat seat)
     seat))

@@ -318,6 +318,7 @@ session's; a seat's ear asks it of the seat's, which is what makes my microphone
   (and srv (sb-thread:with-mutex ((mic-stream-lock srv)) (mic-stream-current srv))))
 
 (defun start-mic-stream (&key (port *mic-stream-port*) (address "127.0.0.1")
+                              path (peer-policy *peer-policy*)
                               (rate *mic-rate*) frame-samples (depth 16) (prime 4)
                               (install t))
   "Accept a peer's microphone on PORT and convert it to RATE for whoever asks.
@@ -333,20 +334,30 @@ late; a recognizer would very much rather be 80 ms late than have a hole punched
 a word, and the audio on this side of the wire has already crossed a real network with a phone at
 the far end of it.  DEPTH is the bound on that trade going wrong: past it, the oldest goes.
 
+PATH receives the same microphone on a UNIX-domain socket instead of a port: the same header, the
+same frames, and a door the kernel keeps (mode 0600) instead of one every process on the box can
+walk through.  PEER-POLICY is who may connect (GLASS:*PEER-POLICY*) — a question only a UNIX
+socket can answer, because only there is there a peer to ask about.  IT MATTERS MOST HERE: this
+port is a MICROPHONE, and anything that can connect to it becomes what the desktop is listening
+to.  Under TCP the qualification for that was `run something on this machine'.
+
 Returns a MIC-STREAM and installs it as the session's; SESSION-MIC is then the microphone of
 whoever is connected, or NIL.  Safe to run with nobody connected forever — that is the normal
 state of the port, and it costs one thread asleep in accept."
   (let* ((frame (or frame-samples (max 1 (round (* rate 0.02d0)))))
-         (srv (%make-mic-stream :port port :rate rate :frame-samples frame
+         (listener (if path
+                       (open-listener :unix :path path :backlog 2 :peer-policy peer-policy)
+                       (open-listener :tcp :port port :address address :backlog 2)))
+         (srv (%make-mic-stream :port (if path 0 port) :rate rate :frame-samples frame
                                 :depth depth :prime prime
-                                :socket (tcp-listen port :address address :backlog 2)
+                                :socket listener
                                 :running t)))
     (setf (mic-stream-thread srv)
           (sb-thread:make-thread
            (lambda ()
              (loop while (mic-stream-running srv) do
                (handler-case
-                   (let ((sock (sb-bsd-sockets:socket-accept (mic-stream-socket srv))))
+                   (let ((sock (listener-accept (mic-stream-socket srv))))
                      (sb-thread:make-thread (lambda () (%serve-mic-client srv sock))
                                             :name "glass-mic-client"))
                  (serious-condition () (sleep 0.2)))))
@@ -359,26 +370,30 @@ state of the port, and it costs one thread asleep in accept."
     (setf (mic-stream-running srv) nil)
     (%retire-mic (mic-stream-current srv) "stopping")
     (sb-thread:with-mutex ((mic-stream-lock srv)) (setf (mic-stream-current srv) nil))
-    (ignore-errors (sb-bsd-sockets:socket-close (mic-stream-socket srv)))
+    ;; CLOSE-LISTENER, not SOCKET-CLOSE: a thread is parked in accept() on it, and a bare close
+    ;; leaves the kernel accepting on a port this process no longer has a descriptor for.  See
+    ;; GLASS:CLOSE-LISTENER — and for a UNIX listener it is also what unlinks the socket file.
+    (ignore-errors (close-listener (mic-stream-socket srv)))
     (when (eq srv *session-mic-stream*) (setf *session-mic-stream* nil)))
   t)
 
 (defun mic-stream-report (&optional (srv *session-mic-stream*))
   (if (null srv)
       "mic-stream: not running"
-      (format nil "mic-stream :~d served=~d rate=~d frame=~d — ~a"
-              (mic-stream-port srv) (mic-stream-served srv)
+      (format nil "mic-stream ~a served=~d rate=~d frame=~d — ~a"
+              (listener-endpoint (mic-stream-socket srv)) (mic-stream-served srv)
               (mic-stream-rate srv) (mic-stream-frame-samples srv)
               (mic-report (mic-stream-current srv)))))
 
-(defun start-session-mic (&key (port *mic-stream-port*) (address "127.0.0.1") (rate *mic-rate*))
+(defun start-session-mic (&key (port *mic-stream-port*) (address "127.0.0.1") path
+                               (rate *mic-rate*))
   "The one line a desktop startup script wants for the inbound half, and deliberately total for
 the same reason START-SESSION-AUDIO is: a desktop with no microphone port is a working desktop,
 and a desktop that did not start is not.  Returns the MIC-STREAM, or NIL (already reported)."
   (handler-case
-      (let ((srv (start-mic-stream :port port :address address :rate rate)))
-        (format *error-output* "~&@@ mic stream on ~a:~d — a peer's microphone, converted to ~d Hz~%"
-                address port rate)
+      (let ((srv (start-mic-stream :port port :address address :path path :rate rate)))
+        (format *error-output* "~&@@ mic stream on ~a — a peer's microphone, converted to ~d Hz~%"
+                (endpoint-string :host address :port port :path path) rate)
         (finish-output *error-output*)
         srv)
     (serious-condition (e)
@@ -469,32 +484,32 @@ frame late, which for a recognizer with a level gate in front of it is a click a
                (incf (mic-sender-head sender)))
       (nreverse out))))
 
+(defun %sender-where (sender)
+  "Where this sender is pointed, as one phrase — a path or a host:port."
+  (endpoint-string :host (mic-sender-host sender) :port (mic-sender-port sender)))
+
 (defun %mic-sender-say (sender fmt &rest args)
   (let ((log (mic-sender-log sender)))
     (when log (ignore-errors (funcall log (apply #'format nil fmt args))))))
 
 (defun %mic-sender-session (sender)
   "One connection, from header to end of stream.  Signals on any failure; the caller reconnects."
-  (let ((sock (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp))
+  (let ((sock nil)
         (stream nil))
     (unwind-protect
          (progn
-           (sb-bsd-sockets:socket-connect
-            sock (sb-bsd-sockets:host-ent-address
-                  (sb-bsd-sockets:get-host-by-name (mic-sender-host sender)))
-            (mic-sender-port sender))
-           (ignore-errors (setf (sb-bsd-sockets:sockopt-tcp-nodelay sock) t))
-           (setf stream (sb-bsd-sockets:socket-make-stream sock :input t :output t
-                                                                :element-type '(unsigned-byte 8)
-                                                                :buffering :full))
+           ;; HOST carries the endpoint, both kinds — "127.0.0.1" beside a port, or
+           ;; "unix:/…/mic.sock" (or a bare absolute path) for a socket file.  Same one string as
+           ;; the tap's, for the same reason: the gateway configures this from one env var.
+           (multiple-value-setq (sock stream)
+             (open-connection :host (mic-sender-host sender) :port (mic-sender-port sender)))
            (%write-ascii stream (format nil "glass-mic/1 rate=~d frame=~d name=~a~%"
                                         (mic-sender-rate sender) (mic-sender-frame-samples sender)
                                         (mic-sender-name sender)))
            (force-output stream)
            (let ((hdr (or (%read-ascii-line stream) (error "no header"))))
              (setf (mic-sender-connected sender) t)
-             (%mic-sender-say sender "microphone -> ~a:~d — ~a"
-                              (mic-sender-host sender) (mic-sender-port sender) hdr))
+             (%mic-sender-say sender "microphone -> ~a — ~a" (%sender-where sender) hdr))
            (let* ((fd (sb-bsd-sockets:socket-file-descriptor sock))
                   (bytes (* 2 (mic-sender-frame-samples sender)))
                   (octets (make-array bytes :element-type '(unsigned-byte 8)))
@@ -535,8 +550,8 @@ screenful a minute."
         (serious-condition (e)
           (unless complained
             (setf complained t)
-            (%mic-sender-say sender "no ear at ~a:~d (~a) — the microphone goes nowhere"
-                             (mic-sender-host sender) (mic-sender-port sender) e))
+            (%mic-sender-say sender "no ear at ~a (~a) — the microphone goes nowhere"
+                             (%sender-where sender) e))
           (incf (mic-sender-reconnects sender))))
       ;; whatever queued up while there was nowhere to send it is stale by now
       (when (mic-sender-running sender)
@@ -568,8 +583,8 @@ the desktop comes up the microphone starts arriving."
 (defun mic-sender-report (sender)
   (if (null sender)
       "mic-sender: none"
-      (format nil "mic-sender ~a:~d ~a ~a@~dHz in=~d sent=~d -~d reconn=~d"
-              (mic-sender-host sender) (mic-sender-port sender)
+      (format nil "mic-sender ~a ~a ~a@~dHz in=~d sent=~d -~d reconn=~d"
+              (%sender-where sender)
               (if (mic-sender-connected sender) "up" "down")
               (mic-sender-name sender) (mic-sender-rate sender)
               (mic-sender-offered sender) (mic-sender-sent sender)

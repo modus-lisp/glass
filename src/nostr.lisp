@@ -746,7 +746,13 @@ a number typed into a startup script, the same way *AUDIO-PORT-OFFSET* is.")
 (defun seat-admission-port (rfb-port) (+ rfb-port *admission-port-offset*))
 
 (defparameter *admission-host* "127.0.0.1"
-  "Where a client looks for the service.  A gateway's GLASS_HOST names the same box.")
+  "Where a client looks for the service.  A gateway's GLASS_HOST names the same box.
+
+Both endpoint forms are understood, here and everywhere else a host is configured: a hostname
+beside a port, or `unix:/path/to/glass-admit.sock' (or a bare absolute path) for a socket file.
+The second is worth wanting HERE more than anywhere: this service answers WHO MAY OPEN THIS
+DESKTOP, and on a loopback port the qualification to ask it — including to ask it as somebody
+else — is a process on this machine.")
 
 (defparameter *admission-timeout* 2.0d0
   "Seconds a client waits for an answer before calling the service unreachable.  Short, because this
@@ -896,7 +902,8 @@ same question of the same function instead of reimplementing the answer."
       (ignore-errors (when stream (close stream)))
       (ignore-errors (sb-bsd-sockets:socket-close sock)))))
 
-(defun start-admission-service (&key (port *admission-port*) (address "127.0.0.1") (install t))
+(defun start-admission-service (&key (port *admission-port*) (address "127.0.0.1") path
+                                    (peer-policy *peer-policy*) (install t))
   "Answer admission questions on PORT, forever.  Returns an ADMISSION-SERVICE, or NIL.
 
 REFUSES WITHOUT AN IDENTITY, and that refusal is load-bearing: a service answering with no box
@@ -909,15 +916,18 @@ in one line: the caller cannot connect."
     (finish-output *error-output*)
     (return-from start-admission-service nil))
   (load-enrolments)
-  (let ((srv (%make-admission-service
-              :port port :running t
-              :socket (tcp-listen port :address address :backlog 8))))
+  (let* ((listener (if path
+                       (open-listener :unix :path path :backlog 8 :peer-policy peer-policy)
+                       (open-listener :tcp :port port :address address :backlog 8)))
+         (srv (%make-admission-service
+               :port (if path 0 port) :running t
+               :socket listener)))
     (setf (admission-service-thread srv)
           (sb-thread:make-thread
            (lambda ()
              (loop while (admission-service-running srv) do
                (handler-case
-                   (let ((sock (sb-bsd-sockets:socket-accept (admission-service-socket srv))))
+                   (let ((sock (listener-accept (admission-service-socket srv))))
                      (sb-thread:make-thread (lambda () (%serve-admission-client srv sock))
                                             :name "glass-admission-client"))
                  (serious-condition () (sleep 0.2)))))
@@ -928,15 +938,18 @@ in one line: the caller cannot connect."
 (defun stop-admission-service (&optional (srv *session-admission-service*))
   (when srv
     (setf (admission-service-running srv) nil)
-    (ignore-errors (sb-bsd-sockets:socket-close (admission-service-socket srv)))
+    ;; CLOSE-LISTENER, not SOCKET-CLOSE: the accept loop is parked on this socket and a bare close
+    ;; leaves the kernel listening.  See GLASS:CLOSE-LISTENER — an admission service that believes
+    ;; it has stopped answering while it is still answering is the worst version of that bug.
+    (ignore-errors (close-listener (admission-service-socket srv)))
     (when (eq srv *session-admission-service*) (setf *session-admission-service* nil)))
   t)
 
 (defun admission-service-report (&optional (srv *session-admission-service*))
   (if (null srv)
       "admission: not running"
-      (format nil "admission :~d served=~d admitted=~d denied=~d devices=~d allow=~d"
-              (admission-service-port srv) (admission-service-served srv)
+      (format nil "admission ~a served=~d admitted=~d denied=~d devices=~d allow=~d"
+              (listener-endpoint (admission-service-socket srv)) (admission-service-served srv)
               (admission-service-admitted srv) (admission-service-denied srv)
               (enrolment-count) (length *nostr-allow*))))
 
@@ -951,24 +964,23 @@ in one line: the caller cannot connect."
 ;;; service could not be reached — that is what a caller's failure policy turns on, and conflating
 ;;; it with a denial is exactly how a fail-closed door becomes a fail-open one.
 
-(defun admission-request (verb &rest params &key host port &allow-other-keys)
+(defun admission-request (verb &rest params &key host port path &allow-other-keys)
   "Ask the admission service one question.  Returns (values STATUS PLIST BODY), where STATUS is
-:OK / :DENY / :ERR / :UNREACHABLE.  Never signals."
+:OK / :DENY / :ERR / :UNREACHABLE.  Never signals.
+
+PATH, or a HOST in either UNIX form, asks over a socket file instead of a port.  The protocol is
+identical — it is a request line and an answer line, and it never knew what carried it."
   (let ((host (or host *admission-host*))
         (port (or port *admission-port*))
         (sock nil) (stream nil))
     (setf params (copy-list params))
-    (remf params :host) (remf params :port)
+    (remf params :host) (remf params :port) (remf params :path)
     (handler-case
         (unwind-protect
              (progn
-               (setf sock (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp))
-               (sb-bsd-sockets:socket-connect
-                sock (sb-bsd-sockets:host-ent-address (sb-bsd-sockets:get-host-by-name host)) port)
-               (ignore-errors (setf (sb-bsd-sockets:sockopt-tcp-nodelay sock) t))
-               (setf stream (sb-bsd-sockets:socket-make-stream
-                             sock :input t :output t :element-type '(unsigned-byte 8)
-                             :buffering :full :timeout *admission-timeout*))
+               (multiple-value-setq (sock stream)
+                 (open-connection :host host :port port :path path
+                                  :timeout *admission-timeout*))
                (%net-write-line stream (apply #'%net-line verb params))
                (force-output stream)
                (let ((line (or (%net-read-line stream) (error "no answer"))))
@@ -1202,7 +1214,7 @@ still a desktop, and a desktop that did not start is not."
 
 ;;; ---- the one line a desktop startup script wants ------------------------------
 
-(defun start-session-nostr (&key (port *admission-port*) (address "127.0.0.1")
+(defun start-session-nostr (&key (port *admission-port*) (address "127.0.0.1") path
                                  (relays *nostr-relays*) (bot t))
   "Everything this desktop needs to own its own identity: the allowlist read, the enrolment store
 loaded, the admission service on PORT, and the DM command bot on RELAYS.
@@ -1219,10 +1231,11 @@ with no identity rather than serving as nobody.  Returns (values SERVICE BOT)."
                      @@   every issued login link and every enrolled device stops verifying.~%")
           (finish-output *error-output*)
           (return-from start-session-nostr (values nil nil)))
-        (let ((srv (start-admission-service :port port :address address))
+        (let ((srv (start-admission-service :port port :address address :path path))
               (b (and bot (start-nostr-bot :relays relays))))
-          (format *error-output* "~&@@ admission on ~a:~d — box ~a, ~a enrolled, ~a allowed~%"
-                  address port (or (box-npub) (box-pubkey)) (enrolment-count)
+          (format *error-output* "~&@@ admission on ~a — box ~a, ~a enrolled, ~a allowed~%"
+                  (endpoint-string :host address :port port :path path)
+                  (or (box-npub) (box-pubkey)) (enrolment-count)
                   (length *nostr-allow*))
           (when b (format *error-output* "@@ nostr dm bot on ~{~a~^, ~}~%" (nostr-bot-relays b)))
           (finish-output *error-output*)

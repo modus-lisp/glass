@@ -17,4 +17,5 @@
            #:open-seat-transport #:close-seat-transport #:close-seat-transports
            #:seat-serving-p #:seat-transports #:transport-open-p
            #:transport-kind #:transport-address #:transport-port-num
-           #:*seat-bind-address*))
+           #:transport-path #:transport-endpoint #:seat-socket-path
+           #:*seat-bind-address* #:*seat-transport-kind*))

@@ -315,6 +315,15 @@
 ;;; See docs/seats-and-transports.md for the argument, and backend/seat.lisp's
 ;;; SEAT-TRANSPORT for the state.
 
+(defparameter *seat-transport-kind* :rfb
+  "The kind of wire OPEN-SEAT-TRANSPORT opens when nobody says which.
+
+   :RFB — a TCP port, which is what glass has always opened and what everything already
+   pointed at a desktop expects.  IT IS STILL THE DEFAULT, and changing it is a deployment
+   decision: a launcher that says :RFB-UNIX gets a socket file only its owner can open, and
+   anything connecting over TCP stops finding it.  That is the whole of the migration and
+   it is one word in one launcher, deliberately left to whoever knows what is connected.")
+
 (defparameter *seat-bind-address* "0.0.0.0"
   "The interface a seat's RFB listener binds when nobody says otherwise.
 
@@ -324,9 +333,19 @@
    or per call via OPEN-SEAT-TRANSPORT's :ADDRESS) closes the exposure the note calls out,
    and it is the operator's call because they are the ones who know what is connected.")
 
-(defun open-seat-transport (seat &key (kind :rfb)
+(defun seat-socket-path (seat)
+  "Where SEAT's UNIX-domain RFB socket lives when nobody names a path.
+
+   Under the seat's NAME rather than its port, because a socket file is not a port and the
+   whole reason to have one is that the name is ours to choose: `seat-home.rfb' says which
+   seat, which is what somebody looking at the directory wants to know, and it survives the
+   seat being re-exposed on a different port."
+  (glass:socket-path (format nil "~a.rfb" (or (seat-name seat) "seat"))))
+
+(defun open-seat-transport (seat &key (kind *seat-transport-kind*)
                                       (port-num (seat-port-num seat))
-                                      (address *seat-bind-address*))
+                                      (address *seat-bind-address*)
+                                      path)
   "Expose SEAT on a wire: an RFB listener on PORT-NUM at ADDRESS, with SEAT's own screen
    framebuffer, its own wake, its own selection and input callbacks closed over SEAT —
    which is the whole of what a seat is on the wire.  Returns the SEAT-TRANSPORT.
@@ -343,12 +362,29 @@
    the socket is an object somebody holds rather than a local of a parked accept.
 
    PORT-NUM defaults to SEAT-PORT-NUM and, when given, becomes it — the seat's port is the
-   port it serves on, and the audio ports beside it (START-SEAT-AUDIO) are derived from it."
-  (check-type port-num (integer 1 65535))
-  (assert (eq kind :rfb) (kind) "Only :RFB transports exist so far; asked for ~s." kind)
+   port it serves on, and the audio ports beside it (START-SEAT-AUDIO) are derived from it.
+
+   KIND :RFB-UNIX opens the same RFB listener on a UNIX-DOMAIN SOCKET instead — at PATH, or
+   at SEAT-SOCKET-PATH.  A SIBLING of :RFB and not a mode of it: RFB is a stream protocol,
+   so everything below this line is identical and the only difference is who the kernel lets
+   near the wire.  A port on 127.0.0.1 is reachable by every process of every uid on the
+   box; a socket file at mode 0600 is reachable by its owner, checked on connect(), and the
+   server can additionally ask WHO connected (GLASS:PEER-CREDENTIALS) — which is real peer
+   authentication with no key material anywhere, and the thing a TCP loopback cannot have.
+   A seat may hold both at once: same screen, same hands, two doors.
+
+   PASSING :PATH implies :RFB-UNIX, because a path is not something a TCP transport could
+   have meant."
+  (when path (setf kind :rfb-unix))
+  (ecase kind
+    (:rfb (check-type port-num (integer 1 65535)))
+    (:rfb-unix (setf path (or path (seat-socket-path seat)))))
   (or (find-if (lambda (tr) (and (transport-open-p tr)
-                                 (eql (transport-port-num tr) port-num)
-                                 (equal (transport-address tr) address)))
+                                 (eq (transport-kind tr) kind)
+                                 (if (eq kind :rfb-unix)
+                                     (equal (transport-path tr) path)
+                                     (and (eql (transport-port-num tr) port-num)
+                                          (equal (transport-address tr) address)))))
                (seat-transports seat))
       (let* ((fb (seat-fb seat)) (port (seat-port seat))
              ;; The seat's OWN keyboard (made by ADD-SEAT), not a new one per listener:
@@ -359,11 +395,14 @@
              (on-key (or (seat-injector seat)
                          (setf (seat-injector seat)
                                (lambda (down k) (glass-on-key port down k seat)))))
-             (socket (glass:tcp-listen port-num :address address))
+             (socket (if (eq kind :rfb-unix)
+                         (glass:open-listener :unix :path path)
+                         (glass:open-listener :tcp :port port-num :address address)))
              (tr (make-instance 'seat-transport :seat seat :kind kind
                                                 :address address :port-num port-num
+                                                :path (and (eq kind :rfb-unix) path)
                                                 :socket socket)))
-        (setf (seat-port-num seat) port-num)
+        (when (eq kind :rfb) (setf (seat-port-num seat) port-num))
         (setf (transport-thread tr)
               (sb-thread:make-thread
                (lambda ()
@@ -399,8 +438,8 @@
                                             (format nil "glass-mcclim (~a)" (seat-name seat))))
                    (error (e)
                      (unless (transport-closing-p tr)
-                       (format *error-output* "~&glass: seat ~a transport ~a:~d ended: ~a~%"
-                               (seat-name seat) address port-num e)
+                       (format *error-output* "~&glass: seat ~a transport ~a ended: ~a~%"
+                               (seat-name seat) (transport-endpoint tr) e)
                        (force-output *error-output*))))
                  (setf (transport-socket tr) nil))
                :name (format nil "glass-server-~a" (seat-name seat))))

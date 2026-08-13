@@ -98,10 +98,16 @@
 
 (defclass seat-transport ()
   ((seat     :initarg :seat     :initform nil   :reader transport-seat)
+   ;; :RFB is a port anybody on this box can reach; :RFB-UNIX is a socket file only its owner
+   ;; can open.  SIBLINGS, deliberately: the same protocol, carried differently, and a seat may
+   ;; hold one of each.  KIND was already the discriminator, so a UNIX wire is another value of
+   ;; it rather than a flag beside it — which also keeps SEAT-TRANSPORTS readable, because what
+   ;; a reader wants to know about a wire is what it is.
    (kind     :initarg :kind     :initform :rfb  :reader transport-kind)
    (address  :initarg :address  :initform "0.0.0.0" :reader transport-address)
    (port-num :initarg :port-num :initform nil   :reader transport-port-num)
-   (socket   :initarg :socket   :initform nil   :accessor transport-socket)  ; the LISTENING socket
+   (path     :initarg :path     :initform nil   :reader transport-path)      ; :RFB-UNIX only
+   (socket   :initarg :socket   :initform nil   :accessor transport-socket)  ; the LISTENER
    (thread   :initform nil :accessor transport-thread)                       ; its accept loop
    ;; Set before the socket is torn down, so the accept loop's resulting error is
    ;; recognised as the thing we asked for rather than reported as a failure.
@@ -114,9 +120,14 @@
 
 (defmethod print-object ((tr seat-transport) stream)
   (print-unreadable-object (tr stream :type t)
-    (format stream "~a ~a:~a~:[~; closed~]"
-            (slot-value tr 'kind) (slot-value tr 'address) (slot-value tr 'port-num)
+    (format stream "~a ~a~:[~; closed~]"
+            (slot-value tr 'kind) (transport-endpoint tr)
             (null (slot-value tr 'socket)))))
+
+(defun transport-endpoint (transport)
+  "Where TRANSPORT is, in one phrase: a socket path, or an address and port."
+  (or (slot-value transport 'path)
+      (format nil "~a:~a" (slot-value transport 'address) (slot-value transport 'port-num))))
 
 (defun transport-open-p (transport)
   "Is TRANSPORT still listening?"

@@ -44,13 +44,17 @@ give modus a remote display, developed and tested on SBCL first."
   :version "0.0.1"
   :author "ynniv"
   :license "MIT"
-  :depends-on ("glass/fb" "glass/clipboard" "sb-bsd-sockets" "cram")
+  :depends-on ("glass/fb" "glass/clipboard" "sb-bsd-sockets" "sb-posix" "cram")
   :serial t
   :components
   ((:module "src"
     :serial t
     :components
     ((:file "perf")
+     ;; socket before rfb: a wire is a TCP port OR a socket file only its owner can open,
+     ;; and RFB is a stream protocol that cannot tell which it got.  sb-posix is here for
+     ;; chmod/stat/unlink on the socket file — the access control IS the file mode.
+     (:file "socket")
      (:file "rfb")
      (:file "zrle")))))
 

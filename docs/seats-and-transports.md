@@ -170,3 +170,64 @@ The bind address is now a parameter (`CLIM-GLASS:*SEAT-BIND-ADDRESS*`, and `:add
 and `open-seat-transport`) whose default is unchanged: `0.0.0.0`, every interface, exactly what
 glass has always bound. Closing the hole the note opens with is one word — `:address "127.0.0.1"`
 in a launcher — and it is deliberately left to whoever knows what is pointed at the box.
+
+## What met the code again: a wire that is a *file*
+
+A second round, against the same note, and it moved one of its conclusions.
+
+**5. `:address "127.0.0.1"` is not the one word that closes the hole.** The note ends by saying
+the exposure it opens with — `:5903` on every interface, no authentication — is closed by binding
+loopback, and calls that the operator's decision. Binding loopback is real and it was the right
+first move, but it is not access control: **`127.0.0.1` is reachable by every process of every uid
+on the box.** A shared build account, a compromised service, a container in the same network
+namespace — all of them can connect to the screen, the mix, the microphone, admission, and to
+`:4013`, which is an unauthenticated `EVAL`. The note's table says "no listener unless a seat opens
+one"; what it could not yet say is *and when a seat does open one, who may reach it.*
+
+A **UNIX-domain transport** is that missing column, and it is a sibling of the TCP one rather than
+a replacement — `CLIM-GLASS:OPEN-SEAT-TRANSPORT` `:KIND :RFB-UNIX`, `GLASS:OPEN-LISTENER`,
+`GLASS:*PEER-POLICY*`, one `LISTENER` class with two subclasses, and every protocol above it (RFB,
+the mix, the microphone, admission, the control socket) untouched because all of them are a stream
+and none of them ever asked what carried it. A seat may hold one of each at the same time.
+
+**6. The note deferred authentication, and the kernel was already offering it.** "Deliberately not
+doing: seat-signed requests… do not add a signing step to a loopback call that has no attacker
+today." That reasoning still holds for signatures. But it framed authentication as something that
+must be *built* — a key, a signature, a verification step — and on a UNIX socket it is something
+you can simply **ask for**: `SO_PEERCRED` hands the server the connecting process's uid, gid and
+pid, filled in by the kernel at `connect()` and unforgeable by the peer. `GLASS:PEER-CREDENTIALS`
+reads it (a raw `getsockopt` through `sb-alien`; `sb-bsd-sockets` exposes `SO_PASSCRED` and not
+this). It is not seat identity and it does not replace it — it says *which process*, not *which
+person* — but it is a real principal, it needs no crypto anywhere near core glass, and it turns the
+anonymous `peer` in a log line into `uid=1001 pid=2658990`. The signature still goes where the note
+says it goes; there is now something underneath it.
+
+**7. The trap in point 2 was documented and not finished.** `CLOSE-LISTENER` exists because
+`SOCKET-CLOSE` alone leaves the kernel listening — and `STOP-AUDIO-STREAM`, `STOP-MIC-STREAM` and
+`STOP-ADMISSION-SERVICE` were all still calling bare `SOCKET-CLOSE` on a socket with a thread
+parked in `accept()` on it. Three copies of the bug the note had already caught once, in files
+nobody re-read after catching it. They call `CLOSE-LISTENER` now. Writing the fix down is not the
+same as applying it, and a note that records a trap should be read as a search pattern.
+
+**And the UNIX version of that same trap:** the socket *file* outlives the socket. `bind()` refuses
+a path that exists — `EADDRINUSE`, whether or not anything is behind it, and there is no
+`SO_REUSEADDR` for this — so a server killed with `-9` leaves a file that makes the *next* start
+fail. Closing unlinks it (only if the inode is still the one we created, or a listener closing late
+would delete its successor's file), and opening probes first: `connect()` returning `ECONNREFUSED`
+means stale, and stale gets removed. The exit hook is a courtesy; the probe at `bind` is the
+mechanism, because a `SIGKILL` is exactly the case an exit hook cannot cover.
+
+**Where the files live, and why:** `$GLASS_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/glass/` **if we
+own it**, else `~/.glass/run/`. The ownership check is not defensive habit — on this box
+`XDG_RUNTIME_DIR` is `/run/user/0`, root's, inherited from whatever started the session, while
+`/run/user/1001` does not exist. Directory mode `0700`, socket mode `0600`, and the `chmod` happens
+**between `bind()` and `listen()`**: a bound socket that is not yet listening refuses every connect,
+so the window in which the mode is whatever the umask made it is a window with nothing to connect
+to. `/tmp` was refused: world-writable parent, and a tmp-cleaner that removes an idle socket file
+takes the listener with it.
+
+**Nothing about the default moved.** `*SEAT-TRANSPORT-KIND*` is `:RFB`, a TCP port; the audio, mic
+and admission services still take `:PORT`; `TCP-LISTEN` still returns a raw socket because callers
+outside this tree hold what it returns. Switching a live desktop over is a deployment decision and
+it is one word in one launcher — which is the same shape, and the same refusal to make it for
+somebody else, as the bind address before it.
