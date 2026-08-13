@@ -15,8 +15,11 @@
 ;;;; such consequence — nothing inside the window can tell — so they are per-seat.
 ;;;;
 ;;;; WHAT IS PER-SEAT (this class):
-;;;;   the screen framebuffer + its size, the wallpaper rendered at that size, the RFB
-;;;;   listener serving it and the wake that nudges its senders; pointer position,
+;;;;   the screen framebuffer + its size, the wallpaper rendered at that size, the
+;;;;   TRANSPORTS carrying it (an RFB listener today; none, by default, until the seat
+;;;;   opens one) and the wake that nudges their senders; an IDENTITY of its own — an
+;;;;   npub naming THIS PLACE, so a way in can be asked for by seat rather than by wire;
+;;;;   pointer position,
 ;;;;   button mask and modifier state; keyboard focus (the focused surface) and the
 ;;;;   McCLIM pointer grab; the drag in progress and its wireframe; the open menu
 ;;;;   chain; the composite's pending damage and its CopyRect hint; the VIEWS —
@@ -76,6 +79,108 @@
   (:documentation "WINDOW's own place in the stacking order (a ticket from the port's ZCLOCK)."))
 (defgeneric (setf window-own-z) (value window))
 
+;;; ---- a wire that reaches this seat ------------------------------------------
+;;;
+;;; A SEAT is what you connect to; a TRANSPORT is what carries it.  They were one thing
+;;; and one slot — the seat's PORT-NUM and the thread serving it — which is why a session
+;;; could not decline to serve: RUN-WM ran the session AND opened the listener, in that
+;;; order, in one call.  docs/seats-and-transports.md is the argument; this class is the
+;;; two lines of state that make "a seat with no transport" a thing you can hold.
+;;;
+;;; A seat may have several (a VNC listener and, later, a WebRTC channel), none, or one it
+;;; opens and closes again while the session runs.  What every transport of one seat
+;;; shares is that seat's SELECTION, its KEYBOARD and its SCREEN; what it does not share
+;;; with another SEAT's transport is any of them.
+;;;
+;;; The socket is held HERE rather than left inside the serving thread, because closing is
+;;; the whole point and a socket only the parked accept can name cannot be closed — see
+;;; GLASS:CLOSE-LISTENER, which also says why SOCKET-CLOSE alone leaves the port listening.
+
+(defclass seat-transport ()
+  ((seat     :initarg :seat     :initform nil   :reader transport-seat)
+   (kind     :initarg :kind     :initform :rfb  :reader transport-kind)
+   (address  :initarg :address  :initform "0.0.0.0" :reader transport-address)
+   (port-num :initarg :port-num :initform nil   :reader transport-port-num)
+   (socket   :initarg :socket   :initform nil   :accessor transport-socket)  ; the LISTENING socket
+   (thread   :initform nil :accessor transport-thread)                       ; its accept loop
+   ;; Set before the socket is torn down, so the accept loop's resulting error is
+   ;; recognised as the thing we asked for rather than reported as a failure.
+   (closing  :initform nil :accessor transport-closing-p))
+  (:documentation
+   "One wire onto one seat: an RFB listener today, and the shape the others will take.
+    A class for the reason everything long-lived here is one — a desktop runs for weeks
+    and grows slots while it runs, and redefining a structure strands the instances
+    already made."))
+
+(defmethod print-object ((tr seat-transport) stream)
+  (print-unreadable-object (tr stream :type t)
+    (format stream "~a ~a:~a~:[~; closed~]"
+            (slot-value tr 'kind) (slot-value tr 'address) (slot-value tr 'port-num)
+            (null (slot-value tr 'socket)))))
+
+(defun transport-open-p (transport)
+  "Is TRANSPORT still listening?"
+  (and transport (transport-socket transport) t))
+
+;;; ---- this seat's identity ----------------------------------------------------
+;;;
+;;; A seat gets an npub of its own: `DM this npub and get a link' is a way in to A SEAT,
+;;; not to a wire, so a seat reachable over VNC today and something else tomorrow is the
+;;; same seat and a rotated transport key changes nothing about the destination.
+;;;
+;;; CORE GLASS CARRIES NO CRYPTO, and that is a property this file must not quietly
+;;; spend.  cl-nostr and ironclad are dependencies of :glass/nostr ALONE; a desktop built
+;;; without it must start, run and serve exactly as it does now.  So what lives here is an
+;;; OPAQUE slot and the question `what is this seat's identity' — minting it, persisting
+;;; it and interpreting it are :glass/nostr's, reached by name (GLASS:SEAT-IDENTITY-FOR),
+;;; the same way START-SEAT-AUDIO reaches GLASS:MAKE-HEADSET.  Nothing here knows what an
+;;; npub is, and nothing here can be made to sign anything.
+;;;
+;;; SEAT IDENTITY IS NOT PERSON IDENTITY.  The seat's key says WHICH PLACE THIS IS: it
+;;; belongs to the session's configuration and persists across whoever is sitting there.
+;;; The person's key — GLASS:*NOSTR-ALLOW* and the device enrolments in src/nostr.lisp —
+;;; says WHO MAY SIT IN IT.  Both are npubs and they answer different questions; collapse
+;;; them and `the owner sat down at the guest seat' stops being sayable, which is a thing
+;;; people do.  They are kept in different stores for that reason and not by accident.
+
+(defvar *seat-identity* t
+  "Do new seats get an identity of their own?  T (the default) means ADD-SEAT asks for one,
+   which does nothing at all unless :glass/nostr is loaded.  NIL suppresses it — for a
+   test that must not touch a key store, and for a session that wants its seats anonymous.")
+
+(defun seat-identity-provider ()
+  "GLASS:SEAT-IDENTITY-FOR if this image has :glass/nostr, else NIL."
+  (let ((s (find-symbol "SEAT-IDENTITY-FOR" '#:glass))) (and s (fboundp s) s)))
+
+(defun ensure-seat-identity (seat)
+  "Give SEAT an identity if it has none and this image can mint one.  Returns it, or NIL.
+
+   NIL is an ordinary answer and not a failure: a desktop without :glass/nostr has seats
+   with no identity, which is the same desktop it has always been."
+  (or (seat-identity seat)
+      (when *seat-identity*
+        (let ((for (seat-identity-provider)))
+          (when for
+            ;; Never fatal.  A key store that cannot be read is a seat without a name, not
+            ;; a desktop that fails to start — the identity is for addressing a seat, and
+            ;; nothing about drawing on one depends on having it.
+            (setf (seat-identity seat) (ignore-errors (funcall for (seat-name seat)))))))))
+
+(defun seat-npub (seat)
+  "SEAT's public name, or NIL if it has no identity (or this image cannot read one)."
+  (let ((id (and seat (seat-identity seat)))
+        (npub (let ((s (find-symbol "SEAT-IDENTITY-NPUB" '#:glass))) (and s (fboundp s) s))))
+    (and id npub (ignore-errors (funcall npub id)))))
+
+;;; WHERE A SIGNATURE WOULD GO.  A seat that signed its requests would be a seat the
+;;; session could VERIFY, which is what would let a seat live in another process without
+;;; the trust boundary being "whoever can reach the port".  It is deliberately not built:
+;;; identity is given now because retrofitting it is a migration, and verification is
+;;; added later because it is a feature — and there is no attacker today on a loopback
+;;; call between two objects in one image.  The signature would be taken over the request
+;;; a remote seat makes (open a transport, move a window, take the CLIM token) with
+;;; SEAT-IDENTITY as the signing key, and checked here against the seat named in it.
+
 ;;; ---- one seat's divergent view of one window --------------------------------
 
 (defclass seat-view ()
@@ -99,9 +204,20 @@
   ((name     :initarg :name     :initform "seat"  :accessor seat-name)
    (port     :initarg :port     :initform nil     :accessor seat-port)   ; the session
    (primary  :initarg :primary  :initform nil     :accessor seat-primary-p)
-   ;; --- the transport this seat is watched through ---
-   (port-num :initarg :port-num :initform 5900    :accessor seat-port-num) ; RFB listener
-   (server   :initform nil :accessor seat-server)                          ; its thread
+   ;; --- who this seat IS ---
+   ;; OPAQUE to everything in this file and in core glass: an object minted and understood
+   ;; by :glass/nostr, or NIL on a desktop that never loaded it.  See the section above for
+   ;; why it is opaque, and for why it is not the same question as who may sit here.
+   (identity :initarg :identity :initform nil     :accessor seat-identity)
+   ;; --- the wires this seat is watched through ---
+   ;; TRANSPORTS is the list of them, and it is empty until somebody opens one: SERVING IS
+   ;; A SEAT'S DECISION.  PORT-NUM is the port this seat serves on WHEN IT SERVES — a
+   ;; setting, not a listener, and it has always been one; nothing listens because it is
+   ;; set.  SERVER is kept because GLASS-PORT-SERVER delegates to it and callers outside
+   ;; this tree read it; it holds the RFB transport's thread.
+   (port-num   :initarg :port-num :initform 5900  :accessor seat-port-num)
+   (transports :initform '() :accessor seat-transports)
+   (server     :initform nil :accessor seat-server)                        ; the RFB one's thread
    (wake     :initform (glass:make-wake) :accessor seat-wake)              ; nudges ITS senders
    ;; --- the screen ---
    (fb       :initarg :fb       :initform nil     :accessor seat-fb)
@@ -190,10 +306,11 @@
 
 (defmethod print-object ((seat seat) stream)
   (print-unreadable-object (seat stream :type t :identity t)
-    (format stream "~s :~d ~dx~d~:[~; primary~]"
+    (format stream "~s :~d ~dx~d~:[~; primary~]~:[ (no transport)~;~]"
             (slot-value seat 'name) (slot-value seat 'port-num)
             (slot-value seat 'screen-w) (slot-value seat 'screen-h)
-            (slot-value seat 'primary))))
+            (slot-value seat 'primary)
+            (slot-value seat 'transports))))
 
 ;;; ---- this seat's view of a window -------------------------------------------
 

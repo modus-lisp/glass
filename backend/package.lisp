@@ -7,6 +7,14 @@
   (:export #:glass-port
            #:find-glass-port
            #:run-frame
-           #:run-wm
+           #:run-wm                      ; a session, AND its home seat exposed on a wire
+           #:run-session                 ; …just the session: nothing listens
+           #:make-wm-session #:start-wm-session #:run-wm-loop   ; the three RUN-WM is made of
            #:register-app                ; register an external app in the root menu
-           #:add-surface))               ; launch any external glass-surface app as a window
+           #:add-surface                 ; launch any external glass-surface app as a window
+           ;; a seat is what you connect to; a transport is what carries it
+           #:add-wm-seat #:port-seat #:seat-name #:seat-identity #:seat-npub
+           #:open-seat-transport #:close-seat-transport #:close-seat-transports
+           #:seat-serving-p #:seat-transports #:transport-open-p
+           #:transport-kind #:transport-address #:transport-port-num
+           #:*seat-bind-address*))

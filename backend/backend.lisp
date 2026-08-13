@@ -115,7 +115,14 @@
    (the session clipboard, the session mix, the key injector, the desktop name), it is
    PORT-SEAT's default, and its window moves write the session's own arrangement.  That
    is a fixed role and NOT the same as driving McCLIM, which is a token that changes
-   hands — see clim-token.lisp."
+   hands — see clim-token.lisp.
+
+   The seat also gets an IDENTITY of its own if this image can mint one (:glass/nostr),
+   keyed by its NAME so the same seat is the same npub across a restart.  Without that
+   system the identity is NIL and the desktop is exactly the desktop it was.
+
+   PORT-NUM is the port this seat serves on WHEN IT SERVES.  Nothing listens because a
+   seat exists: OPEN-SEAT-TRANSPORT is what exposes one, and it is a separate call."
   (let* ((first-p (null (glass-port-seats port)))
          (primary (or primary first-p))
          (seat (make-instance 'seat :name (or name (format nil "seat-~d" port-num))
@@ -132,6 +139,15 @@
                                                    (glass:session-clipboard)
                                                    (glass:make-clipboard)))))
     (setf (glass-port-seats port) (append (glass-port-seats port) (list seat)))
+    ;; Who this seat IS — asked for once, when the place is made.  A no-op without
+    ;; :glass/nostr, and never fatal: see ENSURE-SEAT-IDENTITY.
+    (ensure-seat-identity seat)
+    ;; THIS SEAT'S KEYBOARD, made with the seat and not with its listener.  It was made by
+    ;; START-SEAT-SERVER, which was fine while a seat and a listener arrived together and
+    ;; is not now: a seat that serves nothing still has hands (dictation types on this, and
+    ;; so does a paste), and a seat that opens two transports must not grow two keyboards.
+    ;; The listener still installs it as GLASS:*KEY-INJECTOR* — see OPEN-SEAT-TRANSPORT.
+    (setf (seat-injector seat) (lambda (down k) (glass-on-key port down k seat)))
     (when primary
       (setf (glass-port-default-seat port) seat)
       ;; The first seat starts out DRIVING McCLIM — not because it is the home seat, but
@@ -288,47 +304,160 @@
   (let ((a (climi::pattern-array image)))
     (values (array-dimension a 1) (array-dimension a 0))))
 
-(defun start-seat-server (seat)
-  "Start the RFB listener for SEAT: its own port number, its own screen framebuffer,
-   its own wake, and input callbacks closed over SEAT — which is the whole of what a
-   seat is on the wire.  Idempotent.
+;;; ---- exposing a seat on a wire ----------------------------------------------
+;;;
+;;; SERVING IS A SEAT'S DECISION, NOT THE SESSION'S.  Running a session and opening a
+;;; socket a stranger can reach used to be one call (RUN-WM), which is why there was no
+;;; way to have a session that serves nothing, and why :5903 listens on 0.0.0.0 — not by
+;;; decision, but because the session WAS the listener.  These two functions are the
+;;; decision, and RUN-WM is now a session plus one call to the first of them.
+;;;
+;;; See docs/seats-and-transports.md for the argument, and backend/seat.lisp's
+;;; SEAT-TRANSPORT for the state.
 
-   Nothing here is shared with another seat's listener, so a second seat is a second
-   call: same session, second screen, second pair of hands."
-  (unless (seat-server seat)
-    (let* ((fb (seat-fb seat)) (port (seat-port seat))
-           ;; Made once and KEPT: this is the seat's keyboard, and dictation for this seat
-           ;; types on it (see SEAT-INJECTOR).  Only the primary seat's also becomes the
-           ;; session's GLASS:*KEY-INJECTOR*, or the newest listener would own the typing
-           ;; that nobody addressed to a seat.
-           (on-key (lambda (down k) (glass-on-key port down k seat))))
-      (setf (seat-injector seat) on-key)
-      (setf (seat-server seat)
-            (sb-thread:make-thread
-             (lambda ()
-               (glass:serve fb (seat-port-num seat)
-                            :on-key     on-key
-                            :install-injector (seat-primary-p seat)
-                            :on-pointer (lambda (b x y) (glass-on-pointer port b x y seat))
-                            :on-resize  (lambda (w h) (glass-on-resize port w h seat))
-                            :wake       (seat-wake seat)
-                            ;; Nobody is watching this screen any more: this seat has no
-                            ;; hands, so it must not go on holding the McCLIM token that
-                            ;; the people still here are waiting for.
-                            :on-clients (lambda (n)
-                                          (when (zerop n) (clim-token-seat-gone port seat)))
-                            ;; every transport of THIS seat shares THIS selection
-                            :clipboard  (seat-clipboard seat)
-                            ;; The RFB desktop name is what a viewer puts in its title
-                            ;; bar.  The primary seat keeps the name it has always
-                            ;; advertised — a one-seat desktop must look identical from
-                            ;; the outside, and a nested desktop shows this string in the
-                            ;; hosting window's title — and only a further seat says
-                            ;; which one it is, where the question can actually arise.
-                            :name (if (seat-primary-p seat)
-                                      "glass-mcclim"
-                                      (format nil "glass-mcclim (~a)" (seat-name seat)))))
-             :name (format nil "glass-server-~a" (seat-name seat)))))))
+(defparameter *seat-bind-address* "0.0.0.0"
+  "The interface a seat's RFB listener binds when nobody says otherwise.
+
+   0.0.0.0 — every interface — because that is what glass has always bound and changing
+   it here would silently cut off whatever is already pointed at a desktop on this box.
+   It is a PARAMETER so the choice is one place and one line: binding \"127.0.0.1\" (here,
+   or per call via OPEN-SEAT-TRANSPORT's :ADDRESS) closes the exposure the note calls out,
+   and it is the operator's call because they are the ones who know what is connected.")
+
+(defun open-seat-transport (seat &key (kind :rfb)
+                                      (port-num (seat-port-num seat))
+                                      (address *seat-bind-address*))
+  "Expose SEAT on a wire: an RFB listener on PORT-NUM at ADDRESS, with SEAT's own screen
+   framebuffer, its own wake, its own selection and input callbacks closed over SEAT —
+   which is the whole of what a seat is on the wire.  Returns the SEAT-TRANSPORT.
+
+   Nothing here is shared with another seat's transport, so a second seat is a second
+   call: same session, second screen, second pair of hands.
+
+   IDEMPOTENT PER (ADDRESS, PORT): asking twice for the same wire returns the one that is
+   already open rather than fighting itself for the port.  A seat may hold several.
+
+   THE SOCKET IS BOUND BEFORE THIS RETURNS, in the caller's thread, and handed to the
+   accept loop.  Two things follow, both wanted: a port already in use signals HERE
+   instead of in a thread nobody is looking at, and the transport can be CLOSED, because
+   the socket is an object somebody holds rather than a local of a parked accept.
+
+   PORT-NUM defaults to SEAT-PORT-NUM and, when given, becomes it — the seat's port is the
+   port it serves on, and the audio ports beside it (START-SEAT-AUDIO) are derived from it."
+  (check-type port-num (integer 1 65535))
+  (assert (eq kind :rfb) (kind) "Only :RFB transports exist so far; asked for ~s." kind)
+  (or (find-if (lambda (tr) (and (transport-open-p tr)
+                                 (eql (transport-port-num tr) port-num)
+                                 (equal (transport-address tr) address)))
+               (seat-transports seat))
+      (let* ((fb (seat-fb seat)) (port (seat-port seat))
+             ;; The seat's OWN keyboard (made by ADD-SEAT), not a new one per listener:
+             ;; dictation for this seat types on it, and two transports of one seat are two
+             ;; ways to reach the same pair of hands.  Only the primary seat's also becomes
+             ;; the session's GLASS:*KEY-INJECTOR*, or the newest listener would own the
+             ;; typing that nobody addressed to a seat.
+             (on-key (or (seat-injector seat)
+                         (setf (seat-injector seat)
+                               (lambda (down k) (glass-on-key port down k seat)))))
+             (socket (glass:tcp-listen port-num :address address))
+             (tr (make-instance 'seat-transport :seat seat :kind kind
+                                                :address address :port-num port-num
+                                                :socket socket)))
+        (setf (seat-port-num seat) port-num)
+        (setf (transport-thread tr)
+              (sb-thread:make-thread
+               (lambda ()
+                 ;; A CLOSE tears the listening socket out from under this accept loop on
+                 ;; purpose, and the error that comes of it is the answer, not a fault.
+                 ;; Anything else is reported and ends this transport rather than the
+                 ;; process: an unhandled error in a thread takes a --disable-debugger
+                 ;; image down with it, and one seat's wire must not be able to do that.
+                 (handler-case
+                     (glass:serve fb port-num
+                                  :listen     socket
+                                  :address    address
+                                  :on-key     on-key
+                                  :install-injector (seat-primary-p seat)
+                                  :on-pointer (lambda (b x y) (glass-on-pointer port b x y seat))
+                                  :on-resize  (lambda (w h) (glass-on-resize port w h seat))
+                                  :wake       (seat-wake seat)
+                                  ;; Nobody is watching this screen any more: this seat has
+                                  ;; no hands, so it must not go on holding the McCLIM token
+                                  ;; that the people still here are waiting for.
+                                  :on-clients (lambda (n)
+                                                (when (zerop n) (clim-token-seat-gone port seat)))
+                                  ;; every transport of THIS seat shares THIS selection
+                                  :clipboard  (seat-clipboard seat)
+                                  ;; The RFB desktop name is what a viewer puts in its title
+                                  ;; bar.  The primary seat keeps the name it has always
+                                  ;; advertised — a one-seat desktop must look identical from
+                                  ;; the outside, and a nested desktop shows this string in
+                                  ;; the hosting window's title — and only a further seat says
+                                  ;; which one it is, where the question can actually arise.
+                                  :name (if (seat-primary-p seat)
+                                            "glass-mcclim"
+                                            (format nil "glass-mcclim (~a)" (seat-name seat))))
+                   (error (e)
+                     (unless (transport-closing-p tr)
+                       (format *error-output* "~&glass: seat ~a transport ~a:~d ended: ~a~%"
+                               (seat-name seat) address port-num e)
+                       (force-output *error-output*))))
+                 (setf (transport-socket tr) nil))
+               :name (format nil "glass-server-~a" (seat-name seat))))
+        (push tr (seat-transports seat))
+        ;; GLASS-PORT-SERVER has always meant "the thread serving this screen", and it
+        ;; goes on meaning it.
+        (setf (seat-server seat) (transport-thread tr))
+        tr)))
+
+(defun close-seat-transport (transport)
+  "Stop TRANSPORT: the port stops listening and its accept loop ends.  T if it was open.
+
+   The clients already connected are NOT hunted down — their sockets are their own and
+   they end when they end.  What this closes is the way IN, which is the thing a seat is
+   deciding about."
+  (when (and transport (transport-open-p transport))
+    (let ((seat (transport-seat transport))
+          (sock (transport-socket transport))
+          (thread (transport-thread transport)))
+      (setf (transport-closing-p transport) t)
+      ;; Both, in this order, and for the reason CLOSE-LISTENER spells out: a bare
+      ;; SOCKET-CLOSE leaves the port listening while a thread is parked on it.
+      (glass:close-listener sock)
+      (setf (transport-socket transport) nil)
+      (when (and thread (not (eq thread sb-thread:*current-thread*)))
+        ;; It has one syscall to notice.  If it somehow does not, it is a thread parked on
+        ;; a dead descriptor and it must not be left there — a later listener could be
+        ;; handed the same fd number.
+        (unless (ignore-errors (sb-thread:join-thread thread :timeout 2 :default :timeout))
+          (ignore-errors (sb-thread:terminate-thread thread))))
+      (when seat
+        (setf (seat-transports seat) (remove transport (seat-transports seat)))
+        (when (eq (seat-server seat) thread)
+          (setf (seat-server seat)
+                (let ((next (find-if #'transport-open-p (seat-transports seat))))
+                  (and next (transport-thread next))))))
+      t)))
+
+(defun close-seat-transports (seat)
+  "Close every transport of SEAT — it is watched by nobody and reachable from nowhere.
+   Returns how many were closed.  The seat itself, its screen and its arrangement stay:
+   a seat with no wire is still a place at the session, which is the whole point."
+  (let ((n 0))
+    (dolist (tr (copy-list (seat-transports seat)) n)
+      (when (close-seat-transport tr) (incf n)))))
+
+(defun seat-serving-p (seat)
+  "Is SEAT reachable — does it hold any open transport?"
+  (and seat (some #'transport-open-p (seat-transports seat)) t))
+
+(defun start-seat-server (seat)
+  "Start the RFB listener for SEAT on SEAT-PORT-NUM.  Idempotent.
+
+   The name RUN-WM and every launcher and gate already says, kept meaning what it meant:
+   OPEN-SEAT-TRANSPORT with everything defaulted.  New code inside the WM should say the
+   longer name, because the shorter one cannot express `on this address' or `close it'."
+  (unless (seat-serving-p seat) (open-seat-transport seat)))
 
 (defun start-glass-server (port &optional seat)
   "Start the RFB server thread for PORT's default seat (or SEAT).  Idempotent."

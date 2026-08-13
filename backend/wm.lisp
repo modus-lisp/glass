@@ -1941,8 +1941,75 @@
                (ignore-errors
                 (composite-seat seat (unless (eq pend :full) pend)))))))))))
 
+;;; ---- running a session, and exposing a seat: two things ----------------------
+;;;
+;;; They were one call.  RUN-WM's own docstring said "Run a mini OPEN LOOK desktop OVER
+;;; VNC", and it meant it literally: it built the session and opened a listener, so there
+;;; was no way to have a session that serves nothing and no posture available other than
+;;; "the session is the wire".  docs/seats-and-transports.md is the argument.
+;;;
+;;; The split is underneath, in three pieces that each do one thing, and RUN-WM is still
+;;; the convenience it always was — a session, plus its home seat exposed — spelled out in
+;;; the same order it always ran in, because the order is observable: the listener comes
+;;; up BEFORE the initial windows are spawned, and those take the better part of a second
+;;; each, so a client that connects during startup finds a desktop filling in rather than
+;;; a refused connection.
+
+(defun make-wm-session (&key (port 5900) (width 1000) (height 720) menu
+                             background (background-mode :cover))
+  "Build a window-manager session and return its GLASS-PORT: WM mode on, a screen of
+   WIDTH x HEIGHT for the home seat, a root menu, and a wallpaper if asked for.
+
+   NO LISTENER IS OPENED and no window is spawned.  PORT names the port instance and
+   becomes the home seat's SEAT-PORT-NUM — the port it will serve on IF a transport is
+   opened on it, which is a separate decision (OPEN-SEAT-TRANSPORT)."
+  (let ((p (find-glass-port :port port)))
+    (setf (glass-port-wm-p p) t
+          (glass-port-screen-w p) width (glass-port-screen-h p) height
+          (glass-port-fb p) (glass:make-framebuffer width height +wm-teal+)
+          (glass-port-menu-items p) (or menu (wm-default-menu)))
+    (when background (wm-set-background p background :mode background-mode))
+    p))
+
+(defun start-wm-session (p specs)
+  "Start P's CLIM event loop and open SPECS as windows.  Returns P."
+  (climi::restart-port p)                                   ; event-loop thread
+  (dolist (spec specs p)
+    (wm-spawn-spec p spec)
+    (sleep 0.7)                                             ; stagger for distinct cascade slots
+    (composite-all p)))
+
+(defun run-wm-loop (p)
+  "P's compositing loop.  Blocks forever — this is the desktop running."
+  ;; Surface windows (terminals) render asynchronously in their own threads.
+  ;; DAMAGE TRACKING: only recomposite when a surface actually changed (its
+  ;; dirty-p reports so and clears) — an idle desktop does ZERO compositing, so
+  ;; no wasted full-screen redraws.  A NIL dirty-p means "always redraw" (safe
+  ;; default); a static surface (image) reports NIL forever.  WM operations
+  ;; (move/resize/menu/...) recomposite directly, so they're not gated here.
+  (loop (sleep 1/60) (wm-tick p)))
+
+(defun run-session (specs &key (port 5900) (width 1000) (height 720) menu
+                               background (background-mode :cover))
+  "Run a mini OPEN LOOK desktop that SERVES NOTHING.  Same session RUN-WM runs — the same
+   windows, the same compositing, the same seat — with no socket open onto it and no way
+   in until a seat decides on one.  Blocks.
+
+   That is the default the design note argues for and this is where it is spelled: a
+   session is what runs, a seat is what you connect to, and a transport is what carries
+   it.  To let somebody in, hold the port (RUN-SESSION blocks, so from another thread or
+   over a control socket) and call (OPEN-SEAT-TRANSPORT (PORT-SEAT P)).
+
+   PORT names the port instance and the home seat's would-be listening port; it opens
+   nothing.  Everything else is RUN-WM's."
+  (let ((p (make-wm-session :port port :width width :height height :menu menu
+                            :background background :background-mode background-mode)))
+    (start-wm-session p specs)
+    (run-wm-loop p)))
+
 (defun run-wm (specs &key (port 5900) (width 1000) (height 720) menu
-                          background (background-mode :cover))
+                          background (background-mode :cover)
+                          (address *seat-bind-address*))
   "Run a mini OPEN LOOK desktop over VNC.  Each spec is a decorated window:
    (FRAME-CLASS &key WIDTH HEIGHT) for a McCLIM app, or (:terminal &key COLS ROWS
    PPEM) for a shell terminal.  Right-click the workspace for a root menu; pass
@@ -1950,29 +2017,24 @@
    SPECS), or (LABEL . THUNK) for an arbitrary action — to override its items.
    BACKGROUND is a desktop-wallpaper image path (any format pigment decodes, incl.
    SVG), placed per BACKGROUND-MODE (:cover/:fit/:stretch/:center/:tile).  Serves
-   on PORT."
-  (let ((p (find-glass-port :port port)))
-    (setf (glass-port-wm-p p) t
-          (glass-port-screen-w p) width (glass-port-screen-h p) height
-          (glass-port-fb p) (glass:make-framebuffer width height +wm-teal+)
-          (glass-port-menu-items p) (or menu (wm-default-menu)))
-    (when background (wm-set-background p background :mode background-mode))
-    (start-glass-server p)
-    (climi::restart-port p)                                   ; event-loop thread
-    (dolist (spec specs)
-      (wm-spawn-spec p spec)
-      (sleep 0.7)                                             ; stagger for distinct cascade slots
-      (composite-all p))
-    ;; Surface windows (terminals) render asynchronously in their own threads.
-    ;; DAMAGE TRACKING: only recomposite when a surface actually changed (its
-    ;; dirty-p reports so and clears) — an idle desktop does ZERO compositing, so
-    ;; no wasted full-screen redraws.  A NIL dirty-p means "always redraw" (safe
-    ;; default); a static surface (image) reports NIL forever.  WM operations
-    ;; (move/resize/menu/...) recomposite directly, so they're not gated here.
-    (loop (sleep 1/60) (wm-tick p))))
+   on PORT.
+
+   RUN A SESSION, AND EXPOSE ITS HOME SEAT — the two things it has always done, now
+   said in two calls (RUN-SESSION is the first of them on its own).  Nothing about it
+   changed: same order, same port, same interface.
+
+   ADDRESS is the interface the home seat's listener binds, defaulting to
+   *SEAT-BIND-ADDRESS* — 0.0.0.0, every interface, exactly as before.  Passing
+   \"127.0.0.1\" is the one-line opt-in to a desktop reachable only from this box."
+  (let ((p (make-wm-session :port port :width width :height height :menu menu
+                            :background background :background-mode background-mode)))
+    (open-seat-transport (port-seat p) :port-num port :address address)
+    (start-wm-session p specs)
+    (run-wm-loop p)))
 
 (defun add-wm-seat (port &key port-num (width 1000) (height 720) name background
-                              (background-mode :cover) (audio t))
+                              (background-mode :cover) (audio t) (serve t)
+                              (address *seat-bind-address*))
   "Attach a SECOND (third, …) person to a running desktop: a screen of their own at
    WIDTH x HEIGHT serving on PORT-NUM, with their own pointer, keyboard, focus, menu,
    clipboard, sound and arrangement of the SAME windows.
@@ -1988,6 +2050,12 @@
    their own microphone, on the ports beside it (5923 -> 5933 out, 5934 in) — so seat
    ports want a decade of room between them, and a seat with no sound is one :audio nil.
 
+   SERVE t (the default) also opens the RFB listener, on ADDRESS — the same convenience
+   RUN-WM is, and for the same reason: a second person asked for by port number wants the
+   port.  :SERVE NIL makes the seat and leaves it unreachable, which is what a seat whose
+   wire is something other than a VNC listener wants (OPEN-SEAT-TRANSPORT later, or a
+   transport this file does not know about).
+
    Returns the seat."
   (check-type port-num (integer 1 65535))
   (let ((seat (add-seat port :name (or name (format nil "seat-~d" port-num))
@@ -1996,9 +2064,9 @@
     (when background
       (setf (seat-bg seat)
             (ignore-errors (wm-render-background seat background :mode background-mode))))
-    ;; the server first: it is what fills SEAT-INJECTOR, which is the keyboard this
+    ;; the transport first: it is what fills SEAT-INJECTOR, which is the keyboard this
     ;; seat's dictation types on
-    (start-seat-server seat)
+    (when serve (open-seat-transport seat :port-num port-num :address address))
     (when audio (start-seat-audio port :seat seat))
     (composite-seat seat)
     seat))
