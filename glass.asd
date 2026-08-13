@@ -202,6 +202,24 @@ demonstration right up until it is typing, and then it is a loop."
   :serial t
   :components ((:module "src" :serial t :components ((:file "dictation")))))
 
+(asdf:defsystem :glass/nostr
+  :description "The desktop's own identity, and the terminals it trusts: the box's Nostr key, the
+enrolment store, login-token mint/verify, the `link'/`devices'/`revoke'/`help' command surface over
+NIP-59 gift-wrapped DMs, and an admission service on a socket beside the screen (5903 -> 5915) for
+the transports that carry people to it.  Same argument as :glass/audio-stream one port down — WHO
+MAY OPEN THIS DESKTOP is a property of the desktop, not of whichever wire somebody arrived on, and
+an authorization store inside one transport is one only that transport can answer from, which the
+next transport then copies.  Carries both ends: START-SESSION-NOSTR to serve, and ADMISSION-ADMIT /
+ADMISSION-DEVICES / ADMISSION-ALLOWED-P / ADMISSION-REVOKE for the process that asks.  OPTIONAL, so
+core glass carries no crypto and no relay client: cl-nostr is a dependency of this system alone, and
+a desktop without it starts exactly as before and simply admits nobody of its own accord."
+  :version "0.0.1"
+  :author "ynniv"
+  :license "MIT"
+  :depends-on ("glass" "cl-nostr" "ironclad")
+  :serial t
+  :components ((:module "src" :serial t :components ((:file "nostr")))))
+
 (asdf:defsystem :glass/term
   :description "A terminal emulator on glass: a real PTY + shell, an ANSI/VT
 parser, and a character grid rendered with scribe, served over VNC.  No xterm,

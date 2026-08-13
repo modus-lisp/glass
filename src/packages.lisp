@@ -90,6 +90,26 @@
    #:*dictation-last* #:*session-dictation*
    #:dictation #:dict-name #:dict-ear #:dict-injector #:dict-on #:dict-typed #:dict-muted
    #:dict-last
+   ;; the box's identity and the terminals it trusts (the :glass/nostr system; cl-nostr-backed) —
+   ;; the enrolment store, login tokens, the DM command surface, and the admission service a
+   ;; transport asks instead of keeping a second copy of the answer
+   #:*box-secret* #:box-identity-p #:box-pubkey #:box-npub #:unix-now
+   #:*login-ttl* #:mint-login-token #:verify-login-token #:login-token-status
+   #:*nostr-allow* #:normalize-pubkey #:refresh-nostr-allow #:allowed-pubkey-p
+   #:*enrolment-file* #:*enrolment-ttl* #:*enrolments* #:load-enrolments #:save-enrolments
+   #:sync-enrolments #:enrol-device #:device-enrolled-p #:list-enrolments #:enrolment-count
+   #:revoke-enrolments #:describe-enrolments #:describe-revoke
+   #:admit-peer #:parse-nostr-command #:nostr-command-reply #:*login-url-base*
+   #:*admission-port* #:*admission-port-offset* #:seat-admission-port #:*admission-host*
+   #:*admission-timeout* #:admission-serve #:start-admission-service #:stop-admission-service
+   #:admission-service #:admission-service-p #:admission-service-port #:admission-service-report
+   #:admission-service-running #:*session-admission-service*
+   #:admission-request #:admission-ping #:admission-admit #:admission-allowed-p
+   #:admission-devices #:admission-revoke #:admission-mint
+   #:*nostr-relays* #:*nostr-command-max-age* #:start-nostr-bot #:stop-nostr-bot
+   #:nostr-bot #:nostr-bot-p #:nostr-bot-report #:nostr-bot-pubkey #:nostr-bot-npub
+   #:nostr-bot-received #:nostr-bot-answered #:nostr-bot-denied #:nostr-bot-ignored
+   #:*session-nostr-bot* #:start-session-nostr
    ;; standing perf counters (read a snapshot over the control socket)
    #:*perf-on* #:perf-reset #:perf-report #:perf-record-send #:perf-record-composite
    #:*send-lag* #:*send-queue*))
