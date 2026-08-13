@@ -36,12 +36,37 @@
 ;;; ---- transport --------------------------------------------------------------
 
 (defun tcp-listen (port &key (backlog 8) (address "0.0.0.0"))
-  "A listening TCP socket bound to PORT."
+  "A listening TCP socket bound to PORT.
+
+   ADDRESS defaults to 0.0.0.0 — every interface — which is what it has always been and
+   what every caller in this tree gets unless it says otherwise.  It is a PARAMETER and
+   not a constant so that a caller who wants \"127.0.0.1\" can say so in one place; see
+   CLIM-GLASS:OPEN-SEAT-TRANSPORT, which passes it through for exactly that reason."
   (let ((sock (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
     (setf (sb-bsd-sockets:sockopt-reuse-address sock) t)
     (sb-bsd-sockets:socket-bind sock (sb-bsd-sockets:make-inet-address address) port)
     (sb-bsd-sockets:socket-listen sock backlog)
     sock))
+
+(defun close-listener (sock)
+  "Stop a listening socket made by TCP-LISTEN, and MEAN IT.  T if there was one.
+
+   SOCKET-CLOSE ON ITS OWN DOES NOT STOP LISTENING.  A thread parked in SOCKET-ACCEPT
+   still holds the open file description, so close() drops this process's descriptor and
+   the kernel goes on accepting: the port stays bound, `ss -ltn' goes on showing it, and a
+   client can still connect.  That is not a subtlety anybody should have to rediscover —
+   it is the difference between a seat that has closed its transport and one that only
+   thinks it has.
+
+   SHUTDOWN is what the parked accept notices (it returns EINVAL on Linux and the accept
+   loop unwinds), so it comes first and the close comes after.  Errors from either are
+   ignored on purpose: a socket already shut down, or already closed, is the state being
+   asked for, and a listener that refuses to be closed twice is a worse object than one
+   that does nothing the second time."
+  (when sock
+    (ignore-errors (sb-bsd-sockets:socket-shutdown sock :direction :io))
+    (ignore-errors (sb-bsd-sockets:socket-close sock))
+    t))
 
 (defconstant +siocoutq+ #x5411 "Linux SIOCOUTQ: bytes in a socket's send queue not yet sent to the peer.")
 (defun socket-unsent-bytes (fd)
@@ -909,7 +934,8 @@ its bytes would land in the middle of a rect."
 ;;; ---- server -----------------------------------------------------------------
 
 (defun serve (fb port &key on-key on-pointer on-resize (name *desktop-name*) once wake
-                           (clipboard (session-clipboard)) (install-injector t) on-clients)
+                           (clipboard (session-clipboard)) (install-injector t) on-clients
+                           (address "0.0.0.0") listen)
   "Serve framebuffer FB over RFB on PORT.  ON-KEY (down-p keysym), ON-POINTER
    (button-mask x y) and ON-RESIZE (requested-w requested-h, from the client
    resizing its window) are optional callbacks.  With :ONCE, handle a single
@@ -933,8 +959,18 @@ its bytes would land in the middle of a rect."
    this screen any more: a seat with no viewers has no hands, and anything it was holding
    on everybody else's behalf (see the McCLIM token in the backend) should be let go
    rather than waiting out a timeout.  Called inside IGNORE-ERRORS — a callback must not
-   be able to take down the accept loop."
-  (let ((listen (tcp-listen port))
+   be able to take down the accept loop.
+
+   ADDRESS is the interface to bind, defaulting to 0.0.0.0 exactly as before.
+
+   LISTEN is an ALREADY-LISTENING socket (from TCP-LISTEN) to accept on instead of making
+   one.  It matters for the same reason CLOSE-LISTENER does: a caller that wants to be
+   able to STOP serving needs to hold the socket, and a socket created inside this
+   function is only reachable from the thread parked on it.  With LISTEN, the port is
+   bound and listening by the time the caller starts this function's thread — so \"is it
+   serving yet?\" is answered by the call that returned the socket, not by a sleep.  It is
+   closed on the way out either way."
+  (let ((listen (or listen (tcp-listen port :address address)))
         (live 0)
         (live-lock (sb-thread:make-mutex :name "glass-rfb-clients")))
     ;; Paste's fallback consumer types the selection into whatever has focus, and the only path
@@ -962,7 +998,7 @@ its bytes would land in the middle of a rect."
                      (progn (run stream) (return))
                      (sb-thread:make-thread (lambda () (ignore-errors (run stream)))
                                             :name "glass-client"))))
-          (ignore-errors (sb-bsd-sockets:socket-close listen)))))))
+          (close-listener listen))))))
 
 (defun serve-one (fb port &rest args)
   "Serve exactly one client, then return (handy for tests)."

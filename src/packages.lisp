@@ -19,7 +19,7 @@
    ;; text (the :glass/text system; scribe-backed)
    #:fb-text #:text-width #:load-font #:default-font
    ;; server: (serve fb port &key on-key on-pointer on-resize name once wake)
-   #:serve #:serve-one #:*desktop-name* #:tcp-listen #:make-wake #:wake-signal
+   #:serve #:serve-one #:*desktop-name* #:tcp-listen #:close-listener #:make-wake #:wake-signal
    ;; VNC authentication (from-scratch DES); *vnc-password* nil = open, string = required
    #:*vnc-password* #:*legacy-vnc-auth* #:vnc-auth-response #:vnc-auth-verify
    ;; clipboard (the :glass/clipboard system) — one session selection, many transports
