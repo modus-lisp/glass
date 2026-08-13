@@ -94,6 +94,10 @@
    ;; the enrolment store, login tokens, the DM command surface, and the admission service a
    ;; transport asks instead of keeping a second copy of the answer
    #:*box-secret* #:box-identity-p #:box-pubkey #:box-npub #:unix-now
+   ;; a SEAT's own npub — which PLACE this is, kept apart from who may sit in it
+   #:seat-identity #:seat-identity-for #:seat-identity-known #:seat-identity-name
+   #:seat-identity-pubkey #:seat-identity-npub #:seat-identity-secret
+   #:list-seat-identities #:forget-seat-identity #:*seat-key-file* #:*seat-keys*
    #:*login-ttl* #:mint-login-token #:verify-login-token #:login-token-status
    #:*nostr-allow* #:normalize-pubkey #:refresh-nostr-allow #:allowed-pubkey-p
    #:*enrolment-file* #:*enrolment-ttl* #:*enrolments* #:load-enrolments #:save-enrolments

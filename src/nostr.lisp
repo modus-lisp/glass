@@ -24,9 +24,14 @@
 ;;;; loads this is a working desktop that simply admits nobody of its own accord.
 ;;;;
 ;;;; ==============================================================================================
-;;;; THE FOUR THINGS THIS OWNS
+;;;; THE FIVE THINGS THIS OWNS
 ;;;; ==============================================================================================
 ;;;;
+;;;;   0. THE SEATS' IDENTITIES.  An npub per SEAT — per place at the session, not per person and
+;;;;      not per wire — minted on demand and persisted in a store of their own.  Numbered zero
+;;;;      because it is the newest and the one the other four do not depend on: nothing here
+;;;;      admits anybody by a seat key, and nothing signs with one.  See its section below for why
+;;;;      a place having a name is worth a keypair, and why it is kept apart from (2).
 ;;;;   1. THE IDENTITY.  One secret key; the box's npub is its public name.  Required — there is
 ;;;;      deliberately no fallback, for the reason the gateway learned the hard way: the same
 ;;;;      secret is the HMAC key for login tokens, so a committed placeholder is not an identity
@@ -105,6 +110,184 @@ quietly admitting people as somebody else.")
   (when (box-identity-p)
     (ignore-errors
      (cl-nostr.bech32:npub-encode (cl-nostr.keys:public-key-of-secret *box-secret*)))))
+
+;;; ---- a seat's identity -------------------------------------------------------
+;;;
+;;; A SEAT IS WHAT YOU CONNECT TO (backend/seat.lisp; docs/seats-and-transports.md), and a
+;;; seat gets an npub OF ITS OWN.  "DM this npub and get a link" is then a way in to a
+;;; SEAT rather than to a wire: a seat reachable over VNC today and over something else
+;;; tomorrow is the same seat, and rotating a transport's key changes nothing about the
+;;; destination.  (We rotated the box key on 2026-08-12 and it invalidated every link and
+;;; every enrolment, because the key WAS the destination.)
+;;;
+;;; THIS IS NOT PERSON IDENTITY.  The seat's key says WHICH PLACE THIS IS and belongs to
+;;; the session's configuration; *NOSTR-ALLOW* and the enrolments below say WHO MAY SIT IN
+;;; IT.  Both are npubs, they answer different questions, and they are kept in different
+;;; files so that they cannot be quietly merged: collapse them and "the owner sat down at
+;;; the guest seat" stops being sayable.
+;;;
+;;; PERSISTED, KEYED BY THE SEAT'S NAME, because a seat that got a new npub on every
+;;; restart would be a destination nobody could write down — which is the whole objection
+;;; to addressing a transport.  The store is this file's because the KEYS are: core glass
+;;; carries no crypto (cl-nostr and ironclad are dependencies of :glass/nostr alone), so
+;;; the backend holds an opaque slot and asks for one of these by name.
+;;;
+;;; NOTHING HERE SIGNS ANYTHING, and that is a decision rather than an omission.  Identity
+;;; is given now because retrofitting it is a migration; verification is left out because
+;;; adding it later is a feature, and there is no attacker today on a call between two
+;;; objects in one image.  SEAT-IDENTITY-SECRET is the key a signature would be taken
+;;; with, and it is deliberately the only thing here that touches it.
+
+(defvar *seat-key-file*
+  (or (sb-ext:posix-getenv "GLASS_SEAT_KEYS")
+      (namestring (merge-pathnames ".glass-seats" (user-homedir-pathname))))
+  "Where seat keys are persisted: one `<seat-name> <secret-hex>' line per seat.
+
+SEPARATE FROM *ENROLMENT-FILE* on purpose — that one holds other people's public keys and
+is meant to be read and edited by anything (warp's panel, a shell one-liner); this one
+holds SECRETS and is written 0600.  DEFVAR, so a hot-load cannot move the store out from
+under a running desktop and hand every seat a new name.")
+
+(defvar *seat-keys* (make-hash-table :test 'equal))
+(defvar *seat-keys-lock* (sb-thread:make-mutex :name "glass-seat-keys"))
+
+(defclass seat-identity ()
+  ((name   :initarg :name   :reader seat-identity-name)
+   (secret :initarg :secret :reader seat-identity-secret)
+   (pubkey :initarg :pubkey :reader seat-identity-pubkey)
+   (npub   :initarg :npub   :reader seat-identity-npub))
+  (:documentation
+   "One seat's key: its NAME (which place this is), its 32-byte secret as 64 hex, its
+    x-only PUBKEY and its NPUB — the seat's public name, the thing you would address.
+
+    A class and not a structure for the reason the seat itself is one: a desktop runs for
+    weeks and grows slots while it runs, and redefining a structure strands the instances
+    already made."))
+
+(defmethod print-object ((id seat-identity) stream)
+  ;; The secret is NOT printed.  A seat identity ends up in a backtrace, an inspector and
+  ;; the control socket's output, and a key that prints itself is a key that leaks.
+  (print-unreadable-object (id stream :type t)
+    (format stream "~s ~a" (slot-value id 'name)
+            (let ((n (slot-value id 'npub))) (if n (subseq n 0 (min 16 (length n))) "?")))))
+
+(defun %seat-identity (name secret)
+  "Build a SEAT-IDENTITY for NAME from a 64-hex SECRET, or NIL if the secret is not one."
+  (ignore-errors
+   (let* ((kp (cl-nostr.keys:keypair-from-secret secret))
+          (pub (cl-nostr.keys:public-key-of-secret secret)))
+     (make-instance 'seat-identity
+                    :name name
+                    :secret (string-downcase (cl-nostr.keys:secret-hex kp))
+                    :pubkey (string-downcase (cl-nostr.keys:public-hex kp))
+                    :npub (cl-nostr.bech32:npub-encode pub)))))
+
+(defun %seat-key-name (name)
+  "NAME as a store key: a seat name with nothing in it that could break a line-framed
+   file, so \"Front desk\" is stored as \"Front-desk\".  The reader splits on the LAST space
+   anyway — belt and braces, because the file is edited by hand and a name that ate its
+   own secret would hand a seat a new identity in silence."
+  (%one-line (or name "seat")))
+
+(defun %chmod-600 (path)
+  "Make PATH readable by its owner alone, if this image can say so.  Best effort: a
+   umask-tightened file is already 0600 and a platform without sb-posix is not a reason to
+   refuse to remember a key."
+  (ignore-errors
+   (let* ((pkg (or (find-package "SB-POSIX")
+                   (progn (require :sb-posix) (find-package "SB-POSIX"))))
+          (chmod (and pkg (find-symbol "CHMOD" pkg))))
+     (when (and chmod (fboundp chmod)) (funcall chmod (namestring path) #o600)))))
+
+(defun %load-seat-keys ()
+  "Merge the store into *SEAT-KEYS*.  Never overwrites what this process already holds —
+   an identity handed out is an identity in use, and a file that changed underneath must
+   not make a live seat answer to a second name.  Call with the lock held."
+  (handler-case
+      (with-open-file (s *seat-key-file* :if-does-not-exist nil)
+        (when s
+          (loop for line = (read-line s nil) while line do
+            (let* ((sp (position #\Space line :from-end t))   ; the secret is the last field
+                   (name (and sp (subseq line 0 sp)))
+                   (sec (and sp (string-downcase (subseq line (1+ sp))))))
+              (when (and name (plusp (length name)) (= 64 (length sec))
+                         (not (gethash name *seat-keys*)))
+                (let ((id (%seat-identity name sec)))
+                  (when id (setf (gethash name *seat-keys*) id))))))))
+    (error () nil)))
+
+(defun %save-seat-keys ()
+  "Write the store.  Call with the lock held."
+  (handler-case
+      (progn
+        (with-open-file (s *seat-key-file* :direction :output :if-exists :supersede
+                                           :if-does-not-exist :create)
+          (maphash (lambda (name id)
+                     (format s "~a ~a~%" name (seat-identity-secret id)))
+                   *seat-keys*))
+        (%chmod-600 *seat-key-file*)
+        t)
+    (error () nil)))
+
+(defun seat-identity-for (name)
+  "THE SEAT NAMED NAME'S IDENTITY, minted and persisted the first time it is asked for and
+   the same one every time after — including across a restart, which is what makes a seat
+   an address somebody can write down.  NIL only if a key can be neither read nor made.
+
+   This is the function CLIM-GLASS::ENSURE-SEAT-IDENTITY looks up by name, and it is the
+   whole of the seam: the backend never learns what an npub is, and core glass goes on
+   having no crypto dependency at all."
+  (let ((name (%seat-key-name name)))
+    (sb-thread:with-mutex (*seat-keys-lock*)
+      (or (gethash name *seat-keys*)
+          ;; Not ours: another process (or an earlier run) may have minted it.  Read
+          ;; before minting, or two desktops sharing a store would each make their own
+          ;; key for one seat and the second write would lose the first.
+          (progn (%load-seat-keys) (gethash name *seat-keys*))
+          (let ((id (ignore-errors
+                     (let ((kp (cl-nostr.keys:generate-keypair)))
+                       (%seat-identity name (cl-nostr.keys:secret-hex kp))))))
+            (when id
+              (setf (gethash name *seat-keys*) id)
+              (%save-seat-keys)
+              id))))))
+
+(defun seat-identity-known (name)
+  "The identity stored for NAME, WITHOUT minting one.  NIL if this seat has never had a
+   key — which is how to ask the question without answering it."
+  (let ((name (%seat-key-name name)))
+    (sb-thread:with-mutex (*seat-keys-lock*)
+      (or (gethash name *seat-keys*) (progn (%load-seat-keys) (gethash name *seat-keys*))))))
+
+(defun list-seat-identities ()
+  "The seats this store knows, as ((name . npub) …), by name.  Secrets are not returned:
+   the listing is for saying which places exist and how to address them."
+  (sb-thread:with-mutex (*seat-keys-lock*)
+    (%load-seat-keys)
+    (let ((rows '()))
+      (maphash (lambda (name id) (push (cons name (seat-identity-npub id)) rows)) *seat-keys*)
+      (sort rows #'string< :key #'car))))
+
+(defun forget-seat-identity (name)
+  "Drop NAME's key from the store.  T if there was one.
+
+   THIS IS NOT REVOCATION and there is nothing to revoke: a seat key is a destination, not
+   a credential, and nobody was ever admitted by it.  What it does is make the next seat
+   of that name a DIFFERENT place — so every link that named the old one stops naming
+   anything, which is exactly the failure rotating the box key caused and the reason seats
+   have their own keys at all.  Kept because a store you cannot clean up is a store that
+   accumulates every seat anybody ever typo'd."
+  (let ((name (%seat-key-name name)))
+    (sb-thread:with-mutex (*seat-keys-lock*)
+      (%load-seat-keys)
+      (when (remhash name *seat-keys*) (%save-seat-keys) t))))
+
+;;; WHERE A SEAT'S SIGNATURE WOULD GO.  A remote seat's request — open a transport, move a
+;;; window, take the CLIM token — would be signed with SEAT-IDENTITY-SECRET (BIP340, via
+;;; CL-NOSTR.KEYS:SIGN) over the request's canonical bytes, and the session would check it
+;;; against SEAT-IDENTITY-PUBKEY for the seat the request names.  That is the step which
+;;; would let a seat live in another process without the trust boundary being "whoever can
+;;; reach the port".  It is not built: see the header of the section above.
 
 ;;; ---- time --------------------------------------------------------------------
 
