@@ -129,62 +129,133 @@
    dictates None for 3.3 instead.")
 
 (defvar *vnc-password* nil
-  "If a string, VNC Authentication is REQUIRED for ALL clients and the DES
+  "The SESSION-WIDE credential, and the one every transport that did not name its own
+   inherits.  If a string, VNC Authentication is REQUIRED for those clients and the DES
    challenge/response is VERIFIED against it — a wrong password is rejected, so this
    secures a desktop bound to 0.0.0.0 (and macOS saves the password to its Keychain,
    so it stops prompting).  NIL = the open posture (None for 3.7+, any-password VNC
-   auth for 3.3/macOS).  Set it live: (setf glass:*vnc-password* \"...\").")
+   auth for 3.3/macOS).  Set it live: (setf glass:*vnc-password* \"...\") — a running
+   listener picks that up, because an inherited credential is read per HANDSHAKE and
+   not once at SERVE.
+
+   IT IS NO LONGER THE ONLY PLACE A CREDENTIAL CAN LIVE, and that is what makes a
+   password stop breaking video: SERVE takes :PASSWORD, so a seat can demand one on the
+   wire strangers can reach and demand nothing on the socket file only its owner can
+   open — which is where the VP8 capture lives.  Setting this variable applies to every
+   inheriting transport at once, which is exactly the conflation the per-transport
+   argument exists to undo.")
 
 (defvar *vnc-verify-fn* nil
   "Installed by the optional :glass/vncauth system: (password challenge response) ->
    bool, the DES verify via seal.  Kept a HOOK so core :glass carries no crypto
-   dependency — with *vnc-password* set but this NIL, connections FAIL CLOSED.")
+   dependency — with a password set but this NIL, connections FAIL CLOSED.")
 
-(defun vnc-auth-exchange (s)
+(defun vnc-auth-available-p ()
+  "Can this image actually VERIFY a VNC password?  T iff :glass/vncauth is loaded.
+   Worth asking BEFORE opening a listener with a credential: without the verifier a
+   password does not secure the wire, it closes it — every client is rejected — so a
+   caller generating a credential on somebody's behalf should ask first and say so."
+  (and *vnc-verify-fn* t))
+
+(defparameter +vnc-credential-alphabet+
+  "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+  "The alphabet MAKE-VNC-CREDENTIAL draws from: the unambiguous ASCII — no l/I/1, no
+   o/O/0 — because this password is READ OFF A SCREEN and typed into a viewer by hand.")
+
+(defun make-vnc-credential (&optional (length 8))
+  "A fresh VNC password, LENGTH characters from /dev/urandom.
+
+   EIGHT, and not more, because the RFB VNC-auth key IS eight bytes: the protocol takes
+   the first 8 characters of the password, zero-pads, and reverses each byte's bits to
+   make a DES key (see src/vncauth.lisp).  A 20-character password would be a 20-
+   character password on the screen and the same 8 bytes on the wire, so the extra
+   twelve are theatre — the honest thing is to generate the length that is actually
+   used.  Eight characters of this alphabet is ~46 bits, drawn from the kernel's CSPRNG
+   and not from CL:RANDOM, whose state is not a secret.
+
+   That said: VNC authentication is DES, the challenge/response is offline-crackable by
+   anyone who watches one handshake, and EVERYTHING AFTER IT IS PLAINTEXT.  This is a
+   credential that keeps the internet's scanners out of a desktop, not a channel that
+   keeps a network attacker out of one.  For that there is the UNIX transport with an
+   SSH tunnel, or the WebRTC gateway, both of which encrypt."
+  (let ((n (length +vnc-credential-alphabet+)))
+    (with-open-file (in "/dev/urandom" :element-type '(unsigned-byte 8))
+      (let ((out (make-string length)))
+        (dotimes (i length out)
+          ;; Rejection sampling: 256 is not a multiple of 56, so a bare MOD would deal
+          ;; the first 32 characters five chances each and the other 24 only four.
+          (setf (char out i)
+                (char +vnc-credential-alphabet+
+                      (loop for b = (read-byte in)
+                            until (< b (* n (floor 256 n)))
+                            finally (return (mod b n))))))))))
+
+(defun effective-vnc-password (password)
+  "The credential a handshake should demand, given a transport's PASSWORD setting.
+
+   :INHERIT — the default everywhere — means *VNC-PASSWORD*, read HERE, at handshake
+   time, so that setting the session-wide password live still reaches a listener that
+   is already running (which is what its docstring has always promised).  A string is
+   this wire's own credential; NIL is this wire demanding nothing, whatever the session
+   says, which is how the UNIX transport stays open to the capture client that speaks
+   security type None."
+  (if (eq password :inherit) *vnc-password* password))
+
+(defun vnc-auth-exchange (s &optional (password :inherit))
   "VNC-auth challenge/response over S.  Returns T to admit the client: with no
-   password set, any response is accepted; with a password, the DES verifier
-   (*vnc-verify-fn*, from :glass/vncauth) must confirm it — and if that verifier is
-   absent, the client is rejected (fail closed)."
-  (let ((challenge (make-array 16 :element-type '(unsigned-byte 8))))
+   password, any response is accepted; with one, the DES verifier (*vnc-verify-fn*,
+   from :glass/vncauth) must confirm it — and if that verifier is absent, the client is
+   rejected (fail closed)."
+  (let ((password (effective-vnc-password password))
+        (challenge (make-array 16 :element-type '(unsigned-byte 8))))
     (dotimes (i 16) (setf (aref challenge i) (random 256)))
     (w-bytes s challenge) (force-output s)
     (let ((response (r-bytes s 16)))
-      (cond ((null *vnc-password*) t)                                  ; open: accept any
-            (*vnc-verify-fn* (funcall *vnc-verify-fn* *vnc-password* challenge response))
+      (cond ((null password) t)                                        ; open: accept any
+            (*vnc-verify-fn* (funcall *vnc-verify-fn* password challenge response))
             (t nil)))))                                                ; secured, no verifier -> reject
 
-(defun vnc-auth-and-result (s minor)
+(defun vnc-auth-and-result (s minor &optional (password :inherit))
   "Run VNC auth, send the RFB SecurityResult (0 OK / 1 failed, + a reason string on
    3.8), and return whether the client is admitted."
-  (let ((ok (vnc-auth-exchange s)))
+  (let ((ok (vnc-auth-exchange s password)))
     (w-u32 s (if ok 0 1)) (force-output s)
     (when (and (not ok) (>= minor 8))
       (let ((reason (string->bytes "Authentication failed")))
         (w-u32 s (length reason)) (w-bytes s reason) (force-output s)))
     ok))
 
-(defun handshake (fb s name)
+(defun handshake (fb s name &optional (password :inherit))
   "RFB handshake through ServerInit, honoring the client's protocol version.  We
    advertise 3.8, but macOS Screen Sharing (and other legacy clients) answer 3.3,
    whose security phase is INCOMPATIBLE with 3.7+: 3.3 wants a single u32 security
    type from the server (client doesn't choose, no SecurityResult), while 3.7+ wants
    a type LIST + the client's choice + a SecurityResult.  Getting this wrong is a
-   protocol deadlock (a spinning connection that never opens).  Returns T on success."
-  (w-bytes s (string->bytes "RFB 003.008")) (w-u8 s 10) (force-output s)
-  (let ((minor (client-minor-version (r-bytes s 12))))   ; client ProtocolVersion
-    (if (>= minor 7)
-        ;; 3.7 / 3.8: a security-type LIST, the client's choice, then the exchange
-        (if *vnc-password*                     ; secured -> require VNC auth (type 2)
-            (progn (w-u8 s 1) (w-u8 s 2) (force-output s)
-                   (r-u8 s)                        ; client's chosen type (2)
-                   (unless (vnc-auth-and-result s minor) (return-from handshake nil)))
-            (progn (w-u8 s 1) (w-u8 s 1) (force-output s)    ; None (1)
-                   (r-u8 s) (w-u32 s 0) (force-output s)))   ; SecurityResult = OK
-        ;; 3.3: the server dictates ONE u32 security type
-        (if (or *vnc-password* *legacy-vnc-auth*)
-            (progn (w-u32 s 2) (force-output s)              ; VNC auth (verified if *vnc-password*)
-                   (unless (vnc-auth-and-result s minor) (return-from handshake nil)))
-            (progn (w-u32 s 1) (force-output s)))))          ; None -> straight to ClientInit
+   protocol deadlock (a spinning connection that never opens).  Returns T on success.
+
+   PASSWORD is THIS WIRE's credential (see EFFECTIVE-VNC-PASSWORD): :INHERIT for the
+   session's, a string for its own, NIL for none.  It decides which security type is
+   offered at all, so a client of an unauthenticated transport is offered None and a
+   client of an authenticated one is not — one desktop, two answers, which is the whole
+   of why a password on the TCP wire no longer breaks the capture on the UNIX one."
+  (let ((password (effective-vnc-password password)))
+    (w-bytes s (string->bytes "RFB 003.008")) (w-u8 s 10) (force-output s)
+    (let ((minor (client-minor-version (r-bytes s 12))))   ; client ProtocolVersion
+      (if (>= minor 7)
+          ;; 3.7 / 3.8: a security-type LIST, the client's choice, then the exchange
+          (if password                         ; secured -> require VNC auth (type 2)
+              (progn (w-u8 s 1) (w-u8 s 2) (force-output s)
+                     (r-u8 s)                      ; client's chosen type (2)
+                     (unless (vnc-auth-and-result s minor password)
+                       (return-from handshake nil)))
+              (progn (w-u8 s 1) (w-u8 s 1) (force-output s)    ; None (1)
+                     (r-u8 s) (w-u32 s 0) (force-output s)))   ; SecurityResult = OK
+          ;; 3.3: the server dictates ONE u32 security type
+          (if (or password *legacy-vnc-auth*)
+              (progn (w-u32 s 2) (force-output s)              ; VNC auth (verified if PASSWORD)
+                     (unless (vnc-auth-and-result s minor password)
+                       (return-from handshake nil)))
+              (progn (w-u32 s 1) (force-output s))))))         ; None -> straight to ClientInit
   (r-u8 s)                                     ; ClientInit (shared-flag)
   (w-u16 s (fb-width fb)) (w-u16 s (fb-height fb))
   (write-pixel-format s)
@@ -884,7 +955,7 @@ its bytes would land in the middle of a rect."
 
 (defun serve (fb port &key on-key on-pointer on-resize (name *desktop-name*) once wake
                            (clipboard (session-clipboard)) (install-injector t) on-clients
-                           (address "0.0.0.0") listen)
+                           (address "0.0.0.0") listen (password :inherit))
   "Serve framebuffer FB over RFB on PORT.  ON-KEY (down-p keysym), ON-POINTER
    (button-mask x y) and ON-RESIZE (requested-w requested-h, from the client
    resizing its window) are optional callbacks.  With :ONCE, handle a single
@@ -920,6 +991,25 @@ its bytes would land in the middle of a rect."
    thread — so \"is it serving yet?\" is answered by the call that returned the socket, not
    by a sleep.  It is closed on the way out either way.
 
+   PASSWORD IS THIS LISTENER'S CREDENTIAL, and it is per LISTENER and not per session.
+   :INHERIT (the default) means *VNC-PASSWORD*, read at each handshake, so nothing that
+   ever set that variable — before or during a run — changes behaviour.  A string is a
+   credential only clients of THIS wire are asked for; NIL demands nothing here whatever
+   the session-wide variable says.
+
+   THAT DISTINCTION IS THE POINT.  *VNC-PASSWORD* is one global read inside the handshake,
+   so it applied to every listener at once — which is why turning it on used to break
+   video: the VP8 capture is an RFB client of the same desktop, speaks security type None,
+   and a session-wide password locked it out while the browser's bridged RFB (which does
+   VNC auth) kept working.  The SECURE configuration was the broken one.  With the
+   credential here, a seat can demand a password on the TCP wire a stranger can reach and
+   demand nothing on the socket file only its owner can open, in one process, at once.
+
+   NIL ON A LISTENER BOUND OFF-BOX IS A DECISION SOMEBODY HAS TO MAKE, and this function
+   does not make it: SERVE binds what it is told, as it always has.  The place that
+   chooses an address on a person's behalf is the one that must refuse to expose an
+   unauthenticated wire — see CLIM-GLASS:SERVE-SEAT-VNC.
+
    IT IS ALSO HOW RFB REACHES A UNIX SOCKET, and the whole of how: pass a UNIX-LISTENER and
    this function is unchanged — PORT is then only a label for the log line.  RFB is bytes
    on a stream (RFC 6143 specifies TCP but nothing in the protocol depends on it), so a
@@ -933,8 +1023,14 @@ its bytes would land in the middle of a rect."
     ;; gave us for client keys becomes the session's key injector: an injected key is
     ;; indistinguishable from a typed one, and nothing downstream needs to learn about pasting.
     (when (and on-key install-injector) (setf *key-injector* on-key))
-    (format *error-output* "~&glass: RFB server listening on ~a (~dx~d)~%"
-            (listener-endpoint listen) (fb-width fb) (fb-height fb))
+    ;; Say which posture this wire is in, because "am I asking anybody for anything?" is
+    ;; the question a log line about a listener should answer and this one could not.
+    (format *error-output* "~&glass: RFB server listening on ~a (~dx~d) — ~a~%"
+            (listener-endpoint listen) (fb-width fb) (fb-height fb)
+            (let ((pw (effective-vnc-password password)))
+              (cond ((null pw) "no authentication")
+                    ((vnc-auth-available-p) "VNC authentication REQUIRED")
+                    (t "VNC auth required but NO VERIFIER (:glass/vncauth absent) — every client will be rejected"))))
     (force-output *error-output*)
     (flet ((note-clients (delta)
              (let ((n (sb-thread:with-mutex (live-lock) (incf live delta))))
@@ -942,7 +1038,7 @@ its bytes would land in the middle of a rect."
       (flet ((run (stream)
                (note-clients 1)
                (unwind-protect
-                    (when (handshake fb stream name)   ; NIL = auth failed -> drop the client
+                    (when (handshake fb stream name password)   ; NIL = auth failed -> drop the client
                       (client-loop fb stream on-key on-pointer on-resize wake clipboard))
                  (ignore-errors (close stream))
                  (note-clients -1))))

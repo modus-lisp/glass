@@ -30,8 +30,12 @@
    #:clear-stale-socket #:unix-socket-live-p
    #:peer-credentials #:peer-allowed-p #:peer-name #:socket-fd #:*peer-policy*
    #:open-connection #:parse-endpoint #:endpoint-string #:socket-unsent-bytes
-   ;; VNC authentication (from-scratch DES); *vnc-password* nil = open, string = required
+   ;; VNC authentication (from-scratch DES); *vnc-password* nil = open, string = required.
+   ;; A credential is per TRANSPORT (SERVE's :PASSWORD); *vnc-password* is what a transport
+   ;; that named none inherits, and MAKE-VNC-CREDENTIAL mints one worth naming.
    #:*vnc-password* #:*legacy-vnc-auth* #:vnc-auth-response #:vnc-auth-verify
+   #:make-vnc-credential #:vnc-auth-available-p #:effective-vnc-password
+   #:+vnc-credential-alphabet+
    ;; clipboard (the :glass/clipboard system) — one session selection, many transports
    #:make-clipboard #:clipboard #:clipboard-p #:clipboard-own #:clipboard-set #:clipboard-text
    #:clipboard-disown #:clipboard-clear #:clipboard-owner #:clipboard-owner-name

@@ -108,6 +108,14 @@
    (port-num :initarg :port-num :initform nil   :reader transport-port-num)
    (path     :initarg :path     :initform nil   :reader transport-path)      ; :RFB-UNIX only
    (socket   :initarg :socket   :initform nil   :accessor transport-socket)  ; the LISTENER
+   ;; THIS WIRE'S CREDENTIAL, and the reason it is here rather than in a global: a password
+   ;; read from one special applied to every listener at once, so demanding one anywhere
+   ;; demanded it everywhere — including on the wire the VP8 capture comes in on, which
+   ;; speaks security type None and could only fail.  :INHERIT is GLASS:*VNC-PASSWORD* read
+   ;; at each handshake (the old behaviour, live-settable, and still every launcher's), a
+   ;; string is this wire's own, NIL is this wire asking for nothing whatever the session
+   ;; says — which is what a UNIX transport always is.
+   (password :initarg :password :initform :inherit :reader transport-password)
    (thread   :initform nil :accessor transport-thread)                       ; its accept loop
    ;; Set before the socket is torn down, so the accept loop's resulting error is
    ;; recognised as the thing we asked for rather than reported as a failure.
@@ -132,6 +140,16 @@
 (defun transport-open-p (transport)
   "Is TRANSPORT still listening?"
   (and transport (transport-socket transport) t))
+
+(defun transport-credential (transport)
+  "The credential clients of TRANSPORT are actually asked for, right now: a string, or
+   NIL for none.  Resolves :INHERIT against GLASS:*VNC-PASSWORD* the same way the
+   handshake does, so this answers what a client would MEET and not what we wrote down."
+  (and transport (glass:effective-vnc-password (transport-password transport))))
+
+(defun transport-authenticated-p (transport)
+  "Does TRANSPORT demand a password?  The question a menu label and a log line ask."
+  (and (transport-credential transport) t))
 
 ;;; ---- this seat's identity ----------------------------------------------------
 ;;;

@@ -1186,16 +1186,21 @@
 
 (defun wm-open-menu (port x y &optional seat)
   "Open the workspace root menu at (X,Y): the port's items, plus whatever the SESSION
-   itself can offer from the workspace — today, speaking the clipboard.  Those are
-   appended here rather than registered as apps because they are not apps and because
+   itself can offer from the workspace — today, speaking the clipboard, and deciding
+   whether this seat is on a plain VNC port.  Those are appended here rather than
+   registered as apps because they are not apps and because
    they change: the items are built at every open, so \"Stop speaking\" is on the menu
    exactly while something is being said.  A port whose menu was overridden still gets
    them, for the same reason it still gets a window menu — they are the desktop's, not
    the menu list's."
-  (let ((seat (port-seat port seat))
-        (menu (make-wm-menu :x x :y y :hover -1
-                            :items (append (glass-port-menu-items port)
-                                           (wm-clipboard-menu-items seat)))))
+  (let* ((seat (port-seat port seat))
+         (menu (make-wm-menu :x x :y y :hover -1
+                             :items (append (glass-port-menu-items port)
+                                            (wm-clipboard-menu-items seat)
+                                            ;; …and whether THIS seat is on a VNC port,
+                                            ;; which is a question about the seat whose
+                                            ;; menu this is and not about the session
+                                            (wm-vnc-menu-items port seat)))))
     (setf (seat-menu seat) (wm-place-menu menu seat x y))))
 
 ;;; ---- the selection menu (right-click ON the thing you selected) --------------
@@ -1318,6 +1323,152 @@
                                seat)))))
        (when (and hush (wm-speaking-p))
          (list (cons "Stop speaking" (lambda () (ignore-errors (funcall hush))))))))))
+
+;;; ---- plain VNC, from the root menu, per seat ---------------------------------
+;;;
+;;; A desktop may be reachable only over socket files — the gateway's wire and the
+;;; capture's — and then a person holding a VNC viewer has no way in at all.  These are
+;;; the two items that let one seat decide otherwise while the session runs, and the
+;;; small window that answers the question a menu cannot ask: what is the password?
+;;;
+;;; PER SEAT, and the items are closed over the seat whose menu they are on, because
+;;; serving is a seat's decision (docs/seats-and-transports.md) and "the desktop" is not
+;;; a thing that can be exposed — a session has seats, and one of them can be on a port
+;;; while another is not.
+
+(defparameter *vnc-window-size* '(460 . 300)
+  "The credential window's size.  Big enough that an 8-character password at 26px and a
+   full address line are not truncated on a small screen, small enough not to cover the
+   desktop somebody has just been given.")
+
+(defun wm-vnc-window-lines (tr credential note)
+  "The lines the credential window shows for transport TR: what to connect to, what to
+   type, and — where they differ — what was actually bound.
+
+   THE ADDRESS IS THE ROUTABLE ONE AND NOT THE BOUND ONE, which is the difference
+   between a window somebody can act on and a window that says `0.0.0.0'.  The bound
+   address is still shown, on its own line, because `every interface' is a fact about
+   exposure and this window is the only place it is ever stated."
+  (let* ((port (transport-port-num tr))
+         (bound (transport-address tr))
+         (host (if (loopback-address-p bound) "127.0.0.1" (local-address bound))))
+    (append
+     (list (list :head (if credential "VNC is on, and asking for a password"
+                           "VNC is on — no password"))
+           (list :field "Connect to" (format nil "~a:~d" host port)))
+     (if credential
+         (list (list :secret "Password" credential)
+               (list :note "It is on this seat's clipboard as well."))
+         (list (list :note "Anyone who can reach this port can use this desktop.")))
+     (list (list :field "Bound to" (format nil "~a:~d" bound port))
+           (list :note (if (loopback-address-p bound)
+                           "Loopback only: nothing outside this machine can reach it."
+                           "Every interface: this port faces whatever the box does.")))
+     (when note (list (list :warn note)))
+     (list (list :note "The same menu item stops it again.")))))
+
+(defun wm-render-vnc-window (fb lines)
+  "Draw LINES (from WM-VNC-WINDOW-LINES) onto FB."
+  (let ((font (glass:default-font)) (bold (glass:default-font t))
+        (w (glass:fb-width fb)) (y 14))
+    (glass:fb-fill fb (glass:rgb 248 248 245))
+    (flet ((wrap (text size limit)
+             ;; A note is a sentence, not a label; it wraps rather than running off the
+             ;; edge, because the one that gets truncated is always the one saying why
+             ;; this is on loopback.
+             (let ((words (let ((out '()) (start 0))
+                            (dotimes (i (1+ (length text)) (nreverse out))
+                              (when (or (= i (length text)) (char= (char text i) #\Space))
+                                (when (> i start) (push (subseq text start i) out))
+                                (setf start (1+ i))))))
+                   (lines '()) (cur ""))
+               (dolist (word words (nreverse (if (plusp (length cur)) (cons cur lines) lines)))
+                 (let ((try (if (plusp (length cur)) (concatenate 'string cur " " word) word)))
+                   (if (or (zerop (length cur)) (<= (glass:text-width try :size size :font font) limit))
+                       (setf cur try)
+                       (progn (push cur lines) (setf cur word))))))))
+      (dolist (line lines fb)
+        (destructuring-bind (kind a &optional b) line
+          (ecase kind
+            (:head (glass:fb-text fb 16 y a :size 15 :color (glass:rgb 20 20 20) :font bold)
+                   (glass:fb-hline fb 16 (+ y 22) (- w 32) (glass:rgb 200 200 195))
+                   (incf y 32))
+            (:field (glass:fb-text fb 16 y a :size 13 :color (glass:rgb 100 100 100) :font font)
+                    (glass:fb-text fb 110 y b :size 13 :color (glass:rgb 20 20 20) :font bold)
+                    (incf y 22))
+            (:secret (glass:fb-text fb 16 (+ y 8) a :size 13 :color (glass:rgb 100 100 100) :font font)
+                     (glass:fb-text fb 110 y b :size 26 :color (glass:rgb 20 60 120) :font bold)
+                     (incf y 38))
+            (:note (dolist (l (wrap a 12 (- w 32)))
+                     (glass:fb-text fb 16 y l :size 12 :color (glass:rgb 110 110 110) :font font)
+                     (incf y 16))
+                   (incf y 4))
+            (:warn (dolist (l (wrap a 12 (- w 32)))
+                     (glass:fb-text fb 16 y l :size 12 :color (glass:rgb 150 60 20) :font font)
+                     (incf y 16))
+                   (incf y 4))))))))
+
+(defun wm-show-vnc-window (port lines &optional (title "VNC"))
+  "Put LINES on the screen as an ordinary WM window — a surface with no input, drawn
+   once.  An ordinary window on purpose: it can be moved, raised and closed like
+   everything else, and it does not grab anything."
+  (add-surface port
+               (lambda (fb)
+                 (wm-render-vnc-window fb lines)
+                 (let ((first t))
+                   (values (lambda (down k) (declare (ignore down k)) nil)   ; swallows keys
+                           nil
+                           (lambda () (prog1 first (setf first nil))))))
+               :title title :width (car *vnc-window-size*) :height (cdr *vnc-window-size*)))
+
+(defun wm-start-vnc (port &optional seat)
+  "Start plain VNC for SEAT and show the credential.  Returns the transport, or NIL if
+   it could not be opened — in which case the window says why, because an item that
+   silently does nothing is worse than one that reports a bound port."
+  (let ((seat (port-seat port seat)))
+    (handler-case
+        (multiple-value-bind (tr credential note) (serve-seat-vnc seat)
+          ;; The seat's clipboard, not the session's: this is one person's password,
+          ;; and pasting it should not hand it to whoever else is sitting here.
+          (when credential
+            (ignore-errors (glass:clipboard-set (seat-clipboard seat) credential
+                                                :owner :vnc :name "vnc password")))
+          (wm-show-vnc-window port (wm-vnc-window-lines tr credential note))
+          tr)
+      (error (e)
+        (wm-show-vnc-window port (list (list :head "VNC could not start")
+                                       (list :warn (princ-to-string e)))
+                            "VNC")
+        nil))))
+
+(defun wm-vnc-menu-items (port &optional seat)
+  "The serving items for SEAT's root menu, built at every open so they say what is true
+   now: a toggle, and — while a credential is in force — a way to see it again.
+
+   THE LABEL NAMES THE PORT WHILE IT IS OPEN, and says when there is no password on it.
+   That is the whole point of putting this on the menu rather than in a launcher: the
+   item is also the indicator, so `am I exposed right now, and to whom' is answered by
+   opening the menu and reading one line, rather than by running `ss' on a box somebody
+   may not have a shell on.
+
+   The `show it again' item exists because the password is generated: a person who
+   closes the window has no way back to a credential nothing else knows, and stopping
+   and restarting VNC to see it would mint a DIFFERENT one and break the viewer that
+   had saved the first."
+  (when seat
+    (let ((tr (seat-vnc-transport seat)))
+      (if tr
+          (let ((credential (transport-credential tr)))
+            (cons (cons (format nil "Stop serving VNC (~a~:[ — NO PASSWORD~;~])"
+                                (transport-endpoint tr) credential)
+                        (lambda () (stop-seat-vnc seat)))
+                  (when credential
+                    (list (cons "Show the VNC password"
+                                (lambda ()
+                                  (wm-show-vnc-window
+                                   port (wm-vnc-window-lines tr credential nil))))))))
+          (list (cons "Serve this seat over VNC…"
+                      (lambda () (wm-start-vnc port seat))))))))
 
 (defun wm-open-selection-menu (port surf x y &optional seat)
   "Open the selection menu over SURF at (X,Y), or return NIL if there is nothing to

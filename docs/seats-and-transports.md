@@ -231,3 +231,64 @@ and admission services still take `:PORT`; `TCP-LISTEN` still returns a raw sock
 outside this tree hold what it returns. Switching a live desktop over is a deployment decision and
 it is one word in one launcher — which is the same shape, and the same refusal to make it for
 somebody else, as the bind address before it.
+
+## What met the code a third time: a credential belongs to a *wire*
+
+A third round, and it took the note's own **work plan** away from it.
+
+**8. "Capture internal to the seat" was never what would fix the password, and it is not needed.**
+The note twice names the same remedy — the table's *"capture is internal to the seat; it never
+authenticates"*, and the closing list's *"capture internal to the seat (which is what makes the VNC
+password stop breaking video)"*. That is an architecture change: the RFB client that feeds VP8 would
+stop being a client and become part of the session. It is not what fixed it. **`GLASS:*VNC-PASSWORD*`
+was one special variable read inside `HANDSHAKE`, so a credential was a property of the SESSION, and
+every listener inherited it at once.** Making it a property of the LISTENER — `SERVE`'s `:PASSWORD`,
+`OPEN-SEAT-TRANSPORT`'s `:PASSWORD`, one slot on `SEAT-TRANSPORT` — is the whole of the fix, and the
+capture stays exactly what it was: an ordinary external RFB client, speaking security type None, on a
+wire that asks it for nothing. The desktop now demands a password on a TCP port and offers None on a
+socket file **in the same process, in the same second**, and the gate proves it by running
+webrtc-data's own `glass-capture.lisp` and encoding a real VP8 keyframe out of what it captured while
+a wrong password is being refused on the port.
+
+This is the fourth costume of the same error, in a note written to catalogue that error: the
+compositor, the mixer, warp's rule 8, the session-conflated-with-one-wire — **and the credential,
+conflated with the session.** The note diagnosed the disease and then prescribed surgery on the
+symptom.
+
+**9. The note asserted a capability the code could not express.** *"A seat that wants VNC opens one,
+on a port it chooses, with a credential it chooses."* The port was true from the moment transports
+existed. The credential was never true and could not be made true by any caller: `SERVE` had no
+password argument at all, so "a credential it chooses" was a sentence with nothing under it. Written
+before the code, it read as a description of the model; read after, it was a promise. It is the
+argument that ought to have been checked first, precisely because it was the one nobody had to
+implement to make the section compile.
+
+**10. The socket file inherited the session password too — the same bug, inside the fix.** Point 5
+introduces the UNIX transport as the strong door, and it was: mode 0600, `SO_PEERCRED`, no key
+material. But the handshake over it read the same global, so an operator who set `~/.glass-vnc-pass`
+would have demanded a DES password **on the wire the capture comes in on** and broken video exactly
+as before — through the mechanism the note had just built to be immune to it. `:RFB-UNIX` now forces
+the credential to `NIL` and says so if you pass one: a socket file's access control is the filesystem
+and the peer's uid, checked by the kernel, which is stronger than DES over a plaintext stream and is
+not fooled by somebody who watched one handshake. Point 7 called a recorded trap "a search pattern";
+so is a recorded *conflation*, and this one was sitting inside the paragraph that fixed the last one.
+
+**11. And the bind address is not always the operator's call.** Twice the note refuses to choose an
+address for somebody — `*SEAT-BIND-ADDRESS*` (point 4's coda) and `*SEAT-TRANSPORT-KIND*` (point 5's).
+Both refusals stand, and both are about a **launcher**, where a person wrote the call and knows the
+box. A root-menu item has nobody to ask. So `SERVE-SEAT-VNC` — the one thing that picks an address on
+a person's behalf — is also the one thing that must not pick an exposing one on their behalf: its
+default is `0.0.0.0` **and it overrules that to `127.0.0.1` whenever there is no credential to go with
+it**, including the case where the image has no DES verifier and a password would only reject
+everybody. `OPEN-SEAT-TRANSPORT` underneath it still binds precisely what it is told.
+
+`0.0.0.0` is the default there, and not by inheritance: with a UNIX socket already present, a
+loopback-only VNC port is a *worse copy of a door that already exists* — everything local is better
+served by the socket file, and the only thing a port adds is somebody on another machine. A feature
+whose default made it useless would be a feature nobody turns on.
+
+### Still not built
+
+**Per-seat admission** (the `invoker` becoming a principal) is unchanged and still wanted. **Capture
+internal to the seat** is struck from the list: it was on it for a reason that no longer exists, and
+nothing else has asked for it.

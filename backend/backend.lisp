@@ -345,7 +345,7 @@
 (defun open-seat-transport (seat &key (kind *seat-transport-kind*)
                                       (port-num (seat-port-num seat))
                                       (address *seat-bind-address*)
-                                      path)
+                                      path (password :inherit))
   "Expose SEAT on a wire: an RFB listener on PORT-NUM at ADDRESS, with SEAT's own screen
    framebuffer, its own wake, its own selection and input callbacks closed over SEAT —
    which is the whole of what a seat is on the wire.  Returns the SEAT-TRANSPORT.
@@ -374,18 +374,47 @@
    A seat may hold both at once: same screen, same hands, two doors.
 
    PASSING :PATH implies :RFB-UNIX, because a path is not something a TCP transport could
-   have meant."
+   have meant.
+
+   PASSWORD IS THIS WIRE'S CREDENTIAL AND NOT THE SESSION'S.  :INHERIT (the default, and
+   what every existing caller gets) is GLASS:*VNC-PASSWORD* read at each handshake — the
+   behaviour glass has always had, live-settable, unchanged.  A string is a credential
+   only this wire's clients are asked for.
+
+   AND ON :RFB-UNIX IT IS FORCED TO NIL, which is a refusal and not an oversight.  A
+   socket file's access control is the filesystem and the peer's uid, checked by the
+   kernel on connect() — stronger than a DES challenge over a plaintext stream, and not
+   fooled by an attacker who has watched one handshake.  Asking for a password there
+   would buy nothing and would break the thing this whole exercise is about: the VP8
+   capture is an RFB client that speaks security type None, it comes in over this socket,
+   and a credential on it locks the video out of the desktop it is filming.  A caller who
+   passes :PASSWORD with :RFB-UNIX is told so and ignored, loudly."
   (when path (setf kind :rfb-unix))
   (ecase kind
     (:rfb (check-type port-num (integer 1 65535)))
-    (:rfb-unix (setf path (or path (seat-socket-path seat)))))
-  (or (find-if (lambda (tr) (and (transport-open-p tr)
-                                 (eq (transport-kind tr) kind)
-                                 (if (eq kind :rfb-unix)
-                                     (equal (transport-path tr) path)
-                                     (and (eql (transport-port-num tr) port-num)
-                                          (equal (transport-address tr) address)))))
-               (seat-transports seat))
+    (:rfb-unix
+     (setf path (or path (seat-socket-path seat)))
+     (unless (or (eq password :inherit) (null password))
+       (warn "open-seat-transport: :PASSWORD is ignored on a UNIX transport (~a) — the ~
+              filesystem and SO_PEERCRED are its access control, and a VNC password here ~
+              would only lock out the capture client, which speaks security type None."
+             path))
+     (setf password nil)))
+  (let ((already (find-if (lambda (tr) (and (transport-open-p tr)
+                                            (eq (transport-kind tr) kind)
+                                            (if (eq kind :rfb-unix)
+                                                (equal (transport-path tr) path)
+                                                (and (eql (transport-port-num tr) port-num)
+                                                     (equal (transport-address tr) address)))))
+                          (seat-transports seat))))
+    ;; Idempotent per WIRE — but a credential is not part of the wire's name, so a second
+    ;; call for the same address and port with a DIFFERENT password would otherwise hand
+    ;; back a listener that does not ask for it, and the caller would go on to tell
+    ;; somebody a password that opens nothing.  Say so instead.
+    (when (and already (not (equal (transport-password already) password)))
+      (error "seat ~a is already serving ~a with a different credential — close it first"
+             (seat-name seat) (transport-endpoint already)))
+    (or already
       (let* ((fb (seat-fb seat)) (port (seat-port seat))
              ;; The seat's OWN keyboard (made by ADD-SEAT), not a new one per listener:
              ;; dictation for this seat types on it, and two transports of one seat are two
@@ -401,6 +430,7 @@
              (tr (make-instance 'seat-transport :seat seat :kind kind
                                                 :address address :port-num port-num
                                                 :path (and (eq kind :rfb-unix) path)
+                                                :password password
                                                 :socket socket)))
         (when (eq kind :rfb) (setf (seat-port-num seat) port-num))
         (setf (transport-thread tr)
@@ -415,6 +445,9 @@
                      (glass:serve fb port-num
                                   :listen     socket
                                   :address    address
+                                  ;; THIS wire's credential — the one thing about a seat's
+                                  ;; transports that is deliberately not shared between them.
+                                  :password   password
                                   :on-key     on-key
                                   :install-injector (seat-primary-p seat)
                                   :on-pointer (lambda (b x y) (glass-on-pointer port b x y seat))
@@ -447,7 +480,7 @@
         ;; GLASS-PORT-SERVER has always meant "the thread serving this screen", and it
         ;; goes on meaning it.
         (setf (seat-server seat) (transport-thread tr))
-        tr)))
+        tr))))
 
 (defun close-seat-transport (transport)
   "Stop TRANSPORT: the port stops listening and its accept loop ends.  T if it was open.
@@ -489,6 +522,136 @@
 (defun seat-serving-p (seat)
   "Is SEAT reachable — does it hold any open transport?"
   (and seat (some #'transport-open-p (seat-transports seat)) t))
+
+;;; ---- plain VNC, on demand, with a credential ---------------------------------
+;;;
+;;; The desktop below this line may be serving nothing at all — a socket file for the
+;;; gateway and no port anywhere — which is the posture the design note argues for and
+;;; the one that leaves a person with a VNC viewer and no way in.  This is the way in:
+;;; a seat opens a TCP wire when somebody asks for one, with a credential minted for
+;;; that wire alone, and closes it again.
+;;;
+;;; It is a separate function from OPEN-SEAT-TRANSPORT because it makes DECISIONS —
+;;; which credential, which interface — that OPEN-SEAT-TRANSPORT deliberately does not:
+;;; that one binds what it is told, as every launcher and gate already relies on.  This
+;;; one is the thing a menu item calls, and a menu item has nobody to ask.
+
+(defparameter *seat-vnc-address* "0.0.0.0"
+  "The interface SERVE-SEAT-VNC binds when nobody says otherwise.
+
+   0.0.0.0 — every interface — and unlike *SEAT-BIND-ADDRESS* that is not inherited
+   caution but a choice, because a loopback-only VNC listener is nearly pointless on
+   this box: a UNIX socket is already there for anything local, and it is better at
+   being local (mode 0600 and SO_PEERCRED beat `any process of any uid'), so a port on
+   127.0.0.1 would be a worse copy of a door that already exists.  What makes THIS door
+   worth opening is that a person with a VNC viewer on another machine can walk through
+   it — which is also why it is opened only when asked for, only with a credential, and
+   closed from the same menu item that opened it.
+
+   THE CREDENTIAL IS THE CONDITION, and it is enforced rather than recommended: with no
+   usable credential SERVE-SEAT-VNC binds loopback whatever this says.  Somebody who
+   turns the password off gets a listener that stops being reachable off-box, not a
+   listener that quietly still is.")
+
+(defparameter *vnc-password-file*
+  (merge-pathnames ".glass-vnc-pass" (user-homedir-pathname))
+  "An operator's own VNC password, one line, if they keep one.  When it exists it WINS
+   over a generated credential, for a reason worth stating: a generated password is new
+   every time the menu item is picked, and a viewer that saved the last one (macOS puts
+   it in the Keychain) would be refused by a desktop that thinks it is being helpful.
+   A person who wants a stable password already has the file — serve-desktop.lisp has
+   read it for as long as it has existed — and this reads the same one.")
+
+(defun vnc-password-file-credential (&optional (file *vnc-password-file*))
+  "The credential in *VNC-PASSWORD-FILE*, or NIL if there is no usable one there."
+  (ignore-errors
+   (when (probe-file file)
+     (let ((pw (string-trim '(#\Space #\Tab #\Newline #\Return)
+                            (with-open-file (in file) (or (read-line in nil "") "")))))
+       (and (plusp (length pw)) pw)))))
+
+(defun loopback-address-p (address)
+  "Is ADDRESS an interface only this box can reach?"
+  (and (stringp address)
+       (or (string= address "localhost") (string= address "::1")
+           (and (>= (length address) 4) (string= "127." (subseq address 0 4))))))
+
+(defun seat-vnc-transport (seat)
+  "SEAT's open TCP (:RFB) transport, or NIL.  The one a person means by `is this
+   desktop on a VNC port right now' — a socket file is not what they are asking about."
+  (and seat (find-if (lambda (tr) (and (transport-open-p tr) (eq (transport-kind tr) :rfb)))
+                     (seat-transports seat))))
+
+(defun local-address (&optional (fallback "this host"))
+  "The address of the interface that would carry a packet off this box — what somebody
+   should point a VNC viewer at, as opposed to 0.0.0.0, which is what we BOUND and is
+   not an address anybody can connect to.  Asked of the routing table by opening a UDP
+   socket towards a public address and reading back the local end: no packet is sent
+   (UDP connect() is a routing decision, not a handshake) and nothing is contacted."
+  (or (ignore-errors
+       (let ((sock (make-instance 'sb-bsd-sockets:inet-socket :type :datagram :protocol :udp)))
+         (unwind-protect
+              (progn (sb-bsd-sockets:socket-connect
+                      sock (sb-bsd-sockets:make-inet-address "1.1.1.1") 53)
+                     (multiple-value-bind (addr port) (sb-bsd-sockets:socket-name sock)
+                       (declare (ignore port))
+                       (format nil "~{~d~^.~}" (coerce addr 'list))))
+           (ignore-errors (sb-bsd-sockets:socket-close sock)))))
+      fallback))
+
+(defun serve-seat-vnc (seat &key (port-num (seat-port-num seat))
+                                 (address *seat-vnc-address*)
+                                 (password :generate))
+  "Expose SEAT on a TCP VNC port with a credential of its own.  Returns
+   (values TRANSPORT CREDENTIAL NOTE) — NOTE is a string when something was decided
+   differently from what was asked, and NIL when it was not.
+
+   THE CREDENTIAL, in order: PASSWORD if a string; else *VNC-PASSWORD-FILE* if it holds
+   one; else a fresh GLASS:MAKE-VNC-CREDENTIAL.  PASSWORD NIL means the caller has
+   deliberately asked for an open wire and gets one — on loopback.
+
+   IT ASKS WHETHER THE IMAGE CAN VERIFY A PASSWORD AT ALL, which is not paranoia: the
+   DES verifier is the optional :glass/vncauth system, and a desktop without it that
+   sets a password does not become secure, it becomes UNREACHABLE (the handshake fails
+   closed and rejects every client).  A listener nobody can use is not the answer to
+   `let me in', so with no verifier this serves WITHOUT a credential and — because of
+   that — on loopback, and says so in NOTE rather than either lying or refusing.
+
+   AND WITH NO CREDENTIAL IT WILL NOT BIND OFF-BOX.  ADDRESS is honoured when there is
+   a password to go with it and overridden to 127.0.0.1 when there is not.  That is the
+   one place glass overrules an explicit argument, and it is this narrow on purpose:
+   this function is the one that chooses an address on a person's behalf (the menu item
+   has nobody to ask), and choosing on their behalf is exactly what obliges it not to
+   choose an exposure they did not agree to.  OPEN-SEAT-TRANSPORT below it still binds
+   precisely what it is told."
+  (let* ((verifier (glass:vnc-auth-available-p))
+         (asked address)
+         (credential (cond ((stringp password) password)
+                           ((null password) nil)
+                           ((not verifier) nil)
+                           (t (or (vnc-password-file-credential) (glass:make-vnc-credential)))))
+         ;; FORMAT NIL and not a literal: a `~' continuation is a FORMAT directive, and
+         ;; this string is printed with ~A by its caller, where the tildes would survive.
+         (note (cond ((and (not verifier) (not (null password)))
+                      (format nil "no DES verifier in this image (:glass/vncauth is not ~
+                                   loaded), so a password could only reject every client: ~
+                                   serving WITHOUT one, on loopback only"))
+                     ((null credential)
+                      "no credential was asked for: serving on loopback only")))
+         (address (if credential address "127.0.0.1")))
+    (when (and note (not (equal asked address)))
+      (setf note (format nil "~a (asked for ~a)" note asked)))
+    (values (open-seat-transport seat :kind :rfb :port-num port-num
+                                      :address address :password credential)
+            credential
+            note)))
+
+(defun stop-seat-vnc (seat)
+  "Close SEAT's TCP VNC transport.  T if there was one.  Any UNIX transport it holds —
+   the gateway's, the capture's — is left exactly alone: they are different doors, and
+   this item is about the one that faces the network."
+  (let ((tr (seat-vnc-transport seat)))
+    (and tr (close-seat-transport tr))))
 
 (defun start-seat-server (seat)
   "Start the RFB listener for SEAT on SEAT-PORT-NUM.  Idempotent.

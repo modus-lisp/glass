@@ -262,6 +262,27 @@ lives in [seal](https://github.com/modus-lisp/seal); load the optional
 absent fails closed). macOS saves a working password to its Keychain and stops
 prompting.
 
+**A credential belongs to one listener, not to the session.** `glass:*vnc-password*`
+is what a listener that named none inherits (read at each handshake, so setting it
+live still reaches a running one); `(serve fb port :password "…")` gives *that* wire
+its own, and `:password nil` gives it none whatever the variable says. That
+distinction is why a password no longer breaks video: the VP8 capture is an RFB
+client that speaks `None`, and a session-wide password locked it out of the desktop
+it was filming. A seat can now demand a password on a TCP port and demand nothing on
+its UNIX socket, at once — and `clim-glass:open-seat-transport` forces the credential
+off on `:rfb-unix`, whose access control is the filesystem and `SO_PEERCRED` instead.
+
+**On demand, from the root menu.** A desktop reachable only over socket files can put
+one seat on a plain VNC port while it runs: right-click the workspace → *Serve this
+seat over VNC…*. It mints an 8-character credential (`glass:make-vnc-credential` —
+eight because the VNC-auth DES key *is* eight bytes, so a longer one would be
+theatre), opens the port, and shows the address, port and password in a window, with
+the password on that seat's clipboard. The item then reads *Stop serving VNC
+(0.0.0.0:5901)* — the label is the exposure indicator — and picking it closes the
+port for real. With no credential (`~/.glass-vnc-pass` overrides the generated one;
+`:password nil` declines it) the listener is bound to loopback instead of being
+quietly exposed. See `docs/seats-and-transports.md`.
+
 ## Build & test
 
 Pure Common Lisp; the runtime dependencies are `sb-bsd-sockets` and

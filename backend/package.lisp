@@ -18,4 +18,10 @@
            #:seat-serving-p #:seat-transports #:transport-open-p
            #:transport-kind #:transport-address #:transport-port-num
            #:transport-path #:transport-endpoint #:seat-socket-path
-           #:*seat-bind-address* #:*seat-transport-kind*))
+           #:*seat-bind-address* #:*seat-transport-kind*
+           ;; a credential belongs to ONE wire, not to the session
+           #:transport-password #:transport-credential #:transport-authenticated-p
+           ;; plain VNC on demand: the root-menu item's two verbs, and the policy
+           #:serve-seat-vnc #:stop-seat-vnc #:seat-vnc-transport
+           #:*seat-vnc-address* #:*vnc-password-file* #:vnc-password-file-credential
+           #:local-address #:loopback-address-p))

@@ -41,7 +41,7 @@
     framebuffer and its ZRLE tables.  No McCLIM, no window manager — a REMOTE is a
     framebuffer, two input functions and a thread.")
   (:export #:remote #:remote-p #:connect-remote #:remote-stop
-           #:remote-fb #:remote-host #:remote-port #:remote-name
+           #:remote-fb #:remote-host #:remote-port #:remote-name #:remote-password
            #:remote-state #:remote-connected-p #:remote-width #:remote-height
            #:remote-key #:remote-pointer #:remote-take-dirty #:remote-take-copy
            #:remote-on-resize #:remote-report #:remote-stats
@@ -173,6 +173,7 @@
 
 (defstruct (remote (:conc-name remote-) (:constructor %make-remote))
   host port
+  password                                  ; NIL = security type None only; a string = VNC auth
   fb                                        ; the local framebuffer holding the remote screen
   (name "" :type string)                    ; the remote's desktop name
   (state :connecting)                       ; :connecting | :up | :down
@@ -578,26 +579,54 @@
    and kept anyway: every caller in this tree and outside it says %TCP-CONNECT.)"
   (glass:open-connection :host host :port port))
 
+(defun %vnc-auth (r s)
+  "The VNC-auth (security type 2) challenge/response, client side: read the 16-byte
+   challenge, DES it under the password, write the 16-byte response.
+
+   The DES lives in the OPTIONAL :glass/vncauth system, and it is resolved here by
+   FUNCALLing a symbol rather than compiled in, for the same reason the server hooks
+   its verifier: a client that only ever talks to unauthenticated desktops must not
+   drag seal into its image.  Absent, this says so — a password nobody can compute is
+   a clearer failure than a handshake that stalls."
+  (let ((challenge (r-bytes s 16)))
+    (unless (fboundp 'glass:vnc-auth-response)
+      (error "glass-client: this server wants a VNC password and :glass/vncauth (the DES) ~
+              is not loaded in this image"))
+    (write-sequence (funcall 'glass:vnc-auth-response (remote-password r) challenge) s)
+    (force-output s)))
+
 (defun %handshake (r s)
-  "RFB 3.8 up to ServerInit, then our SetPixelFormat and SetEncodings.  Security
-   type None only: this is a client for desktops on the same trust boundary as the
-   one running it (VNC's DES challenge is not what would be protecting them), and a
-   server that will not offer None is one to say so about rather than half-support."
+  "RFB 3.8 up to ServerInit, then our SetPixelFormat and SetEncodings.
+
+   SECURITY: None, or — when this REMOTE was given a PASSWORD — VNC auth (type 2).  A
+   password is offered only if the server asks for one, so the same client still reaches
+   an open desktop unchanged; without a password and with no None on offer, this says so
+   rather than half-supporting the handshake.
+
+   The password exists because a seat's transports no longer share a credential: the
+   socket file the capture comes in on asks for nothing and the TCP port a stranger can
+   reach asks for a password, at the same moment, in one desktop.  A client that could
+   only speak None could only test one half of that."
   (let ((ver (r-bytes s 12)))
     (declare (ignore ver))
     (write-sequence (map '(simple-array (unsigned-byte 8) (*)) #'char-code
                          (format nil "RFB 003.008~c" #\Newline)) s)
     (force-output s))
-  (let ((ntypes (r-u8 s)))
-    (when (zerop ntypes)                                   ; failure: u32 length + reason
-      (let* ((len (r-u32 s)) (reason (r-bytes s len)))
-        (error "glass-client: server refused the connection: ~a"
-               (map 'string #'code-char reason))))
-    (let ((types (r-bytes s ntypes)))
-      (unless (find 1 types :end ntypes)
-        (error "glass-client: server offers no None security type (~a)"
-               (coerce (subseq types 0 ntypes) 'list)))))
-  (w-u8 s 1) (force-output s)
+  (let ((chosen 1))
+    (let ((ntypes (r-u8 s)))
+      (when (zerop ntypes)                                 ; failure: u32 length + reason
+        (let* ((len (r-u32 s)) (reason (r-bytes s len)))
+          (error "glass-client: server refused the connection: ~a"
+                 (map 'string #'code-char reason))))
+      (let ((types (subseq (r-bytes s ntypes) 0 ntypes)))
+        (cond ((find 1 types) (setf chosen 1))
+              ((and (remote-password r) (find 2 types)) (setf chosen 2))
+              ((find 2 types)
+               (error "glass-client: server requires a VNC password and none was given"))
+              (t (error "glass-client: server offers no security type we speak (~a)"
+                        (coerce types 'list))))))
+    (w-u8 s chosen) (force-output s)
+    (when (= chosen 2) (%vnc-auth r s)))
   (let ((res (r-u32 s)))
     (unless (zerop res)
       (let* ((len (r-u32 s)) (reason (r-bytes s len)))
@@ -751,13 +780,18 @@
 
 ;;; ---- the public handle ------------------------------------------------------
 
-(defun connect-remote (host port &key fb (width 1280) (height 800) on-resize)
+(defun connect-remote (host port &key fb (width 1280) (height 800) on-resize password)
   "Open a live view of the RFB server at HOST:PORT.  Returns immediately with a
    REMOTE whose framebuffer starts out WIDTH x HEIGHT (or FB, if you brought your
    own — a window manager has usually already made one) and becomes the remote's
    size the moment the handshake says what that is.  ON-RESIZE (w h) fires whenever
-   the remote's size changes, including that first time."
-  (let ((r (%make-remote :host host :port port
+   the remote's size changes, including that first time.
+
+   PASSWORD, when the server asks for one (security type 2, VNC auth): needs
+   :glass/vncauth loaded for the DES.  It is kept for the life of the REMOTE because
+   this client RECONNECTS, and a credential that only worked the first time would give
+   a window that goes blank the first time the desktop restarts."
+  (let ((r (%make-remote :host host :port port :password password
                          :fb (or fb (glass:make-framebuffer width height (glass:rgb 24 24 24)))
                          :on-resize on-resize)))
     (%notice r (format nil "~a:~d — connecting…" host port))

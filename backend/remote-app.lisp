@@ -37,7 +37,7 @@
     process behind its own port.")
   (:export #:remote-surface #:remote-surface-fn #:register
            #:*remote-host* #:*remote-port* #:*remote-title*
-           #:*remotes* #:remotes-report))
+           #:*remotes* #:remotes-report #:*remote-password*))
 
 (in-package #:glass-remote)
 
@@ -49,6 +49,13 @@
    point the menu entry somewhere else.")
 (defparameter *remote-title* nil
   "Window title, or NIL to use \"host:port\" until the remote says its own name.")
+
+(defparameter *remote-password* nil
+  "The VNC password for that desktop, if it asks for one.  It can now: a glass seat
+   serves plain VNC with a credential of its own (CLIM-GLASS:SERVE-SEAT-VNC), so the
+   desktop this window opens onto may well be one that demands a password while its
+   own socket file demands nothing.  NIL keeps the old behaviour exactly — security
+   type None, and a clear error from a server that wants more.")
 
 (defvar *remotes* '()
   "Every live REMOTE this desktop has opened, newest first — so a control socket can
@@ -97,13 +104,17 @@
 
 ;;; ---- the surface -----------------------------------------------------------
 
-(defun remote-surface-fn (&key (host *remote-host*) (port *remote-port*))
+(defun remote-surface-fn (&key (host *remote-host*) (port *remote-port*)
+                               (password *remote-password*))
   "A MAKE-FN for ADD-SURFACE / the (:surface ...) window spec, connected to
    HOST:PORT.  Called with a fresh framebuffer, it returns the surface contract:
-   (values ON-KEY ON-POINTER DIRTY-P COPY-P CLOSE-FN)."
+   (values ON-KEY ON-POINTER DIRTY-P COPY-P CLOSE-FN).
+
+   PASSWORD is passed to the client for a remote that asks for VNC auth (needs
+   :glass/vncauth for the DES)."
   (lambda (fb)
     (let* ((*remote-host* host) (*remote-port* port)
-           (r (gc:connect-remote host port :fb fb)))
+           (r (gc:connect-remote host port :fb fb :password password)))
       (push r *remotes*)
       (setf (gc:remote-on-resize r)
             (lambda (w h)
@@ -137,7 +148,7 @@
 ;;; ---- the menu entry ---------------------------------------------------------
 
 (defun register (&key (label "Remote desktop") (host *remote-host*) (port *remote-port*)
-                      (width 1280) (height 800))
+                      (password *remote-password*) (width 1280) (height 800))
   "Put LABEL in the workspace root menu, opening a window onto the glass desktop at
    HOST:PORT.  WIDTH x HEIGHT is only the size the window opens at — the handshake
    replaces it with the remote's real size within a frame.  Found by name, the way
@@ -146,7 +157,7 @@
   (let ((reg (find-symbol "REGISTER-APP" '#:clim-glass)))
     (when (and reg (fboundp reg))
       (funcall reg label
-               (list :surface (remote-surface-fn :host host :port port)
+               (list :surface (remote-surface-fn :host host :port port :password password)
                      :title (or *remote-title* (format nil "~a:~d" host port))
                      :width width :height height))
       label)))
