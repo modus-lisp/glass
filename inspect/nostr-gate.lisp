@@ -68,6 +68,13 @@
 
 (defun hexkey (n) (string-downcase (format nil "~64,'0x" n)))   ; a pubkey-shaped string per N
 
+(defun namedkey (prefix)
+  "A pubkey-shaped string that STARTS with PREFIX, so its first eight characters identify it.
+HEXKEY pads on the LEFT, which makes every key it produces start with zeros — fine until a test
+revokes by an 8-character prefix, at which point `00000000' matches the whole fleet.  (It did.)"
+  (string-downcase (concatenate 'string prefix
+                                (make-string (- 64 (length prefix)) :initial-element #\0))))
+
 (defun slurp (path)
   "PATH's whole text, or \"\" if it is not there.  The code store is asserted against its FILE and
 not only against the process's memory, because the file is the half that survives a restart."
@@ -209,6 +216,205 @@ not only against the process's memory, because the file is the half that survive
            (and (null (glass:revoke-enrolments "22")) (glass:device-enrolled-p *guest*))))
 
 ;;; ==============================================================================
+(banner "an enrolment is a RECORD — and `revoke' marks it rather than destroying it")
+;;; ==============================================================================
+;;;
+;;; `<pubkey> <expiry>' could not answer any of the questions the ALREADY REDEEMED alarm makes
+;;; somebody ask — how did this key get in, when, on whose authority, and was it REMOVED or did it
+;;; simply LAPSE — and revoking destroyed the evidence it was performed for.  These are those
+;;; questions, asked of the store after the fact.
+
+(defun record-of (pk) (glass:device-enrolment pk))
+(defun file-line-for (pk)
+  "The line the FILE holds for PK, or NIL.  Asserted against the file rather than the table
+wherever it matters, because the file is the half that survives a restart."
+  (with-open-file (s *fixture* :if-does-not-exist nil)
+    (when s (loop for l = (read-line s nil) while l
+                  when (eql 0 (search pk l)) return l))))
+
+(glass:revoke-enrolments "all")
+(let ((glass:*enrolments* (make-hash-table :test 'equal)))
+  (declare (ignore glass:*enrolments*)))          ; (kept explicit: nothing is cached across this)
+
+(format t "~&   -- what a record carries --~%")
+(let ((term (namedkey "4ec00001")))
+  (glass:enrol-device term glass:*enrolment-ttl*
+                      :via :code :nonce "cafebabecafebabecafebabecafebabe" :for *owner*)
+  (let ((r (record-of term)))
+    (ok "an admitted terminal has a record, not a row" (typep r 'glass:enrolment))
+    (ok "  …active, with an expiry" (and (eq :active (glass:enrolment-state r))
+                                         (> (glass:enrolment-expiry r) (glass:unix-now))))
+    (ok "  …WHAT ADMITTED IT" (eq :code (glass:enrolment-via r)))
+    (ok "  …ITS PROVENANCE: the nonce it traded, and who that code was minted for"
+        (and (equal "cafebabecafebabecafebabecafebabe" (glass:enrolment-nonce r))
+             (equal *owner* (glass:enrolment-issued r))))
+    (ok "  …when it was created and when it was last seen"
+        (and (plusp (glass:enrolment-created r)) (plusp (glass:enrolment-seen r))))
+    (ok "  …and the cause of the state it is in" (equal "first-admission" (glass:enrolment-cause r)))
+    (ok "and every field of it is on disk, in one greppable line"
+        (let ((l (file-line-for term)))
+          (and l (search "active" l) (search "code" l) (search "cafebabe" l)
+               (search (subseq *owner* 0 8) l)))
+        (file-line-for term)))
+  ;; RENEWAL MOVES THE CLOCKS AND NOT THE PROVENANCE.  Every admission after the first is `device';
+  ;; a record that reported the LAST one would answer "how did this key get in" with "it was
+  ;; already in", which is no answer at all.
+  (let ((created (glass:enrolment-created (record-of term))))
+    (sleep 1.1)
+    (glass:enrol-device term glass:*enrolment-ttl* :via :device)
+    (let ((r (record-of term)))
+      (ok "a renewal moves LAST SEEN" (> (glass:enrolment-seen r) created))
+      (ok "  …and leaves CREATED and the provenance exactly where they were"
+          (and (eql created (glass:enrolment-created r))
+               (eq :code (glass:enrolment-via r))
+               (equal *owner* (glass:enrolment-issued r)))))))
+
+(format t "~&   -- revoked and expired are different ends, and both are findable --~%")
+(let ((gone (namedkey "4ec10002")) (lapsed (namedkey "4ec20003")) (at (glass:unix-now)))
+  (glass:enrol-device gone glass:*enrolment-ttl* :via :code)
+  (glass:enrol-device lapsed -5 :via :device)          ; already past its expiry
+  (glass:revoke-enrolments (subseq gone 0 8) :by *owner*)
+  (let ((r (record-of gone)) (l (record-of lapsed)))
+    (ok "A REVOKED ENROLMENT IS STILL THERE — the line was marked, not deleted"
+        (and r (eq :revoked (glass:enrolment-state r))))
+    (ok "  …with the time it happened" (>= (glass:enrolment-since r) at))
+    (ok "  …and the CAUSE, naming the authority it was performed on"
+        (equal (format nil "revoked-by-~a" (subseq *owner* 0 8)) (glass:enrolment-cause r))
+        (glass:enrolment-cause r))
+    (ok "  …and it admits nobody, which is the actual job" (not (glass:device-enrolled-p gone)))
+    (ok "AN EXPIRED ONE IS DISTINGUISHABLE FROM IT — a different state and a different cause"
+        (and l (eq :expired (glass:enrolment-state l)) (equal "lapsed" (glass:enrolment-cause l))))
+    (ok "neither is listed as enrolled, and neither is in the live pairs LIST-ENROLMENTS returns"
+        (notany (lambda (p) (member (car p) (list gone lapsed) :test #'equal))
+                (glass:list-enrolments)))
+    (ok "but both are in the records, asked for by state"
+        (and (member gone (glass:list-enrolment-records :state :revoked)
+                     :key #'glass:enrolment-pubkey :test #'equal)
+             (member lapsed (glass:list-enrolment-records :state :expired)
+                     :key #'glass:enrolment-pubkey :test #'equal)))
+    (ok "and FIND-ENROLMENTS answers the question an alarm actually asks — by prefix, any state"
+        (equal (list gone) (mapcar #'glass:enrolment-pubkey
+                                   (glass:find-enrolments (subseq gone 0 8))))))
+  ;; THE COMPATIBILITY PROPERTY.  A reader that knows nothing about states takes `$1 $2' — so a
+  ;; revoked record has to read as one that has run out, or keeping the line would be WORSE than
+  ;; deleting it: an unaware reader would report a revoked terminal as enrolled.
+  (let* ((l (file-line-for gone))
+         (w (and l (glass:normalize-pubkey (subseq l 0 64))))
+         (exp (and l (parse-integer (subseq l 65 (position #\Space l :start 65))))))
+    (ok "TO A TWO-FIELD READER a revoked record reads as one that has expired"
+        (and w (equal w gone) (<= exp (glass:unix-now)))
+        l))
+  (ok "and a revoked key that comes back gets a new record saying so"
+      (progn (glass:enrol-device gone glass:*enrolment-ttl* :via :code)
+             (and (glass:device-enrolled-p gone)
+                  (equal "re-admitted-after-revoke" (glass:enrolment-cause (record-of gone)))))))
+
+(format t "~&   -- and a reader never sees the store mid-rewrite, which is how this broke before --~%")
+;; THE BUG THIS IS AGAINST: %SAVE-ENROLMENTS opens the file for :SUPERSEDE, which TRUNCATES it.  A
+;; reader that syncs on an mtime change between the truncation and the write reloads from an EMPTY
+;; file — and if the writer's own mtime lands last, nothing ever re-reads and every terminal is
+;; un-enrolled until something else touches the file.  It went unnoticed for as long as nothing
+;; admitted two peers at the same instant.  The records made the write longer, so the window would
+;; be wider, so it is run again rather than assumed.
+(let ((floor* (glass:enrolment-count)) (dips 0) (stop nil))
+  (let ((watcher (sb-thread:make-thread
+                  (lambda ()
+                    (loop until stop do
+                      (when (< (glass:enrolment-count) floor*) (incf dips))))
+                  :name "enrolment-reader")))
+    (let ((writers (loop for i below 12
+                         collect (let ((i i))
+                                   (sb-thread:make-thread
+                                    (lambda ()
+                                      (dotimes (k 20)
+                                        (glass:enrol-device
+                                         (namedkey (format nil "c0~2,'0d~2,'0d00" i k))
+                                         glass:*enrolment-ttl* :via :code)))
+                                    :name "enrolment-writer")))))
+      (mapc #'sb-thread:join-thread writers))
+    (setf stop t)
+    (sb-thread:join-thread watcher))
+  (ok "240 concurrent enrolments, read continuously: THE COUNT NEVER DIPS"
+      (zerop dips)
+      (format nil "started at ~d, ended at ~d, dips: ~d" floor* (glass:enrolment-count) dips))
+  (ok "  …and all of them are in the file, which is the half that survives a restart"
+      (let ((glass:*enrolments* (make-hash-table :test 'equal))
+            (glass::*enrolments-mtime* nil))
+        (= (glass:enrolment-count) (+ floor* 240)))))
+;; …and put the store back the way the checks below expect to find it
+(dolist (e (glass:list-enrolment-records))
+  (when (eql 0 (search "c0" (glass:enrolment-pubkey e)))
+    (glass:revoke-enrolments (subseq (glass:enrolment-pubkey e) 0 8))))
+
+(format t "~&   -- migration: the two-field file this box used to write --~%")
+(let ((old (namedkey "01d10004")) (older (namedkey "01d20005")))
+  (sleep 1.1)                                   ; file-write-date has one-second resolution
+  (with-open-file (s *fixture* :direction :output :if-exists :supersede)
+    (format s "~a ~a~%~a ~a~%" old (+ (glass:unix-now) 86400) older (- (glass:unix-now) 10)))
+  (glass:sync-enrolments)
+  (ok "A TWO-FIELD LINE LOADS AS AN ACTIVE ENROLMENT — no conversion step and no flag day"
+      (and (glass:device-enrolled-p old) (eq :active (glass:enrolment-state (record-of old)))))
+  (ok "  …with the history it does not have left honestly empty"
+      (and (zerop (glass:enrolment-created (record-of old)))
+           (null (glass:enrolment-via (record-of old)))))
+  (ok "  …and a lapsed two-field line is expired, not enrolled"
+      (and (not (glass:device-enrolled-p older))
+           (eq :expired (glass:enrolment-state (record-of older)))))
+  ;; A RESTART: the file is all there is, and it must not lose an enrolment.
+  (glass:enrol-device old glass:*enrolment-ttl* :via :device)      ; rewrites in the new format
+  (let ((glass:*enrolments* (make-hash-table :test 'equal))
+        (glass::*enrolments-mtime* nil))
+    (ok "AND A RESTART PRESERVES THE ENROLMENTS — a fresh table, read from the file alone"
+        (and (glass:device-enrolled-p old) (not (glass:device-enrolled-p older))))
+    (ok "  …including the settled records, which is what makes them findable tomorrow"
+        (eq :expired (glass:enrolment-state (record-of older))))))
+
+(format t "~&   -- and a HOT PATCH over a running desktop does not silently deny everybody --~%")
+;; *ENROLMENTS* is a DEFVAR, so an image that loads this file while it is serving keeps the table it
+;; had — and before this change that table was `pubkey -> expiry integer'.  Those read as `not
+;; enrolled', and the file has not changed, so nothing would re-read.  Simulated exactly: put the old
+;; shape back under a live sync.
+(let ((patched (namedkey "40714001")))
+  (glass:enrol-device patched)
+  (sb-thread:with-mutex (glass::*enrolments-lock*)
+    (clrhash glass:*enrolments*)
+    (setf (gethash patched glass:*enrolments*) (+ (glass:unix-now) 86400)))   ; the OLD shape
+  (ok "a table left over from the previous build is re-read from the file, not believed"
+      (and (glass:device-enrolled-p patched)
+           (typep (record-of patched) 'glass:enrolment)))
+  (glass:revoke-enrolments (subseq patched 0 8)))
+
+(format t "~&   -- retention: two weeks by default, and zero really means nothing is kept --~%")
+(ok "the default is a fortnight" (eql 1209600 glass:*audit-retention*))
+(let ((old (namedkey "0edd0006")))
+  (glass:enrol-device old -100 :via :code)
+  (ok "a record settled inside the window is kept" (not (null (record-of old))))
+  (let ((glass:*audit-retention* 50))
+    ;; the boundary: settled 100 s ago, a 50 s window.  The prune runs on the next write.
+    (glass:enrol-device (namedkey "0ede0007") glass:*enrolment-ttl*)
+    (ok "RETENTION PRUNES AT THE BOUNDARY — one settled longer ago than the window is gone"
+        (and (null (record-of old)) (null (file-line-for old))))))
+(let ((glass:*audit-retention* 0)
+      (live (namedkey "0e000008")) (dead (namedkey "0e010009")))
+  (glass:enrol-device live glass:*enrolment-ttl* :via :code :nonce "deadbeef" :for *owner*)
+  (glass:enrol-device dead glass:*enrolment-ttl* :via :code)
+  (glass:revoke-enrolments (subseq dead 0 8) :by *owner*)
+  (ok "AT ZERO A REVOKED RECORD IS GONE IMMEDIATELY — the opt-out is real, not a shorter window"
+      (and (null (record-of dead)) (null (file-line-for dead))))
+  (ok "  …and nothing that constitutes a log is written for a LIVE one either"
+      (let ((r (record-of live)))
+        (and (glass:device-enrolled-p live)
+             (zerop (glass:enrolment-created r)) (zerop (glass:enrolment-seen r))
+             (null (glass:enrolment-via r)) (null (glass:enrolment-nonce r))
+             (null (glass:enrolment-issued r)))))
+  (ok "  …so the file is the two-field store this box kept before any of this"
+      (let ((l (file-line-for live)))
+        (and l (= 2 (length (remove "" (glass::%split-on l #\Space) :test #'string=)))))
+      (file-line-for live)))
+(ok "and turning it back on does not retroactively invent a history"
+    (zerop (glass:enrolment-created (record-of (namedkey "0e000008")))))
+
+;;; ==============================================================================
 (banner "admission — three ways in, first match wins")
 ;;; ==============================================================================
 
@@ -230,6 +436,29 @@ not only against the process's memory, because the file is the half that survive
   (ok "the owner is admitted by the allowlist" (eq :allowlist via))
   (ok "and is handed NO bearer credential — an owner has a signer and does not need one"
       (null token)))
+
+;;; ---- THE FACT THE CLIENT COULD NOT OTHERWISE HAVE ----------------------------
+;;; A denial is answered with SILENCE by design, so a browser holding a lapsed device key had no way
+;;; to learn that except by offering into the dark and concluding by timeout — half a minute of a
+;;; page looking broken before it could offer the way back in.  So an admission says when the
+;;; enrolment it just granted runs out, and the browser stores it against this box.
+
+(format t "~&   -- an admission says when the enrolment it granted runs out --~%")
+(let ((peer (namedkey "e5911001")))
+  (multiple-value-bind (via nil* nil** expires) (glass:admit-peer peer (glass:mint-login-token :ttl 900))
+    (declare (ignore nil* nil**))
+    (ok "ADMIT-PEER hands back the enrolment's EXPIRY as its fourth value" (eq :code via))
+    (ok "  …and it is the store's own answer, not a guess"
+        (and (integerp expires)
+             (eql expires (glass:enrolment-expiry (glass:device-enrolment peer)))))
+    (ok "  …a whole *ENROLMENT-TTL* into the future"
+        (> expires (+ (glass:unix-now) (- glass:*enrolment-ttl* 60)))))
+  (multiple-value-bind (via nil* nil** expires) (glass:admit-peer peer nil)
+    (declare (ignore nil* nil**))
+    (ok "a reconnecting terminal is told the RENEWED expiry, which is what keeps the number true"
+        (and (eq :device via) (integerp expires))))
+  (ok "and a refused peer is told nothing, because nothing was enrolled"
+      (null (nth-value 3 (glass:admit-peer (namedkey "e5911002") "garbage")))))
 
 (multiple-value-bind (via nil* status) (glass:admit-peer *guest* "garbage")
   (declare (ignore nil*))
@@ -576,14 +805,43 @@ not only against the process's memory, because the file is the half that survive
   (ok "  …and a stranger gets :expired rather than :spent — expiry is checked first, and is the
        unremarkable one a failure screen must be able to tell apart from the rest"
       (eq :expired (third (quietly (lambda () (glass:admit-peer (hexkey #x5406) short))))))
+  ;; ---- THE TWO LIFETIMES, PROVED APART ---------------------------------------------------
+  ;; A spent code has two clocks and they are not the same clock.  For CORRECTNESS the nonce need
+  ;; only be remembered until it expires — minutes — because the MAC refuses it from that instant
+  ;; with no help from any store.  For FORENSICS the redemption is worth keeping for the whole
+  ;; retention window: `who traded that link' is the question the leak alarm makes somebody ask,
+  ;; and it is asked hours later.  One number for both gives an unbounded store or an empty audit
+  ;; trail exactly for the codes that mattered.  This is where they are shown to be separate.
   (let ((nonce (nth-value 1 (glass:verify-login-token short))))
     (ok "the row was written while the code was live" (search nonce (slurp (glass:login-code-file))))
     ;; the prune runs inside the next transition's critical section
     (glass:redeem-nonce (hexkey #xF00D) (hexkey #xBEEF) (+ (glass:unix-now) 900))
-    (ok "after the next redemption the expired row is pruned from memory"
-        (null (glass:find-login-code nonce)))
-    (ok "  …and from the file, so the store stays a handful of lines"
-        (not (search nonce (slurp (glass:login-code-file)))))))
+    (let ((row (glass:find-login-code nonce)))
+      (ok "THE REDEMPTION RECORD SURVIVES THE CODE — the row is still there after its expiry"
+          (and row (eq :redeemed (glass:code-state row))))
+      (ok "  …still naming the key that traded it, which is the whole forensic point"
+          (and row (equal owner-of-it (glass:code-redeemer row))))
+      (ok "  …and it is on disk, not merely in this process"
+          (search nonce (slurp (glass:login-code-file))))
+      (ok "  …but it is NOT redeemable: the short lifetime is the code's own expiry"
+          (and row (not (glass:code-live-p row))))
+      (ok "  …so REDEEM-NONCE answers :EXPIRED even to the key that holds it, record or no record"
+          (multiple-value-bind (ok* state) (glass:redeem-nonce owner-of-it nonce
+                                                              (glass:code-expiry row))
+            (and (null ok*) (eq :expired state))))
+      (ok "  …and a stranger cannot take it either, which a surviving row must never enable"
+          (null (nth-value 0 (glass:redeem-nonce (hexkey #x5407) nonce
+                                                 (glass:code-expiry row)))))
+      (ok "  …and it is not counted among the live codes, so `how many are outstanding' still means it"
+          (notany (lambda (c) (equal (glass:code-nonce c) nonce))
+                  (remove-if-not #'glass:code-live-p (glass:list-login-codes)))))
+    ;; and the LONG lifetime ends too.  With retention off, the record is dropped at the same
+    ;; instant it always was — which is what makes this a dial and not a leak.
+    (let ((glass:*audit-retention* 0))
+      (glass:redeem-nonce (hexkey #xF00C) (hexkey #xBEEC) (+ (glass:unix-now) 900))
+      (ok "WITH RETENTION AT ZERO the spent row is dropped at the code's expiry, as it always was"
+          (null (glass:find-login-code nonce)))
+      (ok "  …and it is gone from the file too" (not (search nonce (slurp (glass:login-code-file))))))))
 
 (format t "~&   -- an outstanding code that nobody ever taps is pruned too --~%")
 (let ((stale (glass:mint-login-token :ttl 1 :for (hexkey #x57A1E))))
@@ -695,6 +953,14 @@ not only against the process's memory, because the file is the half that survive
                       (length r))))
         (glass:verify-login-token (subseq r (+ at 6) end))))
   (ok "owner: devices -> the list" (search "enrolled terminal" (reply *owner* "devices")))
+  (ok "owner: devices all -> the record too, with what happened to the ones that are gone"
+      (let ((r (progn (glass:enrol-device (namedkey "d0c00001"))
+                      (glass:revoke-enrolments "d0c00001" :by *owner*)
+                      (reply *owner* "devices all"))))
+        (and (search "d0c00001" r) (search "REVOKED" r) (search "revoked-by-11111111" r)))
+      (reply *owner* "devices all"))
+  (ok "  …and a bare `devices' still shows only the live ones, which is what it always meant"
+      (not (search "d0c00001" (reply *owner* "devices"))))
   (ok "owner: help -> mentions the management commands it may use"
       (let ((r (reply *owner* "help"))) (and (search "devices" r) (search "revoke" r))))
   (ok "owner is classified :allowlist" (eq :allowlist (role *owner* "help")))
@@ -803,6 +1069,46 @@ not only against the process's memory, because the file is the half that survive
       (and (search "rows=1" head)
            (eql 0 (search *rando* (first rows)))
            (parse-integer (subseq (first rows) 65) :junk-allowed t))))
+
+;;; ---- the expiry, and the record, over the wire -------------------------------
+;;; The chain the client's half of this rests on: the desktop decides and knows the expiry, the
+;;; reply carries it, and a transport copies it into the answer envelope.  This is the middle link.
+
+(let ((peer (namedkey "e5911003")))
+  (let ((r (raw (format nil "glass-admit/1 admit pub=~a code=~a"
+                        peer (glass:mint-login-token :ttl 900)))))
+    (format t "     ~a~%" r)
+    (ok "ADMIT CARRIES expires= — the enrolment's own expiry, on the wire"
+        (let ((at (search "expires=" r)))
+          (and at (let ((v (parse-integer (subseq r (+ at 8)) :junk-allowed t)))
+                    (and v (eql v (glass:enrolment-expiry (glass:device-enrolment peer))))))))
+    (ok "  …and a denial carries none, because nothing was enrolled to have one"
+        (let ((d (raw (format nil "glass-admit/1 admit pub=~a" (namedkey "e5911004")))))
+          (and (search " deny " d) (not (search "expires=" d))))))
+  ;; the record, as the panel and a shell one-liner see it
+  (multiple-value-bind (head rows) (raw "glass-admit/1 devices"
+                                        :expect-rows (glass:enrolment-count))
+    (declare (ignore head))
+    (let ((line (find peer rows :test (lambda (p l) (eql 0 (search p l))))))
+      (format t "     ~a~%" line)
+      (ok "THE DEVICES ROW IS THE FILE LINE — the record travels, and the first two fields are
+       still `<pubkey> <expiry>' so a reader that wants only those never notices the rest"
+          (let ((w (remove "" (glass::%split-on (or line "") #\Space) :test #'string=)))
+            (and (= 10 (length w)) (equal peer (first w)) (equal "active" (third w))
+                 (equal "code" (sixth w)))))))
+  (ok "and ADMISSION-RECORDS parses it back into a plist a projection can map over"
+      (let ((r (find peer (glass:admission-records :host "127.0.0.1" :port *port*)
+                     :key (lambda (p) (getf p :pubkey)) :test #'equal)))
+        (and r (eq :active (getf r :state)) (eq :code (getf r :via))
+             (integerp (getf r :expiry)) (plusp (getf r :created)))))
+  (glass:revoke-enrolments peer :by *owner*)
+  (ok "  …and `state=all' is how the settled ones are asked for, which the default never returns"
+      (let ((live (glass:admission-records :host "127.0.0.1" :port *port*))
+            (all (glass:admission-records :state :all :host "127.0.0.1" :port *port*)))
+        (and (not (find peer live :key (lambda (p) (getf p :pubkey)) :test #'equal))
+             (let ((r (find peer all :key (lambda (p) (getf p :pubkey)) :test #'equal)))
+               (and r (eq :revoked (getf r :state))
+                    (equal (format nil "revoked-by-~a" (subseq *owner* 0 8)) (getf r :cause))))))))
 
 (ok "revoke on a stranger's authority is DENIED — the rule is enforced here, not at the surface"
     (search "deny reason=not-allowed"

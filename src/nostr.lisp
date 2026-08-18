@@ -86,6 +86,28 @@ no value for you' — and only one of them is NIL to POSIX-GETENV.  Reading them
   (map 'string (lambda (c) (if (member c '(#\Space #\Tab #\Newline #\Return)) #\- c))
        (princ-to-string thing)))
 
+;;; ---- positional fields -------------------------------------------------------
+;;;
+;;; Every store this file keeps is one space-separated line per record with `-' for a field that
+;;; does not apply, because `grep revoked .glass-devices' has to be the diagnostic and a line has to
+;;; be readable next to a log entry without a parser.  These two are that convention, written once:
+;;; a field goes out through %DASH (which also flattens blanks, so a cause can never eat the field
+;;; after it) and comes back through %UNDASH.
+
+(defun %dash (thing)
+  "THING as one positional field: its printed text with blanks flattened, or \"-\" for nothing."
+  (let ((s (and thing (%one-line thing))))
+    (if (and s (plusp (length s)) (not (string= s "-"))) s "-")))
+
+(defun %undash (s)
+  "One positional field back: NIL for \"-\", for \"\" and for a field that was not there at all."
+  (and (stringp s) (plusp (length s)) (not (string= s "-")) s))
+
+(defun %int (s &optional (default 0))
+  "S as an integer, or DEFAULT if it is not one.  A store edited by hand must not be a store that
+throws: an unparseable timestamp is a missing timestamp, and the record is still worth having."
+  (or (and (stringp s) (ignore-errors (parse-integer s))) default))
+
 ;;; ---- the box's identity ------------------------------------------------------
 ;;;
 ;;; DEFVAR and not DEFPARAMETER, for the reason given at *HEARING-MODELS*: a launcher fills this in
@@ -527,6 +549,62 @@ costing somebody their access until the next deploy."
 ;;; and signs with it.  A page admitted on a valid code is ENROLLED for *ENROLMENT-TTL*, after which
 ;;; it can ask for a fresh link itself over the same authenticated DM channel, with nobody involved.
 ;;;
+;;; ==============================================================================================
+;;; A RECORD, NOT A ROW — and `revoke' MARKS rather than DELETES
+;;; ==============================================================================================
+;;;
+;;; This store was `<pubkey> <expiry>' and revocation deleted the line.  Both halves of that are
+;;; fine right up to the moment somebody needs them, and then neither is: when the ALREADY REDEEMED
+;;; alarm fires (see ADMIT-PEER), the questions are HOW DID THIS KEY GET IN, WHEN, ON WHOSE
+;;; AUTHORITY, and WAS IT REMOVED OR DID IT SIMPLY LAPSE — and a two-field row cannot answer one of
+;;; them.  Worse, the answer was destroyed by the very act performed in response to the alarm:
+;;; revoking deleted the evidence it was performed for.
+;;;
+;;; So an enrolment is an ENROLMENT object with a state, and `revoke' moves it to :REVOKED with the
+;;; time and the cause rather than removing it.  A revoked terminal is findable afterwards, and it
+;;; is DISTINGUISHABLE from one that merely lapsed, which is the distinction the whole thing is for.
+;;;
+;;; ONE RECORD PER KEY, HOLDING ITS CURRENT STATE.  Not an append-only log: warp's DESIGN.md rule 4
+;;; is explicit that a presentation stream carries state and that event history is a different
+;;; product, read from a command log.  This store is what the panel projects, so it is state; a key
+;;; that is revoked and later re-admitted has its record moved back to :active with the cause saying
+;;; so, and the box does not pretend to keep a timeline it has nowhere to put.
+;;;
+;;; PROVENANCE IS HOW IT GOT IN, NOT HOW IT LAST CONNECTED.  VIA/NONCE/FOR are stamped when the key
+;;; is first enrolled and are NOT overwritten by the renewals that follow — every subsequent
+;;; admission of an enrolled terminal is `device', and a record that reported the last one would
+;;; answer "how did this key get in" with "it was already in", which is no answer at all.
+;;;
+;;; ==============================================================================================
+;;; RETENTION, AND WHY ZERO HAS TO MEAN ZERO
+;;; ==============================================================================================
+;;;
+;;; A record that outlives its enrolment is a log of who connected to this desktop and when.  On the
+;;; owner's own box that is exactly what you want after an alarm; on a SHARED box it is surveillance
+;;; nobody asked for.  So *AUDIT-RETENTION* is a dial with a real zero: at zero, a settled record is
+;;; dropped the instant it settles AND the forensic fields are never recorded in the first place, so
+;;; the file on disk is `<pubkey> <expiry>' — byte for byte the store this box kept before any of
+;;; this.  An opt-out that still wrote the timestamps and merely declined to keep them would be a
+;;; setting that lies.
+;;;
+;;; ==============================================================================================
+;;; THE FILE, AND WHAT ELSE READS IT
+;;; ==============================================================================================
+;;;
+;;;     <pubkey> <expiry> <state> <created> <seen> <via|-> <nonce|-> <for|-> <since> <cause|->
+;;;
+;;; THE FIRST TWO FIELDS ARE WHAT THEY ALWAYS WERE, and that is a compatibility decision rather
+;;; than an accident of layout.  warp-monitor's READ-DEVICES, `cut -d" " -f1,2', and every shell
+;;; one-liner anybody has written against this file take the pubkey and the expiry positionally;
+;;; appending is the only change that leaves all of them working.  A two-field line still LOADS —
+;;; that is the migration, and it needs no conversion step, no version marker and no flag day.
+;;;
+;;; AND A SETTLED RECORD READS AS LAPSED TO A READER THAT DOES NOT KNOW ABOUT STATES.  Revoking
+;;; sets the expiry to the instant of revocation as well as the state, so an old reader sees a past
+;;; expiry — not enrolled — which is the safe direction and the true one.  Getting this wrong is the
+;;; one way keeping the line could have been worse than deleting it: a revoked terminal that an
+;;; unaware reader reported as enrolled.
+;;;
 ;;; That is a deliberate trust delegation — the device key becomes a bearer credential — so it is
 ;;; bounded two ways: it only ever comes from a session that already authenticated, and it lapses
 ;;; unless refreshed by connecting.
@@ -559,54 +637,215 @@ costing somebody their access until the next deploy."
 an active terminal keeps working and an idle one lapses.  DEVICE_TTL is honoured as a fallback for
 the reason *LOGIN-TTL* gives about LINK_TTL: it is the name the launcher already exports.")
 
+(defparameter *audit-retention*
+  (let ((s (%blank->nil (or (sb-ext:posix-getenv "GLASS_AUDIT_RETENTION")
+                            (sb-ext:posix-getenv "GLASS_DEVICE_RETENTION")))))
+    (or (and s (ignore-errors (max 0 (parse-integer s)))) 1209600))
+  "How long a record is kept after the thing it describes stopped being usable, seconds.  Two weeks.
+
+ONE POLICY, TWO STORES, AND DELIBERATELY NOT THE SAME CLOCK AS EITHER.  This is the FORENSIC
+lifetime — how long the box remembers what happened — and it is a different question from how long
+anything is VALID FOR.  The enrolments keep it after they lapse or are revoked; the login codes keep
+a redemption after the code itself has died.  That second one is the whole reason this is its own
+number: a code is redeemable for MINUTES, because the MAC refuses it after that with no help from
+any store, and a redemption record is worth having for WEEKS, because it is the only thing that can
+answer `who traded that link'.  One number for both gives you an unbounded store (if you take the
+long one) or an empty audit trail exactly for the codes that mattered (if you take the short one).
+
+ZERO IS A REAL OPT-OUT AND NOT A SMALL NUMBER.  At zero a settled record is dropped the moment it
+settles, and the fields that constitute a log — created, last-seen, via, nonce, recipient, cause —
+are never written at all, so `.glass-devices' is the two-field file it always was.  A shared box may
+simply not want a record of when its owner connected, and a privacy setting that still recorded
+everything and merely pruned it sooner would be worth nothing.
+
+GLASS_DEVICE_RETENTION is honoured as a fallback name because that is what the dial was called while
+this was only about the enrolment store.")
+
+(defun audit-retained-p ()
+  "T iff this box keeps records after they stop being usable.  The one place the opt-out is read, so
+it cannot be half-implemented in one store and not the other."
+  (plusp *audit-retention*))
+
 (defvar *enrolment-file*
   (or (sb-ext:posix-getenv "GLASS_DEVICE_FILE")
       (namestring (merge-pathnames ".glass-devices" (user-homedir-pathname))))
-  "Where enrolments are persisted: one `<pubkey-hex> <expiry-unix>' line per terminal.
+  "Where enrolments are persisted, one record per line:
 
-The same format the WebRTC gateway used, on purpose — an existing store is copied across and works,
-and warp-monitor's reader parses it unchanged.  DEFVAR, so a hot-load cannot move the store out
-from under a running desktop.
+    <pubkey> <expiry> <state> <created> <seen> <via|-> <nonce|-> <for|-> <since> <cause|->
+
+THE FIRST TWO FIELDS ARE THE FORMAT THE WEBRTC GATEWAY WROTE, unchanged and still first, so
+warp-monitor's reader and every shell one-liner that takes `$1 $2' go on working and an existing
+store is loaded with no conversion.  A line with only those two fields IS the migration: it reads as
+an active enrolment whose history this box was not keeping yet.  DEFVAR, so a hot-load cannot move
+the store out from under a running desktop.
 
 THE LOGIN-CODE STORE IS DERIVED FROM THIS PATH (`<this>.codes', see LOGIN-CODE-FILE), so redirecting
 this one redirects both.")
 
-(defvar *enrolments* (make-hash-table :test 'equal))
+;;; CLOS AND NOT DEFSTRUCT, for the reason given at LOGIN-CODE and in the modus stack generally:
+;;; this is long-lived state in an image that is patched while it is serving people, and a DEFSTRUCT
+;;; whose slots change strands every instance already made.
+
+(defclass enrolment ()
+  ((pubkey  :initarg :pubkey  :reader   enrolment-pubkey)
+   (expiry  :initarg :expiry  :accessor enrolment-expiry)
+   (state   :initarg :state   :accessor enrolment-state   :initform :active)
+   (created :initarg :created :accessor enrolment-created :initform 0)
+   (seen    :initarg :seen    :accessor enrolment-seen    :initform 0)
+   (via     :initarg :via     :accessor enrolment-via     :initform nil)
+   (nonce   :initarg :nonce   :accessor enrolment-nonce   :initform nil)
+   (issued  :initarg :issued  :accessor enrolment-issued  :initform nil)
+   (since   :initarg :since   :accessor enrolment-since   :initform 0)
+   (cause   :initarg :cause   :accessor enrolment-cause   :initform nil))
+  (:documentation "One enrolled terminal, and how it came to be one.
+
+  PUBKEY   the browser's own device key — the bearer credential this record admits
+  EXPIRY   when the enrolment stops being valid.  For a REVOKED record this is the instant of
+           revocation, which is what makes a reader that knows nothing about states still correct.
+  STATE    :ACTIVE / :EXPIRED / :REVOKED
+  CREATED  when this key was FIRST enrolled; survives renewal and re-admission
+  SEEN     the last admission that renewed it
+  VIA      what admitted it: :CODE / :ALLOWLIST / :DEVICE — how it GOT in, not how it last connected
+  NONCE    for a code admission, the nonce of the code that was traded for this enrolment
+  ISSUED   who that code was minted for — the RECIPIENT of the link, which is the answer to `on
+           whose authority', and is usually a different key from PUBKEY (a link is DM'd to a
+           person's npub and redeemed by a browser's device key)
+  SINCE    when the record entered its current state
+  CAUSE    why — `first-admission', `lapsed', `revoked-by-<8hex>' …
+
+ISSUED and not FOR, because FOR is a symbol in COMMON-LISP and a slot reader named for it would be a
+package-lock violation on the first accessor call.  The wire and the file both spell it `for'."))
+
+(defmethod print-object ((e enrolment) stream)
+  (print-unreadable-object (e stream :type t)
+    (format stream "~a… ~(~a~)" (subseq (slot-value e 'pubkey) 0 (min 8 (length (slot-value e 'pubkey))))
+            (slot-value e 'state))))
+
+(defvar *enrolments* (make-hash-table :test 'equal)
+  "Pubkey -> ENROLMENT.  Holds settled records too, which is why nothing may read a value out of
+here and treat it as an enrolment without asking ENROLMENT-LIVE-P.")
 (defvar *enrolments-lock* (sb-thread:make-mutex :name "glass-enrolments"))
 (defvar *enrolments-mtime* nil)
 
-;;; ---- internals.  ALL THREE REQUIRE *ENROLMENTS-LOCK* ALREADY HELD. ------------
+;;; ---- reading a record -------------------------------------------------------
+
+(defun enrolment-live-p (e &optional (now (unix-now)))
+  "T iff E is an enrolment that would admit its key right now.  ACTIVE AND UNEXPIRED, and both
+halves are load-bearing: a revoked record keeps its line, and a lapsed one keeps its expiry."
+  (and (typep e 'enrolment) (eq (enrolment-state e) :active) (> (enrolment-expiry e) now)))
+
+(defun %settle-enrolment (e now)
+  "Move an ACTIVE record whose expiry has passed to :EXPIRED, at the instant it expired.
+
+LAZILY, when somebody looks, because there is no clock in this file and there does not need to be:
+the transition is a function of the expiry that is already written down, so computing it on read
+gives the same answer a timer would and cannot drift."
+  (when (and (eq (enrolment-state e) :active) (<= (enrolment-expiry e) now))
+    (setf (enrolment-state e) :expired
+          (enrolment-since e) (enrolment-expiry e)
+          (enrolment-cause e) (and (audit-retained-p) "lapsed")))
+  e)
+
+(defun %enrolment-keep-p (e now)
+  "T iff E is still worth a line: live, or settled inside the retention window."
+  (or (enrolment-live-p e now)
+      (and (audit-retained-p) (> (+ (enrolment-since e) *audit-retention*) now))))
+
+(defun %enrolment-line (e)
+  "E as one file/wire line.  Two fields with retention off — which is the old format exactly, and
+the opt-out: with nothing retained there is no state but :ACTIVE to record and no history to keep."
+  (if (audit-retained-p)
+      (format nil "~a ~a ~(~a~) ~a ~a ~(~a~) ~a ~a ~a ~a"
+              (enrolment-pubkey e) (enrolment-expiry e) (enrolment-state e)
+              (enrolment-created e) (enrolment-seen e)
+              (%dash (enrolment-via e)) (%dash (enrolment-nonce e)) (%dash (enrolment-issued e))
+              (enrolment-since e) (%dash (enrolment-cause e)))
+      (format nil "~a ~a" (enrolment-pubkey e) (enrolment-expiry e))))
+
+(defun %parse-enrolment (line)
+  "One line -> an ENROLMENT, or NIL if it is not one.
+
+A TWO-FIELD LINE IS AN ACTIVE ENROLMENT WITH NO HISTORY, which is what the old store's lines are and
+what a retention-zero box writes.  An UNKNOWN STATE is dropped rather than guessed at: a row this
+build cannot interpret must not become a terminal it silently admits."
+  (let ((w (remove "" (%split-on line #\Space) :test #'string=)))
+    (when (>= (length w) 2)
+      (let ((pk (string-downcase (first w)))
+            (exp (and (every #'digit-char-p (second w)) (%int (second w) nil)))
+            (state (if (third w) (intern (string-upcase (third w)) :keyword) :active)))
+        (when (and (plusp (length pk)) (integerp exp)
+                   (member state '(:active :expired :revoked)))
+          (make-instance 'enrolment
+                         :pubkey pk :expiry exp :state state
+                         :created (%int (fourth w)) :seen (%int (fifth w))
+                         :via (let ((v (%undash (sixth w))))
+                                (and v (intern (string-upcase v) :keyword)))
+                         :nonce (let ((n (%undash (seventh w)))) (and n (string-downcase n)))
+                         :issued (let ((f (%undash (eighth w)))) (and f (string-downcase f)))
+                         :since (%int (ninth w) (if (eq state :active) 0 exp))
+                         :cause (%undash (tenth w))))))))
+
+;;; ---- internals.  ALL OF THESE REQUIRE *ENROLMENTS-LOCK* ALREADY HELD. ---------
 
 (defun %load-enrolments ()
   "Merge the file into the table.  Does NOT clear first — %SYNC-ENROLMENTS decides that."
   (handler-case
       (with-open-file (s *enrolment-file* :if-does-not-exist nil)
         (when s
-          (loop for line = (read-line s nil) while line do
-            (let* ((sp (position #\Space line))
-                   (pk (and sp (subseq line 0 sp)))
-                   (exp (and sp (ignore-errors (parse-integer (subseq line (1+ sp)))))))
-              (when (and pk exp (> exp (unix-now)))
-                (setf (gethash (string-downcase pk) *enrolments*) exp))))))
+          (let ((now (unix-now)))
+            (loop for line = (read-line s nil) while line do
+              (let ((e (%parse-enrolment line)))
+                (when e
+                  (%settle-enrolment e now)
+                  (when (and (%enrolment-keep-p e now)
+                             (not (gethash (enrolment-pubkey e) *enrolments*)))
+                    (setf (gethash (enrolment-pubkey e) *enrolments*) e))))))))
     (error () nil)))
 
+(defun %prune-enrolments (now)
+  "Settle what has expired and drop what retention no longer covers.  Returns how many went."
+  (let ((dead '()))
+    (maphash (lambda (pk e)
+               (%settle-enrolment e now)
+               (unless (%enrolment-keep-p e now) (push pk dead)))
+             *enrolments*)
+    (dolist (pk dead) (remhash pk *enrolments*))
+    (length dead)))
+
 (defun %save-enrolments ()
-  "Rewrite the file from the table, lapsed rows dropped."
+  "Rewrite the file from the table, records past retention dropped."
   (handler-case
-      (progn
+      (let ((now (unix-now)))
+        (%prune-enrolments now)
         (with-open-file (s *enrolment-file* :direction :output :if-exists :supersede
                                             :if-does-not-exist :create)
-          (maphash (lambda (pk exp) (when (> exp (unix-now)) (format s "~a ~a~%" pk exp)))
+          (maphash (lambda (pk e) (declare (ignore pk)) (write-line (%enrolment-line e) s))
                    *enrolments*))
         ;; remember our own write, so the next SYNC does not re-read what we have just said
         (setf *enrolments-mtime* (ignore-errors (file-write-date *enrolment-file*))))
     (error () nil)))
 
+(defun %enrolments-stale-p ()
+  "T if the table holds values from before this file grew records.
+
+THE HOT-PATCH GUARD, and it is the difference between this change being live-loadable and needing a
+restart.  *ENROLMENTS* is a DEFVAR — deliberately, so a recompile cannot un-enrol every terminal —
+so an image that loads this file over a running desktop keeps a table of `pubkey -> expiry INTEGER'.
+Every one of those reads as `not enrolled' through ENROLMENT-LIVE-P, and %SYNC-ENROLMENTS would not
+re-read, because the FILE has not changed.  The desktop would go on answering admissions and quietly
+deny everybody until somebody touched the store.
+
+O(1): the two shapes never mix — every writer after the patch writes records — so the first entry
+settles it."
+  (block nil
+    (maphash (lambda (k v) (declare (ignore k)) (return (not (typep v 'enrolment)))) *enrolments*)
+    nil))
+
 (defun %sync-enrolments ()
-  "Re-read if the file changed underneath us."
+  "Re-read if the file changed underneath us — or if this image was patched under a live table."
   (handler-case
       (let ((mt (file-write-date *enrolment-file*)))
-        (unless (eql mt *enrolments-mtime*)
+        (unless (and (eql mt *enrolments-mtime*) (not (%enrolments-stale-p)))
           (setf *enrolments-mtime* mt)
           (clrhash *enrolments*)
           (%load-enrolments)))
@@ -624,57 +863,165 @@ this one redirects both.")
   "Re-read the store if the file changed underneath us."
   (sb-thread:with-mutex (*enrolments-lock*) (%sync-enrolments)))
 
-(defun enrol-device (pubkey &optional (ttl *enrolment-ttl*))
+(defun enrol-device (pubkey &optional (ttl *enrolment-ttl*) &key via nonce for)
   "Trust PUBKEY to ask for its own login links for TTL seconds.  Renews an existing enrolment.
+Returns the enrolment's new EXPIRY (a unix time, so a caller can tell the terminal when it runs out),
+or NIL if there was nothing to enrol.
+
+VIA / NONCE / FOR are the PROVENANCE — what admitted this key, and for a code the nonce it traded
+and the recipient that code was minted for.  They are stamped when the record is CREATED and left
+alone on every renewal after it: see the section header.  They are also the reason ADMIT-PEER is the
+only caller that passes them; anything else enrolling a key by hand genuinely does not know.
+
+TTL IS STILL POSITIONAL, and the keywords come after it, because `(enrol-device k 3600)' is the call
+that exists in scripts and in the gates.  The footgun that arrangement leaves — `(enrol-device k
+:via :code)' would bind TTL to the keyword — is named here rather than designed away, because the
+alternative renames the argument every existing caller passes.
 
 SYNC, SET AND SAVE IN ONE CRITICAL SECTION.  Two peers admitted at the same instant otherwise race
 each other's rewrite of the file, and a reader between them sees the truncation."
   (when (stringp pubkey)
-    (sb-thread:with-mutex (*enrolments-lock*)
-      (%sync-enrolments)
-      (setf (gethash (string-downcase pubkey) *enrolments*) (+ (unix-now) ttl))
-      (%save-enrolments))
-    t))
+    (let ((pk (string-downcase pubkey))
+          (now (unix-now))
+          (audit (audit-retained-p)))
+      (sb-thread:with-mutex (*enrolments-lock*)
+        (%sync-enrolments)
+        (let* ((prior (gethash pk *enrolments*))
+               (expiry (+ now ttl)))
+          (if (enrolment-live-p prior now)
+              ;; RENEWAL.  The expiry moves and the last-seen moves; nothing else does.
+              (setf (enrolment-expiry prior) expiry
+                    (enrolment-seen prior) (if audit now 0))
+              ;; A NEW RECORD — first admission, or one coming back after lapsing or being revoked.
+              ;; CREATED survives that, because "when did this key first get in" is still the
+              ;; question, and the cause says which of the three this was.
+              (setf (gethash pk *enrolments*)
+                    (make-instance 'enrolment
+                                   :pubkey pk :expiry expiry :state :active :since now
+                                   :created (if audit (if prior (enrolment-created prior) now) 0)
+                                   :seen (if audit now 0)
+                                   :via (and audit via)
+                                   :nonce (and audit nonce)
+                                   :issued (and audit for)
+                                   :cause (and audit
+                                               (cond ((null prior) "first-admission")
+                                                     ((eq (enrolment-state prior) :revoked)
+                                                      "re-admitted-after-revoke")
+                                                     (t "re-admitted"))))))
+          (%save-enrolments)
+          expiry)))))
 
 (defun device-enrolled-p (pubkey)
   (and (stringp pubkey)
        (sb-thread:with-mutex (*enrolments-lock*)
          (%sync-enrolments)
-         (let ((exp (gethash (string-downcase pubkey) *enrolments*)))
-           (and exp (> exp (unix-now)) t)))))
+         (enrolment-live-p (gethash (string-downcase pubkey) *enrolments*)))))
+
+(defun device-enrolment (pubkey)
+  "PUBKEY's record — whatever state it is in — or NIL if this box has never heard of it.
+THE ANSWER TO A QUESTION ASKED AFTER THE FACT, which is why it does not filter: `we revoked that
+terminal on Tuesday' is exactly what the caller is trying to find out."
+  (when (stringp pubkey)
+    (sb-thread:with-mutex (*enrolments-lock*)
+      (%sync-enrolments)
+      (gethash (string-downcase pubkey) *enrolments*))))
 
 (defun list-enrolments ()
-  "The live enrolments as ((pubkey . expiry) …), longest remaining first.  A lapsed row is not
-returned even while the file still holds it: a lapsed terminal is not an enrolled one."
+  "The live enrolments as ((pubkey . expiry) …), longest remaining first.  A lapsed or revoked
+record is not returned even while the file still holds it: neither is an enrolled terminal.
+
+THE SHAPE IS UNCHANGED, and deliberately so — warp's device panel and the admission service's
+`devices' verb are both built on these pairs, and the records are offered beside this call rather
+than through it (LIST-ENROLMENT-RECORDS) so that a richer store did not become a broken panel."
   (let ((now (unix-now)) (rows '()))
     (sb-thread:with-mutex (*enrolments-lock*)
       (%sync-enrolments)
-      (maphash (lambda (pk exp) (when (> exp now) (push (cons pk exp) rows))) *enrolments*))
+      (maphash (lambda (pk e) (when (enrolment-live-p e now) (push (cons pk (enrolment-expiry e)) rows)))
+               *enrolments*))
     (sort rows #'> :key #'cdr)))
+
+(defun list-enrolment-records (&key (state :active))
+  "The records this store holds, as ENROLMENT objects.
+
+STATE selects: :ACTIVE (the live ones, the default and what a panel wants), :ALL (everything still
+retained), or one of :EXPIRED / :REVOKED to ask the question that made this a record store — `what
+happened to that terminal'.  Live records first, longest remaining first; settled ones after,
+most recently settled first, because that is the order somebody reading after an alarm wants."
+  (let ((now (unix-now)) (rows '()))
+    (sb-thread:with-mutex (*enrolments-lock*)
+      (%sync-enrolments)
+      (%prune-enrolments now)
+      (maphash (lambda (pk e)
+                 (declare (ignore pk))
+                 (when (case state
+                         (:active (enrolment-live-p e now))
+                         (:all t)
+                         (t (eq (enrolment-state e) state)))
+                   (push e rows)))
+               *enrolments*))
+    (sort rows (lambda (a b)
+                 (let ((la (enrolment-live-p a now)) (lb (enrolment-live-p b now)))
+                   (cond ((not (eq la lb)) la)
+                         (la (> (enrolment-expiry a) (enrolment-expiry b)))
+                         (t (> (enrolment-since a) (enrolment-since b)))))))))
+
+(defun find-enrolments (prefix &key (state :all))
+  "The records whose pubkey starts with PREFIX (four characters and up), in any state by default.
+This is the `the alarm named a key — what do we know about it' call."
+  (when (and (stringp prefix) (>= (length prefix) 4))
+    (let ((prefix (string-downcase prefix)))
+      (remove-if-not (lambda (e)
+                       (let ((pk (enrolment-pubkey e)))
+                         (and (>= (length pk) (length prefix))
+                              (string= prefix (subseq pk 0 (length prefix))))))
+                     (list-enrolment-records :state state)))))
 
 (defun enrolment-count () (length (list-enrolments)))
 
-(defun revoke-enrolments (arg)
-  "Un-enrol terminals matching ARG — a pubkey prefix, or \"all\".  Returns the list revoked.
+(defun revoke-enrolments (arg &key by)
+  "Revoke the terminals matching ARG — a pubkey prefix, or \"all\".  Returns the list revoked.
+
+IT MARKS; IT DOES NOT DELETE.  The record moves to :REVOKED with the time and the cause, and its
+EXPIRY is set to that same instant — so it stops admitting anybody immediately (which is the whole
+job), it reads as lapsed to any reader that does not know about states, and it is still there
+afterwards to answer what was done and by whom.  Deleting the line destroyed the evidence the
+revocation was performed for, which is the one thing you want most at that exact moment.
+
+BY names the authority — the invoking pubkey, from the DM surface or from warp's panel — and lands
+in the cause as `revoked-by-<first-8>'.  It is a keyword and optional because REVOKE-ENROLMENTS is
+also called from a REPL where the authority is `whoever is at the keyboard'.
+
+ONLY LIVE RECORDS MATCH.  Revoking something that already lapsed would rewrite its cause and lose
+the true one, and nothing is gained: it admits nobody either way.
 
 The prefix is matched at four characters and up while the surface advertises eight.  Kept as it was:
 a prefix refused for being one character short is worse than a prefix that is generous, and the
 operator typed it themselves — the ADVERTISED length is the one to copy."
-  (let ((killed '()))
+  (let ((killed '())
+        (now (unix-now)))
     (sb-thread:with-mutex (*enrolments-lock*)
       (%sync-enrolments)
-      (cond
-        ((and (stringp arg) (string-equal arg "all"))
-         (maphash (lambda (pk exp) (declare (ignore exp)) (push pk killed)) *enrolments*)
-         (clrhash *enrolments*))
-        ((and (stringp arg) (>= (length arg) 4))
-         (let ((arg (string-downcase arg)))
-           (maphash (lambda (pk exp) (declare (ignore exp))
-                      (when (and (>= (length pk) (length arg))
-                                 (string= arg (subseq pk 0 (length arg))))
-                        (push pk killed)))
-                    *enrolments*))
-         (dolist (pk killed) (remhash pk *enrolments*))))
+      (let ((cause (if by (format nil "revoked-by-~a" (subseq (%one-line by) 0 (min 8 (length by))))
+                       "revoked")))
+        (flet ((revoke (e)
+                 (setf (enrolment-state e) :revoked
+                       (enrolment-expiry e) now
+                       (enrolment-since e) now
+                       (enrolment-cause e) (and (audit-retained-p) cause))
+                 (push (enrolment-pubkey e) killed)))
+          (cond
+            ((and (stringp arg) (string-equal arg "all"))
+             (maphash (lambda (pk e) (declare (ignore pk))
+                        (when (enrolment-live-p e now) (revoke e)))
+                      *enrolments*))
+            ((and (stringp arg) (>= (length arg) 4))
+             (let ((arg (string-downcase arg)))
+               (maphash (lambda (pk e)
+                          (when (and (enrolment-live-p e now)
+                                     (>= (length pk) (length arg))
+                                     (string= arg (subseq pk 0 (length arg))))
+                            (revoke e)))
+                        *enrolments*))))))
       (%save-enrolments))
     killed))
 
@@ -811,8 +1158,23 @@ hot-load of this file must not drop the set of codes already spent.")
 ;;; the public calls for exactly that reason: a helper that took the lock itself would deadlock the
 ;;; critical sections this whole feature rests on.
 
-(defun %code-field (s) (if (equal s "-") nil s))
-(defun %code-out (s) (or s "-"))
+(defun %code-redeemable-p (c now)
+  "T iff C could still be traded in.  ITS OWN EXPIRY AND NOTHING ELSE — this is the short of the two
+lifetimes, and the point of keeping it separate is that it does not lengthen because the record does."
+  (> (code-expiry c) now))
+
+(defun %code-keep-p (c now)
+  "T iff C's row is still worth keeping: redeemable, or a SETTLED record inside retention.
+
+THE TWO LIFETIMES, in one function.  A code is redeemable for minutes; what became of it is worth
+remembering for weeks — but only if something BECAME of it.  An outstanding code that nobody ever
+tapped is dropped at its expiry, because there is no redemption to record, the MAC refuses it at
+that same instant, and keeping every link ever minted is how a store with a retention window turns
+into a store with no bound."
+  (or (%code-redeemable-p c now)
+      (and (audit-retained-p)
+           (member (code-state c) '(:redeemed :superseded))
+           (> (+ (code-settled c) *audit-retention*) now))))
 
 (defun %codes-load (store)
   "Re-read STORE if it is looking at a different file, or the file changed underneath it."
@@ -833,36 +1195,39 @@ hot-load of this file must not drop the set of codes already spent.")
                       (let ((nonce (string-downcase (first w)))
                             (state (intern (string-upcase (second w)) :keyword))
                             (exp (ignore-errors (parse-integer (third w))))
-                            (rcpt (%code-field (fourth w)))
-                            (by (%code-field (fifth w)))
+                            (rcpt (%undash (fourth w)))
+                            (by (%undash (fifth w)))
                             (minted (ignore-errors (parse-integer (sixth w))))
                             (settled (ignore-errors (parse-integer (seventh w)))))
                         ;; an unknown state is dropped rather than trusted: a row this build cannot
                         ;; interpret must not become a code it silently treats as live
-                        (when (and exp (> exp now)
-                                   (member state '(:outstanding :redeemed :superseded)))
-                          (setf (gethash nonce (code-table store))
-                                (make-instance 'login-code
-                                               :nonce nonce :expiry exp :state state
-                                               :recipient (and rcpt (string-downcase rcpt))
-                                               :redeemer (and by (string-downcase by))
-                                               :minted (or minted 0)
-                                               :settled (or settled 0)))))))))))
+                        (when (and exp (member state '(:outstanding :redeemed :superseded)))
+                          (let ((c (make-instance 'login-code
+                                                  :nonce nonce :expiry exp :state state
+                                                  :recipient (and rcpt (string-downcase rcpt))
+                                                  :redeemer (and by (string-downcase by))
+                                                  :minted (or minted 0)
+                                                  :settled (or settled 0))))
+                            (when (%code-keep-p c now)
+                              (setf (gethash nonce (code-table store)) c)))))))))))
         (error () nil)))))
 
 (defun %codes-prune (store now)
-  "Drop rows whose code has expired.  Returns how many went.
+  "Drop rows that are neither redeemable nor retained.  Returns how many went.
 
-Pruned AT THE CODE'S OWN EXPIRY and not a moment before — that is the same instant
-VERIFY-LOGIN-TOKEN starts refusing it, so there is never a window where the row is gone and the
-code still works."
+NEVER BEFORE THE CODE'S OWN EXPIRY — that is the same instant VERIFY-LOGIN-TOKEN starts refusing it,
+so there is never a window where the row is gone and the code still works — and, for a code that was
+actually traded or superseded, not until *AUDIT-RETENTION* has run out either.  This used to prune
+at expiry full stop, which is exactly the collapse the two lifetimes exist to prevent: the record
+of the redemption vanished minutes after the redemption, so the store was empty precisely for the
+codes an investigation would have asked about."
   (let ((dead '()))
-    (maphash (lambda (k c) (unless (> (code-expiry c) now) (push k dead))) (code-table store))
+    (maphash (lambda (k c) (unless (%code-keep-p c now) (push k dead))) (code-table store))
     (dolist (k dead) (remhash k (code-table store)))
     (length dead)))
 
 (defun %codes-save (store)
-  "Write STORE out, expired rows dropped.  Whole-file rewrite, like the enrolments."
+  "Write STORE out, rows past both lifetimes dropped.  Whole-file rewrite, like the enrolments."
   (handler-case
       (let ((file (login-code-file))
             (now (unix-now)))
@@ -870,10 +1235,10 @@ code still works."
                                 :if-does-not-exist :create)
           (maphash (lambda (k c)
                      (declare (ignore k))
-                     (when (> (code-expiry c) now)
+                     (when (%code-keep-p c now)
                        (format s "~a ~(~a~) ~a ~a ~a ~a ~a~%"
                                (code-nonce c) (code-state c) (code-expiry c)
-                               (%code-out (code-recipient c)) (%code-out (code-redeemer c))
+                               (%dash (code-recipient c)) (%dash (code-redeemer c))
                                (code-minted c) (code-settled c))))
                    (code-table store)))
         ;; remember our own write, so the next load does not re-read what we have just said
@@ -918,14 +1283,23 @@ they are sitting in front of, and a later link must not reach back and log them 
 (defun redeem-nonce (nonce pubkey expiry &key (bind t) (store *login-codes*))
   "Trade NONCE, a code valid until EXPIRY, for PUBKEY's admission.
 
-Returns (values OK STATE HOLDER):
+Returns (values OK STATE HOLDER RECIPIENT):
   OK      T if PUBKEY may use this code
   STATE   :BOUND       it was live and is now PUBKEY's        (first redemption)
           :AGAIN       PUBKEY already holds it                (the retry, and it passes)
           :FREE        it was live and BIND was NIL           (a probe; nothing was written)
           :TAKEN       another key holds it   (OK NIL — the link leaked)
           :SUPERSEDED  a newer link replaced it (OK NIL — ask for a fresh one)
+          :EXPIRED     its own expiry has passed (OK NIL — and the ROW may still be here)
   HOLDER  on :TAKEN, the key that got there first
+  RECIPIENT  who the code was minted FOR, when the store knows — the provenance an enrolment
+             bought with this code records, and the answer to `on whose authority'
+
+:EXPIRED IS THE SHORT LIFETIME, STATED.  A row now outlives its code by *AUDIT-RETENTION* so that
+the redemption stays on the record, which means the row's presence can no longer be read as `this
+code is live' — so redeemability is asked of the EXPIRY, first, before anything else is consulted.
+ADMIT-PEER never reaches it (VERIFY-LOGIN-TOKEN refuses an expired code before this is called) and
+that is exactly why it is written down here: the guard has no caller to keep it honest.
 
 A NONCE WITH NO ROW AT ALL IS LIVE, and that is deliberate: a renewal token and a code from the
 command-line link minter are never recorded at mint time, because neither has a recipient to form a
@@ -948,61 +1322,80 @@ releasing the lock, so N threads presenting one live code produce exactly one :B
         (%codes-load store)
         (let* ((dirty (plusp (%codes-prune store now)))
                (prior (gethash nonce (code-table store)))
+               (rcpt (and prior (code-recipient prior)))
                (result
                  (cond
+                   ((<= (if prior (code-expiry prior) expiry) now)
+                    (list nil :expired (and prior (code-redeemer prior)) rcpt))
                    ((and prior (eq (code-state prior) :redeemed))
                     (if (equal (code-redeemer prior) pubkey)
-                        (list t :again pubkey)
-                        (list nil :taken (code-redeemer prior))))
+                        (list t :again pubkey rcpt)
+                        (list nil :taken (code-redeemer prior) rcpt)))
                    ((and prior (eq (code-state prior) :superseded))
-                    (list nil :superseded nil))
-                   ((not bind) (list t :free nil))
+                    (list nil :superseded nil rcpt))
+                   ((not bind) (list t :free nil rcpt))
                    (prior                                    ; :outstanding — trade it in
                     (setf (code-state prior) :redeemed
                           (code-redeemer prior) pubkey
                           (code-settled prior) now
                           dirty t)
-                    (list t :bound pubkey))
+                    (list t :bound pubkey rcpt))
                    (t                                        ; a bare token: renewal, or the CLI
                     (setf (gethash nonce (code-table store))
                           (make-instance 'login-code :nonce nonce :expiry expiry :state :redeemed
                                                      :redeemer pubkey :minted now :settled now)
                           dirty t)
-                    (list t :bound pubkey)))))
+                    (list t :bound pubkey nil)))))
           (when dirty (%codes-save store))
           (values-list result))))))
 
 ;;; ---- reading it ---------------------------------------------------------------
 
 (defun list-login-codes (&optional (store *login-codes*))
-  "The live rows as LOGIN-CODE objects, most recently settled first.  Diagnostic only — nothing
-decides anything from this list; the decisions are made inside the lock, above."
+  "Every row the store still holds, as LOGIN-CODE objects, most recently settled first — the
+redeemable ones AND the retained records of ones that are not.  Diagnostic only: nothing decides
+anything from this list, because the decisions are made inside the lock, above.
+
+A CALLER THAT WANTS `IS THIS CODE STILL USABLE' MUST ASK CODE-LIVE-P and not merely find a row.
+That used to be the same question; retention is what separated them."
   (let ((now (unix-now)) (rows '()))
     (sb-thread:with-mutex ((code-lock store))
       (%codes-load store)
-      (maphash (lambda (k c) (declare (ignore k))
-                 (when (> (code-expiry c) now) (push c rows)))
-               (code-table store)))
+      (%codes-prune store now)
+      (maphash (lambda (k c) (declare (ignore k)) (push c rows)) (code-table store)))
     (sort rows #'> :key (lambda (c) (max (code-settled c) (code-minted c))))))
+
+(defun code-live-p (c &optional (now (unix-now)))
+  "T iff C is still redeemable — its own expiry, which is the short of its two lifetimes."
+  (and (typep c 'login-code) (%code-redeemable-p c now)))
 
 (defun find-login-code (nonce &optional (store *login-codes*))
   "The row for NONCE, or NIL."
   (when (stringp nonce)
     (find (string-downcase nonce) (list-login-codes store) :key #'code-nonce :test #'equal)))
 
-(defun login-code-count (&optional (store *login-codes*)) (length (list-login-codes store)))
+(defun login-code-count (&optional (store *login-codes*))
+  "How many codes are still REDEEMABLE.  Not how many rows there are: a retained record is history,
+and counting it here would make the number grow for two weeks after the last person logged in."
+  (count-if #'code-live-p (list-login-codes store)))
 
 (defun describe-login-codes (&optional (store *login-codes*))
-  "The outstanding and spent codes in words, for an operator staring at a lockout."
-  (let ((rows (list-login-codes store)) (now (unix-now)))
+  "The outstanding, spent and remembered codes in words, for an operator staring at a lockout."
+  (let* ((rows (list-login-codes store)) (now (unix-now))
+         (live (count-if (lambda (c) (code-live-p c now)) rows)))
     (if (null rows)
         "No codes are outstanding."
-        (format nil "~a live code~:p:~%~{~a~%~}" (length rows)
+        (format nil "~a live code~:p~@[, ~a kept on the record~]:~%~{~a~%~}"
+                live (and (> (length rows) live) (- (length rows) live))
                 (mapcar (lambda (c)
-                          (format nil "  ~a  ~10@a  expires in ~d min~@[  to ~a…~]~@[  by ~a…~]"
+                          (format nil "  ~a  ~10@a  ~a~@[  to ~a…~]~@[  by ~a…~]"
                                   (subseq (code-nonce c) 0 8)
                                   (string-downcase (symbol-name (code-state c)))
-                                  (max 0 (round (- (code-expiry c) now) 60))
+                                  (if (code-live-p c now)
+                                      (format nil "expires in ~d min"
+                                              (max 0 (round (- (code-expiry c) now) 60)))
+                                      (format nil "dead ~d min ago"
+                                              (max 0 (round (- now (code-expiry c)) 60))))
                                   (and (code-recipient c) (subseq (code-recipient c) 0 8))
                                   (and (code-redeemer c) (subseq (code-redeemer c) 0 8))))
                         rows)))))
@@ -1039,9 +1432,10 @@ decides anything from this list; the decisions are made inside the lock, above."
 (defun admit-peer (pubkey code &key (enrol t) (ttl *renewal-ttl*))
   "Decide whether PUBKEY, holding CODE, may open this desktop.
 
-Returns (values VIA TOKEN STATUS):
+Returns (values VIA TOKEN STATUS EXPIRY):
   VIA     :code / :allowlist / :device, or NIL when refused
   TOKEN   a fresh login code to hand back with the answer, or NIL
+  EXPIRY  when this peer's enrolment runs out, unix — NIL when nothing was enrolled
   STATUS  the code's own status — ALWAYS, so a peer admitted by the allowlist while presenting a
           rotten code is visible rather than silently fine, and so a failure screen can eventually
           tell an unremarkable expiry from something worth investigating:
@@ -1063,7 +1457,16 @@ one admitted purely by the allowlist — an owner has a signer and does not need
 pushed at them.  That is the rule the field is already running; it is preserved exactly.  It is
 minted with NO :FOR, so it joins no supersede group and cancels nothing, and with a fresh random
 nonce, so it never arrives already spent.  TTL defaults to *RENEWAL-TTL* and not to *LOGIN-TTL*:
-this is a credential at rest in localStorage, not one in transit through a DM."
+this is a credential at rest in localStorage, not one in transit through a DM.
+
+AND IT SAYS WHEN THE ENROLMENT RUNS OUT, which is the fact the client could not otherwise have.  A
+denial is answered with SILENCE by design — the box will not confirm to an unknown sender that it is
+listening — so a browser holding a lapsed device key had no way to learn that except by offering
+into the dark and concluding by timeout, half a minute of a page looking broken before it could even
+offer the way back in.  The expiry rides the answer envelope the renewal code already rides, is
+stored per box, and lets the NEXT cold load show the options at once.  It is a PREDICTION and the
+client is told so: it still offers, because a working credential must never be pre-empted by a
+guess about it."
   (multiple-value-bind (code-live nonce code-exp) (verify-login-token code)
     (let* ((crypto-status (cond ((or (not (stringp code)) (zerop (length code))) :absent)
                                 ((null nonce) :bad)
@@ -1074,13 +1477,14 @@ this is a credential at rest in localStorage, not one in transit through a DM."
            ;; without redeeming it — the one hole this whole section exists to close.
            (redeemable (and (eq crypto-status :ok) (stringp pubkey) (plusp (length pubkey))))
            (holder nil)
+           (recipient nil)
            (status (if (not redeemable)
                        crypto-status
                        ;; UNCONDITIONAL.  Not inside the COND below, not guarded by "unless the
                        ;; allowlist would have taken them anyway" — see the note above.
-                       (multiple-value-bind (ok state who)
+                       (multiple-value-bind (ok state who for)
                            (redeem-nonce nonce pubkey code-exp :bind enrol)
-                         (setf holder who)
+                         (setf holder who recipient for)
                          (cond (ok :ok)
                                ((eq state :superseded) :superseded)
                                (t :spent)))))
@@ -1102,10 +1506,19 @@ this is a credential at rest in localStorage, not one in transit through a DM."
                    @@   the one that is enrolled;  revoke ~a…  if it was not you.~%"
                   (tag nonce) (tag (or holder "?")) (tag pubkey) (tag (or holder "?")))
           (finish-output *error-output*)))
-      (when (and via enrol) (enrol-device pubkey))
-      (values via
-              (when (member via '(:code :device)) (mint-login-token :ttl ttl))
-              status))))
+      ;; THE PROVENANCE IS RECORDED HERE OR NOWHERE.  This is the only place that knows all three
+      ;; facts at once — which of the three doors opened, the nonce that was traded if it was the
+      ;; code door, and who that code had been minted for.  A store asked afterwards can reconstruct
+      ;; none of them, which is precisely the position the two-field file left us in.
+      (let ((expiry (when (and via enrol)
+                      (enrol-device pubkey *enrolment-ttl*
+                                    :via via
+                                    :nonce (and (eq via :code) nonce)
+                                    :for recipient))))
+        (values via
+                (when (member via '(:code :device)) (mint-login-token :ttl ttl))
+                status
+                expiry)))))
 
 ;;; ---- the command surface -----------------------------------------------------
 ;;;
@@ -1136,36 +1549,59 @@ than a generous match."
            (arg (and sp (string-trim '(#\Space) (subseq txt (1+ sp))))))
       (cond ((zerop (length txt)) nil)
             ((search "link" verb) (values :link nil))
-            ((string= verb "devices") (values :devices nil))
+            ;; `devices' carries its argument now — `devices all' asks for the settled records too.
+            ;; A bare `devices' is what it always was, which is what an operator's muscle memory and
+            ;; every message history are going to keep typing.
+            ((string= verb "devices") (values :devices arg))
             ((string= verb "revoke") (values :revoke arg))
             ((or (string= verb "help") (string= verb "?")) (values :help nil))
             (t nil)))))
 
-(defun describe-enrolments ()
-  "Human-readable listing of enrolled terminals."
-  (let ((rows (list-enrolments)) (now (unix-now)))
-    (if (null rows)
-        "No terminals are enrolled."
-        (format nil "~a enrolled terminal~:p:~%~{~a~%~}~@
-                     Use \"revoke <first-8>\" or \"revoke all\"."
-                (length rows)
-                (mapcar (lambda (r)
-                          (let ((hrs (/ (- (cdr r) now) 3600.0)))
-                            (if (< hrs 1)
-                                (format nil "  ~a  expires in ~d min" (subseq (car r) 0 8)
-                                        (max 1 (round (* hrs 60))))
-                                (format nil "  ~a  expires in ~,1f h" (subseq (car r) 0 8) hrs))))
-                        rows)))))
+(defun %ago (seconds)
+  "A duration in the coarsest unit that still says something: min / h / d."
+  (let ((s (max 0 seconds)))
+    (cond ((< s 3600) (format nil "~d min" (max 1 (round s 60))))
+          ((< s 172800) (format nil "~,1f h" (/ s 3600.0)))
+          (t (format nil "~,1f d" (/ s 86400.0))))))
 
-(defun describe-revoke (arg)
-  "Run a `revoke' and report it in words."
+(defun describe-enrolment (e &optional (now (unix-now)))
+  "One record in one line: what it is, and — for a settled one — what happened to it and when."
+  (format nil "  ~a  ~a~@[  via ~(~a~)~]~@[  first seen ~a ago~]~@[  ~a~]"
+          (subseq (enrolment-pubkey e) 0 8)
+          (if (enrolment-live-p e now)
+              (format nil "expires in ~a" (%ago (- (enrolment-expiry e) now)))
+              (format nil "~:@(~a~) ~a ago" (enrolment-state e)
+                      (%ago (- now (enrolment-since e)))))
+          (enrolment-via e)
+          (and (plusp (enrolment-created e)) (%ago (- now (enrolment-created e))))
+          (and (not (enrolment-live-p e now)) (enrolment-cause e))))
+
+(defun describe-enrolments (&key (state :active))
+  "Human-readable listing of enrolled terminals.  STATE :ALL includes the records of terminals that
+lapsed or were revoked — which is the listing somebody wants AFTER something has gone wrong, and the
+reason revoking marks instead of deleting."
+  (let ((rows (list-enrolment-records :state state)) (now (unix-now)))
+    (if (null rows)
+        (if (eq state :active) "No terminals are enrolled." "Nothing is on the record.")
+        (format nil "~a ~:[record~;enrolled terminal~]~p:~%~{~a~%~}~@
+                     Use \"revoke <first-8>\" or \"revoke all\"~:[~;, \"devices all\" for the record~]."
+                (length rows) (eq state :active) (length rows)
+                (mapcar (lambda (e) (describe-enrolment e now)) rows)
+                (eq state :active)))))
+
+(defun describe-revoke (arg &key by)
+  "Run a `revoke' and report it in words.  BY is the authority it is performed on, and it goes onto
+each record's cause — `on whose authority' being one of the questions the record exists to answer."
   (if (null arg)
       "Usage: revoke <first-8-of-pubkey> | revoke all"
-      (let ((killed (revoke-enrolments arg)))
+      (let ((killed (revoke-enrolments arg :by by)))
         (if (null killed)
             (format nil "Nothing matched \"~a\"." arg)
-            (format nil "Revoked ~a terminal~:p:~%~{  ~a~%~}" (length killed)
-                    (mapcar (lambda (pk) (subseq pk 0 8)) killed))))))
+            (format nil "Revoked ~a terminal~:p:~%~{  ~a~%~}~:[~;~
+                         They stay on the record, revoked, until the retention window runs out.~]"
+                    (length killed)
+                    (mapcar (lambda (pk) (subseq pk 0 8)) killed)
+                    (audit-retained-p))))))
 
 (defvar *login-url-base*
   (or (%blank->nil (sb-ext:posix-getenv "GLASS_LOGIN_URL_BASE"))
@@ -1224,12 +1660,16 @@ that is the whole reason the two surfaces cannot drift apart."
                                          (and (integerp killed) (plusp killed)
                                               "This replaces any earlier link I sent you — those no longer work."))
                                  "This box has no identity and cannot mint a link.")))))
-                 (:devices (if admin (describe-enrolments) :denied))
-                 (:revoke (if admin (describe-revoke arg) :denied))
+                 (:devices
+                  (if admin
+                      (describe-enrolments
+                       :state (if (and arg (string-equal arg "all")) :all :active))
+                      :denied))
+                 (:revoke (if admin (describe-revoke arg :by pubkey) :denied))
                  (:help
                   (if (or admin dev)
                       (format nil "Commands:~%  link~%~@[~a~]"
-                              (and admin "  devices~%  revoke <first-8> | revoke all~%"))
+                              (and admin "  devices [all]~%  revoke <first-8> | revoke all~%"))
                       :denied))
                  (t nil))))
         (values reply verb role)))))
@@ -1374,14 +1814,22 @@ same question of the same function instead of reimplementing the answer."
       ;; fail-closed policy at the other end.
       ((string= verb "ping")
        (%net-line :ok :box (or (box-pubkey) "none") :allow (length *nostr-allow*)
-                  :devices (enrolment-count) :ttl *enrolment-ttl*))
+                  :devices (enrolment-count) :ttl *enrolment-ttl*
+                  :retention *audit-retention*))
       ;; ---- the authentication path: decide, enrol, and mint the renewal in one round trip
+      ;;
+      ;; EXPIRES IS THE NEW FIELD AND IT IS THE POINT OF THE ROUND TRIP HAVING AN ANSWER AT ALL.  A
+      ;; transport copies it into the answer envelope beside the renewal code; the browser stores it
+      ;; against this box and can then tell, at its NEXT cold load and before it has spoken to
+      ;; anybody, whether the credential it is about to offer is one this box still honours.  A
+      ;; denial is silence by design, so this is the only channel that fact has.
       ((string= verb "admit")
        (if (null pub)
            (%net-line :err :reason "no-pub")
-           (multiple-value-bind (via token status) (admit-peer pub (getf params :code))
+           (multiple-value-bind (via token status expires) (admit-peer pub (getf params :code))
              (if via
-                 (%net-line :ok :via via :code status :token token :devices (enrolment-count))
+                 (%net-line :ok :via via :code status :token token :expires expires
+                            :devices (enrolment-count))
                  (%net-line :deny :reason status)))))
       ;; ---- the allowlist predicate, asked as a question.  A second surface's invoker is THIS and
       ;; nothing else — not the session's `via', which takes the first of code/allowlist/device and
@@ -1390,15 +1838,29 @@ same question of the same function instead of reimplementing the answer."
        (%net-line :ok :allowed (if (allowed-pubkey-p pub) 1 0)))
       ;; ---- the store as a result-set.  No PUB: this is the shared query behind warp's panel, one
       ;; for however many phones are looking, and the per-peer rule is on the COMMANDS below.
+      ;;
+      ;; THE BODY LINE IS THE FILE LINE, field for field, so one parser reads both and a reader that
+      ;; wants only `<pubkey> <expiry>' — which is what ADMISSION-DEVICES and every deployed caller
+      ;; want — goes on taking the first two words and never notices the rest arrived.  That is the
+      ;; whole compatibility story for this verb: the row got longer at the end.
+      ;;
+      ;; `state=all' (or expired / revoked) asks for the settled records as well.  DEFAULT ACTIVE,
+      ;; because the panel projects CURRENT STATE (DESIGN.md rule 4) and a list that quietly grew
+      ;; two weeks of revoked terminals would be an event log wearing a result-set's clothes.
       ((string= verb "devices")
-       (let ((rows (list-enrolments)))
-         (values (%net-line :ok :rows (length rows))
-                 (mapcar (lambda (r) (format nil "~a ~a" (car r) (cdr r))) rows))))
-      ;; ---- and the destructive one, which is allowlist-only wherever it is invoked from
+       (let* ((want (let ((s (%undash (getf params :state))))
+                      (if s (intern (string-upcase s) :keyword) :active)))
+              (rows (list-enrolment-records
+                     :state (if (member want '(:active :all :expired :revoked)) want :active))))
+         (values (%net-line :ok :rows (length rows) :state want)
+                 (mapcar #'%enrolment-line rows))))
+      ;; ---- and the destructive one, which is allowlist-only wherever it is invoked from.  PUB is
+      ;; the authority, and now it is also what the record says it was revoked BY: the panel and the
+      ;; DM surface reach one function, so they leave one kind of evidence.
       ((string= verb "revoke")
        (cond ((not (allowed-pubkey-p pub)) (%net-line :deny :reason "not-allowed"))
              ((null (getf params :arg)) (%net-line :err :reason "no-arg"))
-             (t (let ((killed (revoke-enrolments (getf params :arg))))
+             (t (let ((killed (revoke-enrolments (getf params :arg) :by pub)))
                   (values (%net-line :ok :rows (length killed)) killed)))))
       ;; ---- a link, for the surfaces that are not the DM bot.  Same rule the `link' command
       ;; applies: an allowlisted owner or an enrolled device, and nobody else.
@@ -1579,16 +2041,56 @@ answer and the second value is how a caller can say so out loud."
           (t nil))))
 
 (defun admission-devices (&rest where)
-  "The desktop's enrolments, as ((pubkey . expiry) …).  (values NIL :unreachable) when nobody
+  "The desktop's LIVE enrolments, as ((pubkey . expiry) …).  (values NIL :unreachable) when nobody
 answered — which a caller must not render as an empty list, because `no terminals are enrolled' and
-`the desktop is not there' are different things to show somebody."
+`the desktop is not there' are different things to show somebody.
+
+THE FIRST TWO FIELDS AND NOTHING ELSE, which is the contract this function has always had and the
+reason the record could grow without a caller changing.  It takes the second WORD rather than the
+rest of the line — the rest of the line is a record now, and PARSE-INTEGER over `1234 active 0 …'
+does not answer 1234, it answers nothing, which would have rendered every terminal as lapsed."
   (multiple-value-bind (status plist body) (apply #'admission-request :devices where)
     (declare (ignore plist))
     (if (eq status :ok)
         (loop for line in body
-              for sp = (position #\Space line)
-              when sp collect (cons (subseq line 0 sp)
-                                    (or (ignore-errors (parse-integer (subseq line (1+ sp)))) 0)))
+              for w = (remove "" (%split-on line #\Space) :test #'string=)
+              when (>= (length w) 2)
+                collect (cons (first w) (%int (second w))))
+        (values nil :unreachable))))
+
+(defun admission-records (&rest where &key state &allow-other-keys)
+  "The desktop's enrolment RECORDS, as plists:
+
+    (:pubkey … :expiry … :state :active/:expired/:revoked :created … :seen …
+     :via :code/:allowlist/:device :nonce … :for … :since … :cause …)
+
+STATE selects, exactly as the service's verb does: :ACTIVE (default), :ALL, :EXPIRED, :REVOKED.
+(values NIL :unreachable) when nobody answered, for the reason ADMISSION-DEVICES gives.
+
+A PLIST AND NOT AN OBJECT, because the caller is in another image and another system: the transport
+that asks this has no reason to load a class definition to read ten fields, and a plist is what its
+own projection is going to map over anyway."
+  (setf where (copy-list where))
+  (remf where :state)
+  (multiple-value-bind (status plist body)
+      (apply #'admission-request :devices (append (when state (list :state state)) where))
+    (declare (ignore plist))
+    (if (eq status :ok)
+        (loop for line in body
+              for w = (remove "" (%split-on line #\Space) :test #'string=)
+              when (>= (length w) 2)
+                collect (list :pubkey (string-downcase (first w))
+                              :expiry (%int (second w))
+                              :state (if (third w)
+                                         (intern (string-upcase (third w)) :keyword)
+                                         :active)
+                              :created (%int (fourth w)) :seen (%int (fifth w))
+                              :via (let ((v (%undash (sixth w))))
+                                     (and v (intern (string-upcase v) :keyword)))
+                              :nonce (%undash (seventh w))
+                              :for (%undash (eighth w))
+                              :since (%int (ninth w))
+                              :cause (%undash (tenth w))))
         (values nil :unreachable))))
 
 (defun admission-revoke (pubkey arg &rest where)

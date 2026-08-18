@@ -116,9 +116,18 @@
    ;; rest in a browser's localStorage, and they want opposite numbers
    #:*login-ttl* #:*renewal-ttl* #:mint-login-token #:verify-login-token #:login-token-status
    #:*nostr-allow* #:normalize-pubkey #:refresh-nostr-allow #:allowed-pubkey-p
+   ;; the enrolment store: a RECORD per terminal, not a row — what admitted it, when, on whose
+   ;; authority, and a state (:active / :expired / :revoked) with the time and cause of the
+   ;; transition, so `revoke' marks instead of destroying the evidence it was performed for.
+   ;; *AUDIT-RETENTION* is how long a settled record is kept, and zero really means nothing is.
    #:*enrolment-file* #:*enrolment-ttl* #:*enrolments* #:load-enrolments #:save-enrolments
    #:sync-enrolments #:enrol-device #:device-enrolled-p #:list-enrolments #:enrolment-count
-   #:revoke-enrolments #:describe-enrolments #:describe-revoke
+   #:revoke-enrolments #:describe-enrolments #:describe-revoke #:describe-enrolment
+   #:*audit-retention* #:audit-retained-p
+   #:enrolment #:enrolment-pubkey #:enrolment-expiry #:enrolment-state #:enrolment-created
+   #:enrolment-seen #:enrolment-via #:enrolment-nonce #:enrolment-issued #:enrolment-since
+   #:enrolment-cause #:enrolment-live-p
+   #:device-enrolment #:list-enrolment-records #:find-enrolments
    ;; what became of every code this box minted: redeemed (bound to the ONE key that traded it in),
    ;; superseded (a newer link for the same recipient), or pruned at expiry — so a successful login
    ;; means nobody else used that code, the honest retry still passes, and an untapped link stops
@@ -126,14 +135,14 @@
    #:*login-code-file* #:login-code-file #:*login-codes* #:redeem-nonce #:record-mint
    #:login-code #:login-code-store #:code-nonce #:code-expiry #:code-state #:code-recipient
    #:code-redeemer #:code-minted #:code-settled #:code-table #:code-lock #:code-source #:code-mtime
-   #:list-login-codes #:find-login-code #:login-code-count #:describe-login-codes
+   #:list-login-codes #:find-login-code #:login-code-count #:describe-login-codes #:code-live-p
    #:admit-peer #:parse-nostr-command #:nostr-command-reply #:*login-url-base*
    #:*admission-port* #:*admission-port-offset* #:seat-admission-port #:*admission-host*
    #:*admission-timeout* #:admission-serve #:start-admission-service #:stop-admission-service
    #:admission-service #:admission-service-p #:admission-service-port #:admission-service-report
    #:admission-service-running #:*session-admission-service*
    #:admission-request #:admission-ping #:admission-admit #:admission-allowed-p
-   #:admission-devices #:admission-revoke #:admission-mint
+   #:admission-devices #:admission-records #:admission-revoke #:admission-mint
    #:*nostr-relays* #:*nostr-command-max-age* #:start-nostr-bot #:stop-nostr-bot
    #:nostr-bot #:nostr-bot-p #:nostr-bot-report #:nostr-bot-pubkey #:nostr-bot-npub
    #:nostr-bot-received #:nostr-bot-answered #:nostr-bot-denied #:nostr-bot-ignored
