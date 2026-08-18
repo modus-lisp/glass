@@ -287,6 +287,45 @@ loopback-only VNC port is a *worse copy of a door that already exists* — every
 served by the socket file, and the only thing a port adds is somebody on another machine. A feature
 whose default made it useless would be a feature nobody turns on.
 
+## What met the code a fourth time: a *URL* is not a handoff
+
+A fourth round, from outside this note's subject — publishing — which nevertheless took two things
+away from it.
+
+**12. There are four keys, not three.** "Three keys, and one we can probably drop" presents its
+list as complete: transport, seat, session/box. There is a **site key**, and on 2026-08-18 it
+arrived in this same image. It is not a destination and not an identity anybody addresses; it is
+the authority to *replace every page served at an npub*, and publishing is destructive by
+construction because kind 15128 is replaceable. The section's actual argument survives intact — the
+box key may still be the home seat's, and that is still worth doing — but the enumeration was
+offered as the whole set and was not, which is the same failure mode as point 9: a sentence nobody
+had to implement to make the section compile.
+
+It also lands the other way round. The note's answer to "what should hold a key" has been *the
+thing the key names*: a seat's key belongs to the seat, a transport's to the transport. A site key
+names neither a place nor a wire, and it ended up here for a reason the note has no vocabulary for
+— **it is held by whoever must speak with that authority, and the thing that must is the process
+that mints links to what was published.** `glass/src/site.lisp` records what that costs.
+
+**13. The recurring error has a fifth costume, and it is a value in the wrong process's
+environment.** The catalogue is: the compositor, the mixer, warp's rule 8, the session conflated
+with one wire, and (point 8) the credential conflated with the session. Add: **the published URL,
+conflated with one transport's environment.** `LOGIN_URL_BASE` describes what the SITE is serving —
+a session-level fact, true for every wire — and it lived in the WebRTC gateway's env, refreshed
+from a file by that gateway's restart loop. The moment the `link` command moved into the desktop,
+the fact stayed where it was and the new holder froze: the site served `/k42.html` while the box
+handed out `/k27.html` on a stale gateway host, from a build older than the box key rotation.
+
+**14. And a recorded *handoff* is a search pattern the way a recorded trap is.** Point 7 says a
+trap written down should be re-read as a search pattern. This is the stronger version: `site-url.env`
+never became wrong. Its writer went on writing, its content stayed correct, and it acquired a reader
+that read it once at exec — **a file cannot report that nobody is reading it any more.** So the
+question to ask of every file two processes share is not "is it right" but "who reads it, and
+when", and any answer of the form "at process start" is a handoff waiting for its consumer to move.
+The remedy here was not a better file: it was putting the writer and the reader in one image so the
+fact is a variable. What survives on disk (`~/.glass/site-url`) is read by the *same* image, once,
+before it has minted anything — which is a memo, and the distinction is the whole of the fix.
+
 ### Still not built
 
 **Per-seat admission** (the `invoker` becoming a principal) is unchanged and still wanted. **Capture

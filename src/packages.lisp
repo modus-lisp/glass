@@ -128,6 +128,16 @@
    #:nostr-bot #:nostr-bot-p #:nostr-bot-report #:nostr-bot-pubkey #:nostr-bot-npub
    #:nostr-bot-received #:nostr-bot-answered #:nostr-bot-denied #:nostr-bot-ignored
    #:*session-nostr-bot* #:start-session-nostr
+   ;; publishing the client this box hands out links to (the :glass/site system) — the OTHER half
+   ;; of a login link, in the same image as the mint, because a URL carried between two processes
+   ;; in an environment variable is a URL that freezes the day one of them moves
+   #:*site-key-file* #:*site-url-file* #:*site-npub* #:site-secret #:site-identity-p #:site-npub
+   #:*site-blossom* #:*site-relays* #:*site-lookup-relays* #:*site-gateway* #:*site-title*
+   #:site-publication #:site-publication-npub #:site-publication-version #:site-publication-path
+   #:site-publication-url #:site-publication-hash #:site-publication-at #:site-publication-report
+   #:site-publication-problems #:*last-site-publication* #:site-report
+   #:save-site-url #:load-site-url #:set-login-url-base #:site-link-path
+   #:note-site-publication #:publish-site #:publish-site-file #:read-file-octets
    ;; standing perf counters (read a snapshot over the control socket)
    #:*perf-on* #:perf-reset #:perf-report #:perf-record-send #:perf-record-composite
    #:*send-lag* #:*send-queue*))

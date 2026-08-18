@@ -72,6 +72,15 @@
         collect (string-trim '(#\Space #\Tab) (subseq string start i))
         while i do (setf start (1+ i))))
 
+(defun %blank->nil (s)
+  "S trimmed, or NIL if it is not a string or has nothing in it.
+
+An UNSET environment variable and one exported EMPTY are the same statement — `this launcher has
+no value for you' — and only one of them is NIL to POSIX-GETENV.  Reading them differently is how
+`\"\"' ends up in a login link."
+  (let ((s (and (stringp s) (string-trim '(#\Space #\Tab #\Newline #\Return) s))))
+    (and s (plusp (length s)) s)))
+
 (defun %one-line (thing)
   "THING printed with every blank turned into a dash, so it cannot break a line-framed protocol."
   (map 'string (lambda (c) (if (member c '(#\Space #\Tab #\Newline #\Return)) #\- c))
@@ -648,12 +657,21 @@ than a generous match."
                     (mapcar (lambda (pk) (subseq pk 0 8)) killed))))))
 
 (defvar *login-url-base*
-  (or (sb-ext:posix-getenv "GLASS_LOGIN_URL_BASE") (sb-ext:posix-getenv "LOGIN_URL_BASE"))
+  (or (%blank->nil (sb-ext:posix-getenv "GLASS_LOGIN_URL_BASE"))
+      (%blank->nil (sb-ext:posix-getenv "LOGIN_URL_BASE")))
   "The published client a magic link points at.  It must name a PATH (…/k23.html), not a ?v= query:
 an nsite gateway resolves a request by path against its manifest, so a query string selects the same
 blob and the browser is free to keep serving its cached copy.
 
-NIL means `link' has nowhere to send anybody, and says so rather than handing out half a URL.")
+NIL means `link' has nowhere to send anybody, and says so rather than handing out half a URL.
+
+A VARIABLE, AND THAT IS THE FIX.  This used to be filled in once from an environment variable a
+DIFFERENT process wrote into a file — and the day the `link' command moved out of the gateway and
+into this image, the reader that was re-reading that file every three seconds stopped existing and
+nothing noticed.  The site was serving /k42.html; this box handed out /k27.html from weeks before.
+:glass/site publishes IN THIS IMAGE and SETFs this in the same call, so there is no handoff left to
+be stale.  Without that system loaded the environment is still where the value comes from, which is
+exactly as good as it ever was and no worse.")
 
 (defun nostr-command-reply (pubkey payload)
   "The reply this box owes PUBKEY for a command DM, or NIL if PAYLOAD is not a command.

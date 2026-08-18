@@ -224,6 +224,25 @@ a desktop without it starts exactly as before and simply admits nobody of its ow
   :serial t
   :components ((:module "src" :serial t :components ((:file "nostr")))))
 
+(asdf:defsystem :glass/site
+  :description "The box publishes its own client, in the image that mints links to it.  A login
+link is a token AND a URL; the token was minted here and the URL was minted in another process and
+carried over in an environment variable, so the day the DM bot moved into the desktop it froze —
+the site was serving /k42.html while the desktop handed out a /k27.html from weeks before, on a
+gateway host that had been stale all week.  That is not a bad value, it is publishing and minting
+being different processes coordinating through a file.  PUBLISH-SITE (CL-NOSTR.NSITE underneath)
+sets *LOGIN-URL-BASE* in the same call that published the manifest, with nothing between them but
+a variable reference, so there is no reader left to go stale.  SEPARATE FROM :glass/nostr on
+purpose: this system is the only thing that touches the SITE key — the authority to replace every
+page served at that npub — and the WebRTC gateway loads :glass/nostr for the client half of
+admission.  A system boundary is the only thing that reliably keeps code out of an image."
+  :version "0.0.1"
+  :author "ynniv"
+  :license "MIT"
+  :depends-on ("glass/nostr")
+  :serial t
+  :components ((:module "src" :serial t :components ((:file "site")))))
+
 (asdf:defsystem :glass/term
   :description "A terminal emulator on glass: a real PTY + shell, an ANSI/VT
 parser, and a character grid rendered with scribe, served over VNC.  No xterm,
