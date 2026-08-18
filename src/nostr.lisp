@@ -313,10 +313,18 @@ depend on ENCODE-UNIVERSAL-TIME's timezone handling being what we assumed it was
 ;;; inside a gift-wrapped DM — only that npub can read it — so holding a valid code IS the proof of
 ;;; identity, and no browser signer is needed.
 ;;;
-;;; A CODE IS REUSABLE UNTIL IT EXPIRES.  There is no spent-nonce set and deliberately no plan for
-;;; one: its TTL plus the authenticated delivery is the security boundary, and single use burned the
-;;; code on the first — possibly failed — attempt, so a page reload cost a person their login.  (An
-;;; older header claimed the gateway enforced single use.  It never did; this says so instead.)
+;;; A CODE IS REDEEMED ONCE, BY ONE KEY, and the store that decides it is THE REDEMPTION STORE
+;;; below.  The MAC and the expiry are still stateless — that has to stay true, because they are what
+;;; a token minted years ago is checked against — so single use is a separate fact kept beside the
+;;; enrolments rather than baked into the token.  What a successful login now means is `nobody else
+;;; used this code', which is what turns an intercepted link from undetectable into detected.
+;;;
+;;; IT IS A BINDING AND NOT A BURN, for the reason the burn was rejected the first time: signalling
+;;; is one-shot and non-trickle over three relays with no renegotiation, so a lost answer means the
+;;; phone RE-OFFERS with the same code, and relay fan-out delivers one offer several times anyway.
+;;; A code that could be shown exactly once refused the honest retry and stranded the user — and the
+;;; failure looked exactly like the bug it was supposed to fix.  Binding the nonce to the pubkey
+;;; that redeemed it keeps the retry working and still refuses the interceptor: see REDEEM-NONCE.
 ;;;
 ;;; THE WIRE FORMAT IS FROZEN.  Every link in somebody's message history is a string in this shape
 ;;; keyed by this MAC, so changing any of it — the separator, the label, the epoch — invalidates
@@ -324,16 +332,64 @@ depend on ENCODE-UNIVERSAL-TIME's timezone handling being what we assumed it was
 ;;; PREVIOUS implementation as a literal and verifies it here, so that claim is checked and not
 ;;; merely asserted.
 
+;;; TWO TTLS, BECAUSE THERE ARE TWO JOBS.  These were ONE parameter (*LOGIN-TTL*, 1800 s) doing both,
+;;; which is why neither could be tuned: the numbers want to move in opposite directions.
+;;;
+;;;   A LINK is a credential in transit.  It is DM'd to a person, sits in a notification, and is
+;;;   tapped — the window it is exposed for IS its TTL, and nothing else about it wants to be long.
+;;;   A LINK'S TTL IS THE ONLY THING BOUNDING A LEAKED LINK.
+;;;
+;;;   A RENEWAL is a credential at rest.  It rides back in the answer envelope into localStorage and
+;;;   has to still be there on that browser's NEXT LOAD, which may be tomorrow.  Shortening it does
+;;;   not make anything safer — it is already sitting in the same browser's storage as the device
+;;;   key it would fall back to — it just quietly demotes a `code' admission to a `device' one.
+;;;
+;;; So they are split, and a deployment that shortens one no longer silently shortens the other.
+
 (defparameter *login-ttl*
   (or (ignore-errors (parse-integer (or (sb-ext:posix-getenv "GLASS_LOGIN_TTL")
                                         (sb-ext:posix-getenv "LINK_TTL"))))
-      1800)
-  "Default lifetime of a minted login code, seconds.  Half an hour: long enough to walk to the
-other room and open the link, short enough that a screenshot of a DM is not a permanent key.
+      600)
+  "Lifetime of a minted LINK, seconds.  Ten minutes, and the reasoning is worth keeping because the
+number is the only bound on a leaked link:
+
+  WHAT IT HAS TO COVER.  Gift-wrap publish and relay fan-out are seconds, not minutes — that is not
+  what sets the floor.  What sets it is a person: the DM lands, the phone is face down in another
+  room, they walk over, unlock it, open the DM, and tap.  Then the client's tap-to-open gate asks
+  for one more deliberate tap (a link-preview bot must not be able to redeem a code by rendering
+  the page).  Five minutes covers that with nothing to spare, and a link that fails because
+  somebody answered the door is a link they ask for again — which is not a security event but IS a
+  worse experience than the risk it buys back.
+
+  WHAT IT HAS TO NOT COVER.  Thirty minutes was `long enough to walk to the other room' with
+  twenty-five minutes of slack attached, and that slack is exactly the window in which a
+  screenshot, a forwarded message or a mirrored notification is a working key.  Ten minutes keeps
+  the human path and deletes the slack.
+
+  WHY TEN AND NOT FIVE.  Five is defensible and this dial is one environment variable, but five
+  starts failing the ordinary case, and the failure of a too-short link is indistinguishable at the
+  far end from the failures that matter.  Ten is the largest number that still makes a DM found
+  later useless.
+
+  AND IT IS NO LONGER THE ONLY DEFENCE, which is what makes shortening it safe rather than merely
+  strict: the code is bound to the first key that redeems it, superseded the moment a newer link is
+  minted for the same person, and burned on use even when the caller did not need it.
 
 LINK_TTL is honoured as a fallback because that is the name the gateway's launcher already exports,
 and a value that silently stopped being read on the day this moved would be the worst kind of
 regression — invisible, and only in the direction of longer-lived credentials.")
+
+(defparameter *renewal-ttl*
+  (or (ignore-errors (parse-integer (sb-ext:posix-getenv "GLASS_RENEWAL_TTL")))
+      1800)
+  "Lifetime of the renewal code handed back in an answer envelope, seconds.
+
+UNCHANGED AT HALF AN HOUR, deliberately: this is the value the field is already running, and the
+point of splitting it out of *LOGIN-TTL* was to shorten the LINK without touching this.  A renewal
+that expires is not a lockout — the browser falls back to its device enrolment (*ENROLMENT-TTL*, a
+day, renewed by use) — so the failure of a short renewal is invisible, gradual, and exactly the kind
+of behaviour change that should be somebody's decision rather than a side effect of tightening
+links.  Raise it toward *ENROLMENT-TTL* if you want `via=code' on a next-day cold load.")
 
 (defun %secret-bytes (secret)
   "SECRET as 64-hex string, byte vector, or integer -> (unsigned-byte 8) vector."
@@ -356,13 +412,34 @@ regression — invisible, and only in the direction of longer-lived credentials.
              do (setf diff (logior diff (logxor (char-code ca) (char-code cb))))
              finally (return (zerop diff)))))
 
-(defun mint-login-token (&key (ttl *login-ttl*) (secret *box-secret*))
-  "Mint a login code valid for TTL seconds, keyed by the box SECRET.  NIL without an identity."
+(defun mint-login-token (&key (ttl *login-ttl*) (secret *box-secret*) for)
+  "Mint a login code valid for TTL seconds, keyed by the box SECRET.  NIL without an identity.
+
+FOR NAMES THE RECIPIENT A LINK IS BEING SENT TO, and passing it is what makes this mint SUPERSEDE
+that recipient's earlier outstanding codes — see RECORD-MINT.  It is not part of the token: the MAC
+is over `glass-login|nonce|exp' and nothing else, frozen, so the binding is the STORE's and the
+token stays byte-compatible with every link ever issued.  That separation is what lets a link be
+redeemed by a browser's own device key while still being cancellable by the person it was sent to.
+
+WITHOUT :FOR NOTHING IS RECORDED and nothing is superseded, which is the correct behaviour for the
+two mints that have no recipient: the renewal that rides back in an answer envelope (it belongs to
+whoever is already in the session) and the gateway's allowlist top-up.  A renewal that joined a
+supersede group would cancel its own predecessor — or, on a reconnect race, itself — and lock a
+person out of the terminal they are sitting at.
+
+Returns (values TOKEN SUPERSEDED), where SUPERSEDED is how many of the recipient's earlier
+outstanding codes this mint cancelled — NIL when there was no :FOR.  The `link' command says so in
+its reply, because a person who taps an older link afterwards is going to be refused and the only
+place that can be explained is the message carrying the replacement."
   (when secret
     (ignore-errors
-     (let ((nonce (ironclad:byte-array-to-hex-string (ironclad:random-data 16)))
-           (exp (+ (unix-now) ttl)))
-       (format nil "~a.~a.~a" nonce exp (%token-mac secret nonce exp))))))
+     (let* ((nonce (ironclad:byte-array-to-hex-string (ironclad:random-data 16)))
+            (exp (+ (unix-now) ttl))
+            (token (format nil "~a.~a.~a" nonce exp (%token-mac secret nonce exp))))
+       ;; recorded AFTER the token exists and before it is handed out.  If the store cannot be
+       ;; written the code is still a valid single-use code — it simply supersedes nothing — which
+       ;; is the right way for this to degrade: a failure here must not stop somebody logging in.
+       (values token (when for (record-mint nonce exp (normalize-pubkey for))))))))
 
 (defun verify-login-token (token &key (secret *box-secret*))
   "Verify TOKEN against the box SECRET.  Returns (values OK NONCE EXP): OK is T only if the MAC
@@ -381,7 +458,12 @@ which is what lets a denial say `expired' rather than `bad' and be diagnosable f
 
 (defun login-token-status (token)
   "Classify TOKEN: :OK, :EXPIRED, :BAD (wrong MAC or malformed), or :ABSENT.  Distinct reasons, so
-a denied login can be told apart from a login that was never attempted."
+a denied login can be told apart from a login that was never attempted.
+
+CRYPTOGRAPHY ONLY — this asks nothing of the redemption store and takes no lock, so it stays a pure
+function of the token and the box secret.  :OK here means `this box minted it and it has not
+expired', which is a strictly weaker claim than `this key may use it': whether it has already been
+traded is ADMIT-PEER's question, because the answer depends on WHO is asking."
   (if (or (not (stringp token)) (zerop (length token)))
       :absent
       (multiple-value-bind (ok nonce) (verify-login-token token)
@@ -453,6 +535,21 @@ costing somebody their access until the next deploy."
 ;;; mtime change, which is what lets a shell one-liner, an admin app, or warp's device panel revoke
 ;;; a terminal and have it honoured on the next check with no restart anywhere.  Persistence is not
 ;;; a convenience: an in-memory set would silently un-enrol every terminal on any restart.
+;;;
+;;; ONE LOCK, HELD ACROSS THE WHOLE OF EVERY OPERATION, and it has to be.  This used to sync outside
+;;; the mutex and then take it, and to open the file for :SUPERSEDE outside it as well, which is a
+;;; real race and not a theoretical one:
+;;;
+;;;   thread A enrols and enters SAVE-ENROLMENTS.  Opening the file truncates it.  Before A writes a
+;;;   byte, thread B calls DEVICE-ENROLLED-P, sees a changed mtime, CLRHASHes and reloads — from the
+;;;   empty file.  A then finishes writing and records the final mtime, so the next sync sees no
+;;;   change and never reloads.  The file is correct and THE TABLE IS EMPTY, and every terminal is
+;;;   un-enrolled until something else touches the file.
+;;;
+;;; It went unnoticed because nothing ever admitted two peers at the same instant — until the
+;;; concurrency proof for the login-code store started doing exactly that, and caught it.  So the
+;;; file operations moved inside the lock: %-prefixed helpers assume it is HELD, the exported names
+;;; take it, and no public call in this section leaves the table visible mid-rewrite.
 
 (defparameter *enrolment-ttl*
   (or (ignore-errors (parse-integer (or (sb-ext:posix-getenv "GLASS_DEVICE_TTL")
@@ -469,69 +566,89 @@ the reason *LOGIN-TTL* gives about LINK_TTL: it is the name the launcher already
 
 The same format the WebRTC gateway used, on purpose — an existing store is copied across and works,
 and warp-monitor's reader parses it unchanged.  DEFVAR, so a hot-load cannot move the store out
-from under a running desktop.")
+from under a running desktop.
+
+THE LOGIN-CODE STORE IS DERIVED FROM THIS PATH (`<this>.codes', see LOGIN-CODE-FILE), so redirecting
+this one redirects both.")
 
 (defvar *enrolments* (make-hash-table :test 'equal))
 (defvar *enrolments-lock* (sb-thread:make-mutex :name "glass-enrolments"))
 (defvar *enrolments-mtime* nil)
 
-(defun load-enrolments ()
+;;; ---- internals.  ALL THREE REQUIRE *ENROLMENTS-LOCK* ALREADY HELD. ------------
+
+(defun %load-enrolments ()
+  "Merge the file into the table.  Does NOT clear first — %SYNC-ENROLMENTS decides that."
   (handler-case
       (with-open-file (s *enrolment-file* :if-does-not-exist nil)
         (when s
-          (sb-thread:with-mutex (*enrolments-lock*)
-            (loop for line = (read-line s nil) while line do
-              (let* ((sp (position #\Space line))
-                     (pk (and sp (subseq line 0 sp)))
-                     (exp (and sp (ignore-errors (parse-integer (subseq line (1+ sp)))))))
-                (when (and pk exp (> exp (unix-now)))
-                  (setf (gethash (string-downcase pk) *enrolments*) exp)))))))
+          (loop for line = (read-line s nil) while line do
+            (let* ((sp (position #\Space line))
+                   (pk (and sp (subseq line 0 sp)))
+                   (exp (and sp (ignore-errors (parse-integer (subseq line (1+ sp)))))))
+              (when (and pk exp (> exp (unix-now)))
+                (setf (gethash (string-downcase pk) *enrolments*) exp))))))
     (error () nil)))
 
-(defun save-enrolments ()
+(defun %save-enrolments ()
+  "Rewrite the file from the table, lapsed rows dropped."
   (handler-case
       (progn
         (with-open-file (s *enrolment-file* :direction :output :if-exists :supersede
                                             :if-does-not-exist :create)
-          (sb-thread:with-mutex (*enrolments-lock*)
-            (maphash (lambda (pk exp) (when (> exp (unix-now)) (format s "~a ~a~%" pk exp)))
-                     *enrolments*)))
+          (maphash (lambda (pk exp) (when (> exp (unix-now)) (format s "~a ~a~%" pk exp)))
+                   *enrolments*))
         ;; remember our own write, so the next SYNC does not re-read what we have just said
         (setf *enrolments-mtime* (ignore-errors (file-write-date *enrolment-file*))))
     (error () nil)))
 
-(defun sync-enrolments ()
-  "Re-read the store if the file changed underneath us."
+(defun %sync-enrolments ()
+  "Re-read if the file changed underneath us."
   (handler-case
       (let ((mt (file-write-date *enrolment-file*)))
         (unless (eql mt *enrolments-mtime*)
           (setf *enrolments-mtime* mt)
-          (sb-thread:with-mutex (*enrolments-lock*) (clrhash *enrolments*))
-          (load-enrolments)))
+          (clrhash *enrolments*)
+          (%load-enrolments)))
     (error () nil)))
 
+;;; ---- and the same three, taking the lock, for everybody else -----------------
+
+(defun load-enrolments ()
+  (sb-thread:with-mutex (*enrolments-lock*) (%load-enrolments)))
+
+(defun save-enrolments ()
+  (sb-thread:with-mutex (*enrolments-lock*) (%save-enrolments)))
+
+(defun sync-enrolments ()
+  "Re-read the store if the file changed underneath us."
+  (sb-thread:with-mutex (*enrolments-lock*) (%sync-enrolments)))
+
 (defun enrol-device (pubkey &optional (ttl *enrolment-ttl*))
-  "Trust PUBKEY to ask for its own login links for TTL seconds.  Renews an existing enrolment."
+  "Trust PUBKEY to ask for its own login links for TTL seconds.  Renews an existing enrolment.
+
+SYNC, SET AND SAVE IN ONE CRITICAL SECTION.  Two peers admitted at the same instant otherwise race
+each other's rewrite of the file, and a reader between them sees the truncation."
   (when (stringp pubkey)
-    (sync-enrolments)
     (sb-thread:with-mutex (*enrolments-lock*)
-      (setf (gethash (string-downcase pubkey) *enrolments*) (+ (unix-now) ttl)))
-    (save-enrolments)
+      (%sync-enrolments)
+      (setf (gethash (string-downcase pubkey) *enrolments*) (+ (unix-now) ttl))
+      (%save-enrolments))
     t))
 
 (defun device-enrolled-p (pubkey)
-  (sync-enrolments)
   (and (stringp pubkey)
        (sb-thread:with-mutex (*enrolments-lock*)
+         (%sync-enrolments)
          (let ((exp (gethash (string-downcase pubkey) *enrolments*)))
            (and exp (> exp (unix-now)) t)))))
 
 (defun list-enrolments ()
   "The live enrolments as ((pubkey . expiry) …), longest remaining first.  A lapsed row is not
 returned even while the file still holds it: a lapsed terminal is not an enrolled one."
-  (sync-enrolments)
   (let ((now (unix-now)) (rows '()))
     (sb-thread:with-mutex (*enrolments-lock*)
+      (%sync-enrolments)
       (maphash (lambda (pk exp) (when (> exp now) (push (cons pk exp) rows))) *enrolments*))
     (sort rows #'> :key #'cdr)))
 
@@ -543,9 +660,9 @@ returned even while the file still holds it: a lapsed terminal is not an enrolle
 The prefix is matched at four characters and up while the surface advertises eight.  Kept as it was:
 a prefix refused for being one character short is worse than a prefix that is generous, and the
 operator typed it themselves — the ADVERTISED length is the one to copy."
-  (sync-enrolments)
   (let ((killed '()))
     (sb-thread:with-mutex (*enrolments-lock*)
+      (%sync-enrolments)
       (cond
         ((and (stringp arg) (string-equal arg "all"))
          (maphash (lambda (pk exp) (declare (ignore exp)) (push pk killed)) *enrolments*)
@@ -557,44 +674,438 @@ operator typed it themselves — the ADVERTISED length is the one to copy."
                                  (string= arg (subseq pk 0 (length arg))))
                         (push pk killed)))
                     *enrolments*))
-         (dolist (pk killed) (remhash pk *enrolments*)))))
-    (save-enrolments)
+         (dolist (pk killed) (remhash pk *enrolments*))))
+      (%save-enrolments))
     killed))
+
+;;; ---- the login-code store: what became of every code this box minted ---------
+;;;
+;;; A code used to be a pure function of the box secret: mint it, and from then on the only facts
+;;; about it were its MAC and its expiry.  That made two things impossible to say, and this store
+;;; exists to say both.
+;;;
+;;; ONE — A CODE IS REDEEMED ONCE, BY ONE KEY.  The first key to present a code binds it and is
+;;; enrolled; the code has been TRADED for the enrolment and there is nothing left to spend.  That
+;;; same key may present it again as often as it likes and is admitted every time.  A DIFFERENT key
+;;; is refused, and that refusal is worth waking somebody for: the code went to exactly one npub
+;;; inside a gift wrap, so two keys holding it means the link leaked.  A successful login therefore
+;;; MEANS `nobody else used this code', which turns interception from undetectable into detected.
+;;;
+;;; TWO — A CODE NOBODY TAPPED STOPS BEING LIVE WHEN IT IS CLEARLY UNNECESSARY.  Single use does
+;;; nothing about the commonest shape there is: ask for a link, tap nothing, ask again.  The second
+;;; link works, the person is content, and the first one is still armed in a DM until its TTL runs
+;;; out.  So MINTING SUPERSEDES: a link minted FOR a recipient invalidates that recipient's earlier
+;;; outstanding codes, in the same critical section that mints it.
+;;;
+;;; THE ENDS A CODE CAN COME TO, kept as distinct reasons and not collapsed to a boolean, because a
+;;; person locked out deserves to be told which one happened and the three have different answers:
+;;;
+;;;   :outstanding  minted, not yet presented.  Live.
+;;;   :redeemed     traded, and REDEEMED-BY names the key that traded it.  Live for that key alone.
+;;;   :superseded   a newer link was minted for the same recipient.  Ask for a fresh one.
+;;;                 (Expiry is the fourth end and is not a state: an expired row is simply pruned,
+;;;                  because VERIFY-LOGIN-TOKEN refuses the code at the same instant with no help.)
+;;;
+;;; WHAT DOES *NOT* INVALIDATE A CODE, and this is a decision rather than an omission:
+;;;
+;;;   AN ADMISSION DOES NOT BURN THE ADMITTED IDENTITY'S OTHER CODES.  "They are already logged in,
+;;;   so kill their outstanding links" sounds right and has a trap in it.  A phone connected on its
+;;;   enrolment and a laptop that was just sent a link are the same person; burning on the phone's
+;;;   next reconnect kills the laptop's link before anybody taps it, and the laptop then fails
+;;;   EXACTLY the way an intercepted code fails — which is the one distinction this whole store was
+;;;   built to make legible.  The rule kept instead is the narrower one that cannot misfire:
+;;;   A CODE IS INVALIDATED ONLY BY A LATER MINT TO THE SAME RECIPIENT.  It satisfies "a code minted
+;;;   after the last admission survives" by construction — nothing about admission is consulted —
+;;;   and it still kills the shape that motivated any of this, because asking again IS a later mint.
+;;;
+;;;   A RENEWAL SUPERSEDES NOTHING, because it has no recipient.  Every admitted `code'/`device'
+;;;   session is handed a fresh code in the answer envelope, minted with a fresh random nonce and no
+;;;   :FOR — so it is never recorded at mint time, never joins a supersede group, and cannot cancel
+;;;   the link somebody is walking to another room to tap.  A renewal that superseded its own
+;;;   predecessor, or worse itself, would lock a user out of their own terminal on reconnect; that
+;;;   is the failure this feature is most at risk of introducing, so nostr-gate.lisp walks a
+;;;   twenty-deep renewal chain rather than reasoning about it.
+;;;
+;;; THE THREE THINGS THAT MAKE IT TRUE, in the order they are easy to get wrong:
+;;;
+;;;   ATOMICITY.  Check-and-bind is ONE critical section, and so is supersede-and-insert — each
+;;;   takes the store's lock, reloads, prunes, decides and persists without releasing it.  A gap
+;;;   anywhere in there lets two racing redemptions both see a nonce free, or two racing mints both
+;;;   survive, and either is the entire property gone to a missing lock.  Note the shape difference
+;;;   from ENROL-DEVICE, which syncs OUTSIDE its mutex and then takes it: that is fine for a store
+;;;   where the LAST writer wins, and fatal for one where the FIRST writer must.
+;;;
+;;;   PERSISTENCE.  A restart that forgot would silently restore reusability — the feature would
+;;;   test green on a live desktop for the fifteen minutes before its next deploy and be gone
+;;;   afterwards.  So it is a file, in the same shape and beside the same store as the enrolments,
+;;;   and pruned at each code's own expiry so it stays a handful of lines: a code lives 15–30
+;;;   minutes, and a row for an expired code is dead weight the MAC check already refuses.
+;;;
+;;;   THE RENEWAL PATH, above.  Asserted rather than assumed.
+;;;
+;;; A SEPARATE FILE, DERIVED FROM THE ENROLMENT ONE, and both halves of that are deliberate.
+;;; Separate, because `<pubkey> <expiry>' lines are a format other readers already parse — warp's
+;;; device panel, a shell one-liner — and SAVE-ENROLMENTS rewrites the whole file, so a second
+;;; record type sharing it would be either misparsed as a terminal or truncated away by the other
+;;; writer.  Derived (`<enrolment-file>.codes') rather than independently configured, because the
+;;; one thing that must never happen is a test or a second desktop writing the LIVE store: anything
+;;; that redirects GLASS_DEVICE_FILE now redirects this too, in the same breath, with nothing to
+;;; remember.  Resolved per call and not at load, so rebinding *ENROLMENT-FILE* moves both.
+
+(defvar *login-code-file*
+  (%blank->nil (sb-ext:posix-getenv "GLASS_CODE_FILE"))
+  "Where the fate of minted codes is persisted, or NIL to derive one beside the enrolments.
+
+One space-separated line per code, positional, `-' for a field that does not apply:
+
+    <nonce-hex> <state> <expiry> <recipient|-> <redeemed-by|-> <minted-at> <settled-at>
+
+Positional and greppable rather than structured, like every other store this desktop keeps: `grep
+superseded' is the diagnostic, and a line is readable next to a log entry without a parser.  The
+two timestamps are what make it an audit record instead of a set — MINTED-AT is what orders a
+supersede group, and SETTLED-AT is what lets a leak report say the code was traded BEFORE its owner
+ever tapped it, which is a different sentence from `somebody has your link'.")
+
+(defun login-code-file ()
+  "The path minted codes live at, resolved now rather than at load time."
+  (or *login-code-file* (concatenate 'string (princ-to-string *enrolment-file*) ".codes")))
+
+;;; CLOS AND NOT DEFSTRUCT, for the reason the modus stack defaults to it: this is long-lived state
+;;; in an image that gets patched while it is serving people, and a DEFSTRUCT whose slots change
+;;; strands every live instance, where UPDATE-INSTANCE-FOR-REDEFINED-CLASS migrates them.  A store
+;;; that admits people is the last thing that should need a restart to grow a field — and this one
+;;; grew two the same week it was written.
+
+(defclass login-code ()
+  ((nonce     :initarg :nonce     :reader code-nonce)
+   (expiry    :initarg :expiry    :reader code-expiry)
+   (state     :initarg :state     :accessor code-state    :initform :outstanding)
+   (recipient :initarg :recipient :reader   code-recipient :initform nil)
+   (redeemer  :initarg :redeemer  :accessor code-redeemer :initform nil)
+   (minted    :initarg :minted    :reader   code-minted   :initform 0)
+   (settled   :initarg :settled   :accessor code-settled  :initform 0))
+  (:documentation "One login code, and what became of it.
+
+RECIPIENT is who the link was sent to and is the key a supersede group is formed on; REDEEMER is the
+key that actually traded it in.  They are DIFFERENT ROLES and usually different keys — a link is
+DM'd to a person's npub and redeemed by the browser's own device key, which is the whole reason the
+gateway tops an allowlist admission up with a bearer code at all.  Collapsing them into one `pubkey'
+slot would make superseding and leak detection the same question, and they are not."))
+
+(defclass login-code-store ()
+  ((table  :initform (make-hash-table :test 'equal) :reader code-table)
+   (lock   :initform (sb-thread:make-mutex :name "glass-login-codes") :reader code-lock)
+   (source :initform nil :accessor code-source)
+   (mtime  :initform nil :accessor code-mtime))
+  (:documentation "Minted codes, and the file they came from.
+
+SOURCE is the path last read or written, not merely the mtime: rebinding *ENROLMENT-FILE* points
+LOGIN-CODE-FILE somewhere else entirely, and a store that only watched the mtime would happily
+answer a question about the new file out of the old file's table."))
+
+(defvar *login-codes* (make-instance 'login-code-store)
+  "What became of the codes this desktop minted.  DEFVAR for the reason *BOX-SECRET* is one — a
+hot-load of this file must not drop the set of codes already spent.")
+
+;;; ---- internals.  ALL OF THESE REQUIRE THE STORE'S LOCK ALREADY HELD.  They are separate from
+;;; the public calls for exactly that reason: a helper that took the lock itself would deadlock the
+;;; critical sections this whole feature rests on.
+
+(defun %code-field (s) (if (equal s "-") nil s))
+(defun %code-out (s) (or s "-"))
+
+(defun %codes-load (store)
+  "Re-read STORE if it is looking at a different file, or the file changed underneath it."
+  (let* ((file (login-code-file))
+         (mt (ignore-errors (file-write-date file))))
+    (when (or (not (equal file (code-source store)))
+              (not (eql mt (code-mtime store))))
+      (setf (code-source store) file
+            (code-mtime store) mt)
+      (clrhash (code-table store))
+      (handler-case
+          (with-open-file (s file :if-does-not-exist nil)
+            (when s
+              (let ((now (unix-now)))
+                (loop for line = (read-line s nil) while line do
+                  (let ((w (remove "" (%split-on line #\Space) :test #'string=)))
+                    (when (>= (length w) 7)
+                      (let ((nonce (string-downcase (first w)))
+                            (state (intern (string-upcase (second w)) :keyword))
+                            (exp (ignore-errors (parse-integer (third w))))
+                            (rcpt (%code-field (fourth w)))
+                            (by (%code-field (fifth w)))
+                            (minted (ignore-errors (parse-integer (sixth w))))
+                            (settled (ignore-errors (parse-integer (seventh w)))))
+                        ;; an unknown state is dropped rather than trusted: a row this build cannot
+                        ;; interpret must not become a code it silently treats as live
+                        (when (and exp (> exp now)
+                                   (member state '(:outstanding :redeemed :superseded)))
+                          (setf (gethash nonce (code-table store))
+                                (make-instance 'login-code
+                                               :nonce nonce :expiry exp :state state
+                                               :recipient (and rcpt (string-downcase rcpt))
+                                               :redeemer (and by (string-downcase by))
+                                               :minted (or minted 0)
+                                               :settled (or settled 0)))))))))))
+        (error () nil)))))
+
+(defun %codes-prune (store now)
+  "Drop rows whose code has expired.  Returns how many went.
+
+Pruned AT THE CODE'S OWN EXPIRY and not a moment before — that is the same instant
+VERIFY-LOGIN-TOKEN starts refusing it, so there is never a window where the row is gone and the
+code still works."
+  (let ((dead '()))
+    (maphash (lambda (k c) (unless (> (code-expiry c) now) (push k dead))) (code-table store))
+    (dolist (k dead) (remhash k (code-table store)))
+    (length dead)))
+
+(defun %codes-save (store)
+  "Write STORE out, expired rows dropped.  Whole-file rewrite, like the enrolments."
+  (handler-case
+      (let ((file (login-code-file))
+            (now (unix-now)))
+        (with-open-file (s file :direction :output :if-exists :supersede
+                                :if-does-not-exist :create)
+          (maphash (lambda (k c)
+                     (declare (ignore k))
+                     (when (> (code-expiry c) now)
+                       (format s "~a ~(~a~) ~a ~a ~a ~a ~a~%"
+                               (code-nonce c) (code-state c) (code-expiry c)
+                               (%code-out (code-recipient c)) (%code-out (code-redeemer c))
+                               (code-minted c) (code-settled c))))
+                   (code-table store)))
+        ;; remember our own write, so the next load does not re-read what we have just said
+        (setf (code-source store) file
+              (code-mtime store) (ignore-errors (file-write-date file))))
+    (error () nil)))
+
+;;; ---- the two public transitions ----------------------------------------------
+
+(defun record-mint (nonce expiry recipient &key (store *login-codes*))
+  "Record NONCE as outstanding for RECIPIENT, and supersede RECIPIENT's earlier outstanding codes.
+Returns the number superseded, or NIL if there was nothing to record.
+
+ONE CRITICAL SECTION, and that is the point rather than an implementation detail: two `link' DMs
+answered at once must not both leave a live code behind, so supersede-and-insert cannot be two
+calls.  ONLY :OUTSTANDING ROWS ARE SUPERSEDED — a code the recipient already redeemed is a terminal
+they are sitting in front of, and a later link must not reach back and log them out of it."
+  (when (and (stringp nonce) (plusp (length nonce)) (integerp expiry)
+             (stringp recipient) (plusp (length recipient)))
+    (let ((nonce (string-downcase nonce))
+          (recipient (string-downcase recipient))
+          (now (unix-now)))
+      (sb-thread:with-mutex ((code-lock store))
+        (%codes-load store)
+        (%codes-prune store now)
+        (let ((killed 0))
+          (maphash (lambda (k c)
+                     (declare (ignore k))
+                     (when (and (eq (code-state c) :outstanding)
+                                (equal (code-recipient c) recipient)
+                                (not (equal (code-nonce c) nonce)))
+                       (setf (code-state c) :superseded
+                             (code-settled c) now)
+                       (incf killed)))
+                   (code-table store))
+          (setf (gethash nonce (code-table store))
+                (make-instance 'login-code :nonce nonce :expiry expiry :state :outstanding
+                                           :recipient recipient :minted now))
+          (%codes-save store)
+          killed)))))
+
+(defun redeem-nonce (nonce pubkey expiry &key (bind t) (store *login-codes*))
+  "Trade NONCE, a code valid until EXPIRY, for PUBKEY's admission.
+
+Returns (values OK STATE HOLDER):
+  OK      T if PUBKEY may use this code
+  STATE   :BOUND       it was live and is now PUBKEY's        (first redemption)
+          :AGAIN       PUBKEY already holds it                (the retry, and it passes)
+          :FREE        it was live and BIND was NIL           (a probe; nothing was written)
+          :TAKEN       another key holds it   (OK NIL — the link leaked)
+          :SUPERSEDED  a newer link replaced it (OK NIL — ask for a fresh one)
+  HOLDER  on :TAKEN, the key that got there first
+
+A NONCE WITH NO ROW AT ALL IS LIVE, and that is deliberate: a renewal token and a code from the
+command-line link minter are never recorded at mint time, because neither has a recipient to form a
+supersede group with.  They are recorded HERE, at the moment they are redeemed, which is all
+single-use needs.
+
+WITH BIND NIL THIS ONLY ASKS.  ADMIT-PEER passes its own :ENROL through, because a call that
+deliberately does not enrol is a `would this peer be admitted' probe, and a probe that silently
+spent somebody's code would be a worse bug than the one this fixes.
+
+THE WHOLE BODY IS ONE CRITICAL SECTION.  Load, prune, look up, bind and persist happen without
+releasing the lock, so N threads presenting one live code produce exactly one :BOUND and N-1
+:TAKEN — never two winners.  nostr-gate.lisp runs that race rather than reading this paragraph."
+  (when (and (stringp nonce) (stringp pubkey) (integerp expiry)
+             (plusp (length nonce)) (plusp (length pubkey)))
+    (let ((nonce (string-downcase nonce))
+          (pubkey (string-downcase pubkey))
+          (now (unix-now)))
+      (sb-thread:with-mutex ((code-lock store))
+        (%codes-load store)
+        (let* ((dirty (plusp (%codes-prune store now)))
+               (prior (gethash nonce (code-table store)))
+               (result
+                 (cond
+                   ((and prior (eq (code-state prior) :redeemed))
+                    (if (equal (code-redeemer prior) pubkey)
+                        (list t :again pubkey)
+                        (list nil :taken (code-redeemer prior))))
+                   ((and prior (eq (code-state prior) :superseded))
+                    (list nil :superseded nil))
+                   ((not bind) (list t :free nil))
+                   (prior                                    ; :outstanding — trade it in
+                    (setf (code-state prior) :redeemed
+                          (code-redeemer prior) pubkey
+                          (code-settled prior) now
+                          dirty t)
+                    (list t :bound pubkey))
+                   (t                                        ; a bare token: renewal, or the CLI
+                    (setf (gethash nonce (code-table store))
+                          (make-instance 'login-code :nonce nonce :expiry expiry :state :redeemed
+                                                     :redeemer pubkey :minted now :settled now)
+                          dirty t)
+                    (list t :bound pubkey)))))
+          (when dirty (%codes-save store))
+          (values-list result))))))
+
+;;; ---- reading it ---------------------------------------------------------------
+
+(defun list-login-codes (&optional (store *login-codes*))
+  "The live rows as LOGIN-CODE objects, most recently settled first.  Diagnostic only — nothing
+decides anything from this list; the decisions are made inside the lock, above."
+  (let ((now (unix-now)) (rows '()))
+    (sb-thread:with-mutex ((code-lock store))
+      (%codes-load store)
+      (maphash (lambda (k c) (declare (ignore k))
+                 (when (> (code-expiry c) now) (push c rows)))
+               (code-table store)))
+    (sort rows #'> :key (lambda (c) (max (code-settled c) (code-minted c))))))
+
+(defun find-login-code (nonce &optional (store *login-codes*))
+  "The row for NONCE, or NIL."
+  (when (stringp nonce)
+    (find (string-downcase nonce) (list-login-codes store) :key #'code-nonce :test #'equal)))
+
+(defun login-code-count (&optional (store *login-codes*)) (length (list-login-codes store)))
+
+(defun describe-login-codes (&optional (store *login-codes*))
+  "The outstanding and spent codes in words, for an operator staring at a lockout."
+  (let ((rows (list-login-codes store)) (now (unix-now)))
+    (if (null rows)
+        "No codes are outstanding."
+        (format nil "~a live code~:p:~%~{~a~%~}" (length rows)
+                (mapcar (lambda (c)
+                          (format nil "  ~a  ~10@a  expires in ~d min~@[  to ~a…~]~@[  by ~a…~]"
+                                  (subseq (code-nonce c) 0 8)
+                                  (string-downcase (symbol-name (code-state c)))
+                                  (max 0 (round (- (code-expiry c) now) 60))
+                                  (and (code-recipient c) (subseq (code-recipient c) 0 8))
+                                  (and (code-redeemer c) (subseq (code-redeemer c) 0 8))))
+                        rows)))))
 
 ;;; ---- admission ---------------------------------------------------------------
 ;;;
 ;;; THREE WAYS IN, CHECKED IN THIS ORDER, FIRST MATCH WINS, with deliberately different lifetimes:
 ;;;
-;;;   code       a login token from a magic link.  Valid for its own TTL, and it authorises
-;;;              INDEPENDENTLY of the allowlist — that is what a magic link is for.
+;;;   code       a login token from a magic link.  Valid for its own TTL, redeemable by ONE key,
+;;;              and it authorises INDEPENDENTLY of the allowlist — that is what a magic link is for.
 ;;;   allowlist  the identities this desktop belongs to.  Permanent.
 ;;;   device     a browser enrolled after arriving on a valid code.  *ENROLMENT-TTL*, renewed by use.
 ;;;
 ;;; ANY ADMITTED PEER IS ENROLLED, which is what makes a terminal keep working across reconnects and
 ;;; is also why one leaked link is durable access until somebody runs `revoke'.  Both halves of that
 ;;; are true, and the second is why `revoke' exists.
+;;;
+;;; A CODE THAT IS NO LONGER USABLE DOES NOT DEMOTE A PEER WHO HAS STANDING OF THEIR OWN.  :spent
+;;; and :superseded kill the `code' row and nothing more, so an owner or an enrolled terminal that
+;;; presents a code somebody else beat them to — or one a newer link replaced — is still let in the
+;;; way they always were, and the STATUS carries the fact so the event is visible in the log of an
+;;; admission that SUCCEEDED.
+;;;
+;;; AND REDEMPTION IS NOT CONTINGENT ON NEED.  A code that could have been redeemed IS redeemed,
+;;; before anything asks whether the caller had another way in.  It looks like waste — the terminal
+;;; was already enrolled, the code bought it nothing — and it is the point: an offer that carries a
+;;; code and is admitted on an enrolment would otherwise leave that code LIVE, in a DM, for the rest
+;;; of its TTL, having already been used by the person it was sent to.  The client sends the code
+;;; whenever it has one for exactly this reason; the box must spend it whenever it is sent one, and
+;;; the obvious optimisation ("we already have an enrolment, skip the code") is the bug.  It is
+;;; stated here, and asserted in nostr-gate.lisp, because nothing about the code path's POSITION in
+;;; the COND makes it true on purpose rather than by accident.
 
-(defun admit-peer (pubkey code &key (enrol t) (ttl *login-ttl*))
+(defun admit-peer (pubkey code &key (enrol t) (ttl *renewal-ttl*))
   "Decide whether PUBKEY, holding CODE, may open this desktop.
 
 Returns (values VIA TOKEN STATUS):
   VIA     :code / :allowlist / :device, or NIL when refused
   TOKEN   a fresh login code to hand back with the answer, or NIL
-  STATUS  the code's own status (:absent :bad :expired :ok) — ALWAYS, so a peer admitted by the
-          allowlist while presenting a rotten code is visible rather than silently fine
+  STATUS  the code's own status — ALWAYS, so a peer admitted by the allowlist while presenting a
+          rotten code is visible rather than silently fine, and so a failure screen can eventually
+          tell an unremarkable expiry from something worth investigating:
+            :absent      none was offered
+            :bad         malformed, or not minted by this box
+            :expired     good MAC, past its expiry                      (unremarkable)
+            :superseded  good, but a NEWER LINK for the same recipient replaced it
+            :spent       good and live, but ANOTHER KEY REDEEMED IT     (the link leaked)
+            :ok          good, live, and this key's to redeem
+
+REDEMPTION HAPPENS HERE AND NOWHERE ELSE, in the same call that enrols and mints: the code is
+traded for the enrolment, atomically, and a peer whose enrolment is the thing it bought can never
+find the trade half-done.  It is attempted for EVERY offer that carries a live code, whether or not
+the caller needed it, and bound only when ENROL is true — a non-enrolling call is a probe, and a
+probe must not spend somebody's code (see REDEEM-NONCE's :BIND).
 
 The renewal token is minted for a peer that came in on a code or as an enrolled device, and not for
 one admitted purely by the allowlist — an owner has a signer and does not need a bearer credential
-pushed at them.  That is the rule the field is already running; it is preserved exactly."
-  (let* ((status (login-token-status code))
-         (via (cond ((eq status :ok) :code)
-                    ((allowed-pubkey-p pubkey) :allowlist)
-                    ((device-enrolled-p pubkey) :device)
-                    (t nil))))
-    (when (and via enrol) (enrol-device pubkey))
-    (values via
-            (when (member via '(:code :device)) (mint-login-token :ttl ttl))
-            status)))
+pushed at them.  That is the rule the field is already running; it is preserved exactly.  It is
+minted with NO :FOR, so it joins no supersede group and cancels nothing, and with a fresh random
+nonce, so it never arrives already spent.  TTL defaults to *RENEWAL-TTL* and not to *LOGIN-TTL*:
+this is a credential at rest in localStorage, not one in transit through a DM."
+  (multiple-value-bind (code-live nonce code-exp) (verify-login-token code)
+    (let* ((crypto-status (cond ((or (not (stringp code)) (zerop (length code))) :absent)
+                                ((null nonce) :bad)
+                                ((not code-live) :expired)
+                                (t :ok)))
+           ;; REDEEMABLE and not merely :OK: a code presented without a pubkey cannot be bound to
+           ;; one, and admitting on a code nobody can be held to would be a way to use a code
+           ;; without redeeming it — the one hole this whole section exists to close.
+           (redeemable (and (eq crypto-status :ok) (stringp pubkey) (plusp (length pubkey))))
+           (holder nil)
+           (status (if (not redeemable)
+                       crypto-status
+                       ;; UNCONDITIONAL.  Not inside the COND below, not guarded by "unless the
+                       ;; allowlist would have taken them anyway" — see the note above.
+                       (multiple-value-bind (ok state who)
+                           (redeem-nonce nonce pubkey code-exp :bind enrol)
+                         (setf holder who)
+                         (cond (ok :ok)
+                               ((eq state :superseded) :superseded)
+                               (t :spent)))))
+           (via (cond ((and (eq status :ok) redeemable) :code)
+                      ((allowed-pubkey-p pubkey) :allowlist)
+                      ((device-enrolled-p pubkey) :device)
+                      (t nil))))
+      ;; LOUD, AND ON PURPOSE.  Every other denial here is quiet because it is ordinary — a lapsed
+      ;; terminal, a typo'd code, a link the owner replaced.  This one is not ordinary: two
+      ;; different keys held one code that was delivered to exactly one npub inside a gift wrap, so
+      ;; either that DM was read by somebody it was not for or the link was forwarded.  It is the
+      ;; only signal this system has that an interception HAPPENED, and a signal nobody prints is a
+      ;; signal nobody gets.  :superseded is deliberately NOT loud: that one is routine hygiene.
+      (when (eq status :spent)
+        (flet ((tag (s) (subseq s 0 (min 8 (length s)))))
+          (format *error-output*
+                  "~&@@ LOGIN CODE ALREADY REDEEMED — nonce ~a… was traded by ~a… and has just been~@
+                   @@   presented by ~a…  One code, two keys: that link leaked.  The FIRST key is~@
+                   @@   the one that is enrolled;  revoke ~a…  if it was not you.~%"
+                  (tag nonce) (tag (or holder "?")) (tag pubkey) (tag (or holder "?")))
+          (finish-output *error-output*)))
+      (when (and via enrol) (enrol-device pubkey))
+      (values via
+              (when (member via '(:code :device)) (mint-login-token :ttl ttl))
+              status))))
 
 ;;; ---- the command surface -----------------------------------------------------
 ;;;
@@ -691,15 +1202,27 @@ that is the whole reason the two surfaces cannot drift apart."
                (case verb
                  (:link
                   ;; the one command an enrolled device may also use: a terminal whose code is about
-                  ;; to lapse can refresh itself with nobody doing anything
+                  ;; to lapse can refresh itself with nobody doing anything.
+                  ;;
+                  ;; MINTED :FOR THE SENDER, which is what makes asking twice safe.  "Ask for a
+                  ;; link, tap nothing, ask again" is the commonest shape there is, and without a
+                  ;; recipient on the mint every unused link in that history stays armed until its
+                  ;; TTL runs out.  With one, the new link cancels the old ones in the same critical
+                  ;; section that mints it — so at most ONE outstanding code per person exists, and
+                  ;; it is always the most recent.
                   (cond ((not (or admin dev)) :denied)
                         ((null *login-url-base*)
                          "This box has no published client to link to (LOGIN_URL_BASE is unset).")
-                        (t (let ((token (mint-login-token :ttl *login-ttl*)))
+                        (t (multiple-value-bind (token killed)
+                               (mint-login-token :ttl *login-ttl* :for pubkey)
                              (if token
-                                 (format nil "Fresh glass login link (expires in ~a min):~%~%~a#box=~a&code=~a"
+                                 (format nil "Fresh glass login link (expires in ~a min):~%~%~a#box=~a&code=~a~@[~%~%~a~]"
                                          (max 1 (round *login-ttl* 60)) *login-url-base*
-                                         (or (box-npub) "") token)
+                                         (or (box-npub) "") token
+                                         ;; said out loud, because a person who taps an older link
+                                         ;; after this will be refused and deserves to know why
+                                         (and (integerp killed) (plusp killed)
+                                              "This replaces any earlier link I sent you — those no longer work."))
                                  "This box has no identity and cannot mint a link.")))))
                  (:devices (if admin (describe-enrolments) :denied))
                  (:revoke (if admin (describe-revoke arg) :denied))
@@ -879,13 +1402,28 @@ same question of the same function instead of reimplementing the answer."
                   (values (%net-line :ok :rows (length killed)) killed)))))
       ;; ---- a link, for the surfaces that are not the DM bot.  Same rule the `link' command
       ;; applies: an allowlisted owner or an enrolled device, and nobody else.
+      ;;
+      ;; PUB IS THE AUTHORITY; `for' IS THE RECIPIENT, and the presence of `for' is what makes this
+      ;; a LINK rather than a TOP-UP.  The two callers want opposite things from the same verb:
+      ;;
+      ;;   mint pub=X          the gateway topping up an allowlist admission — a credential going
+      ;;                       straight into THAT session's localStorage for its next cold load.  It
+      ;;                       has no recipient, must not cancel anybody's outstanding link, and
+      ;;                       wants *RENEWAL-TTL* because it has to still be there tomorrow.
+      ;;   mint pub=X for=Y    a surface sending Y a link (warp's device panel, an admin app).  It
+      ;;                       is a credential in transit, wants the short *LOGIN-TTL*, and
+      ;;                       supersedes Y's earlier outstanding codes exactly as `link' does.
+      ;;
+      ;; An explicit ttl= still wins over both, so a caller that knows what it is doing can say so.
       ((string= verb "mint")
-       (let ((ttl (or (ignore-errors (parse-integer (getf params :ttl))) *login-ttl*)))
+       (let* ((for (normalize-pubkey (getf params :for)))
+              (ttl (or (ignore-errors (parse-integer (getf params :ttl)))
+                       (if for *login-ttl* *renewal-ttl*))))
          (if (not (or (allowed-pubkey-p pub) (device-enrolled-p pub)))
              (%net-line :deny :reason "not-allowed")
-             (let ((token (mint-login-token :ttl ttl)))
+             (multiple-value-bind (token killed) (mint-login-token :ttl ttl :for for)
                (if token
-                   (%net-line :ok :token token :ttl ttl)
+                   (%net-line :ok :token token :ttl ttl :for for :superseded killed)
                    (%net-line :err :reason "no-identity"))))))
       (t (%net-line :err :reason "unknown-op")))))
 
@@ -1065,7 +1603,14 @@ the list revoked, or (values NIL :denied / :unreachable)."
       (t (values nil :denied)))))
 
 (defun admission-mint (pubkey &rest where)
-  "A fresh login token on PUBKEY's authority, or NIL if refused or unreachable."
+  "A fresh login token on PUBKEY's authority, or NIL if refused or unreachable.
+
+WHERE carries the endpoint (:HOST/:PORT/:PATH) and may also carry :FOR and :TTL, which go to the
+server as ordinary parameters.  :FOR NAMES A RECIPIENT and is the difference between the two things
+this verb does — with it the token is a LINK (short *LOGIN-TTL*, and it supersedes that recipient's
+earlier outstanding codes); without it, a TOP-UP for the session already asking (*RENEWAL-TTL*, and
+it supersedes nothing).  A gateway topping up an allowlist admission wants the second and passes no
+:FOR, which is why its call is unchanged."
   (multiple-value-bind (status plist) (apply #'admission-request :mint :pub pubkey where)
     (and (eq status :ok) (getf plist :token))))
 

@@ -112,11 +112,21 @@
    #:seat-identity #:seat-identity-for #:seat-identity-known #:seat-identity-name
    #:seat-identity-pubkey #:seat-identity-npub #:seat-identity-secret
    #:list-seat-identities #:forget-seat-identity #:*seat-key-file* #:*seat-keys*
-   #:*login-ttl* #:mint-login-token #:verify-login-token #:login-token-status
+   ;; two TTLs and not one: a LINK is a credential in transit through a DM, a RENEWAL is one at
+   ;; rest in a browser's localStorage, and they want opposite numbers
+   #:*login-ttl* #:*renewal-ttl* #:mint-login-token #:verify-login-token #:login-token-status
    #:*nostr-allow* #:normalize-pubkey #:refresh-nostr-allow #:allowed-pubkey-p
    #:*enrolment-file* #:*enrolment-ttl* #:*enrolments* #:load-enrolments #:save-enrolments
    #:sync-enrolments #:enrol-device #:device-enrolled-p #:list-enrolments #:enrolment-count
    #:revoke-enrolments #:describe-enrolments #:describe-revoke
+   ;; what became of every code this box minted: redeemed (bound to the ONE key that traded it in),
+   ;; superseded (a newer link for the same recipient), or pruned at expiry — so a successful login
+   ;; means nobody else used that code, the honest retry still passes, and an untapped link stops
+   ;; being live the moment it is unnecessary
+   #:*login-code-file* #:login-code-file #:*login-codes* #:redeem-nonce #:record-mint
+   #:login-code #:login-code-store #:code-nonce #:code-expiry #:code-state #:code-recipient
+   #:code-redeemer #:code-minted #:code-settled #:code-table #:code-lock #:code-source #:code-mtime
+   #:list-login-codes #:find-login-code #:login-code-count #:describe-login-codes
    #:admit-peer #:parse-nostr-command #:nostr-command-reply #:*login-url-base*
    #:*admission-port* #:*admission-port-offset* #:seat-admission-port #:*admission-host*
    #:*admission-timeout* #:admission-serve #:start-admission-service #:stop-admission-service

@@ -60,14 +60,35 @@
       glass:*login-url-base* "https://example.invalid/k1.html")
 (glass:refresh-nostr-allow *owner*)
 (clrhash glass:*enrolments*)
+;; the login-code store rides on the enrolment file's path, so redirecting one redirects both —
+;; but a suite that assumed that and was wrong would write the LIVE store, so it is asserted below
+;; rather than trusted, and the file is cleared here the same way the enrolments are.
+(ignore-errors (delete-file (glass:login-code-file)))
+(setf glass:*login-codes* (make-instance 'glass:login-code-store))
+
+(defun hexkey (n) (string-downcase (format nil "~64,'0x" n)))   ; a pubkey-shaped string per N
+
+(defun slurp (path)
+  "PATH's whole text, or \"\" if it is not there.  The code store is asserted against its FILE and
+not only against the process's memory, because the file is the half that survives a restart."
+  (with-open-file (s path :if-does-not-exist nil)
+    (if (null s) ""
+        (with-output-to-string (o)
+          (loop for l = (read-line s nil) while l do (write-line l o))))))
 
 (banner "the fixture is in /tmp and the live store is not touched")
 (ok "the enrolment file is under /tmp" (eql 0 (search "/tmp/" glass:*enrolment-file*)))
 (ok "and it is not the live one" (not (equal glass:*enrolment-file* *live*)))
+(ok "the login-code store is DERIVED from it, so one redirection moves both"
+    (and (equal (glass:login-code-file) (concatenate 'string *fixture* ".codes"))
+         (eql 0 (search "/tmp/" (glass:login-code-file))))
+    (glass:login-code-file))
 (let ((before (and (probe-file *live*) (file-write-date *live*))))
   (defparameter *live-mtime-before* before)
   (ok "the live store's mtime is noted, and checked again at the end"
       (or (null before) (integerp before))))
+(defparameter *live-codes* (concatenate 'string *live* ".codes"))
+(defparameter *live-codes-before* (and (probe-file *live-codes*) (file-write-date *live-codes*)))
 
 ;;; ==============================================================================
 (banner "the identity")
@@ -228,6 +249,414 @@
            (not (glass:device-enrolled-p never)))))
 
 ;;; ==============================================================================
+(banner "a code is REDEEMED — once, by one key, and the honest retry still passes")
+;;; ==============================================================================
+;;;
+;;; The property: A SUCCESSFUL REDEMPTION MEANS NOBODY ELSE USED THAT CODE.  What makes it hard is
+;;; that the client legitimately re-presents one — signalling is one-shot and non-trickle over three
+;;; relays with no renegotiation, so a lost answer means the phone re-offers with the same code, and
+;;; fan-out delivers the same offer several times regardless.  A strict burn refuses that retry and
+;;; strands the user, and the failure looks EXACTLY like the bug being fixed.  So the two cases are
+;;; tested against each other here, not one at a time.
+
+(glass:revoke-enrolments "all")
+(setf glass:*login-codes* (make-instance 'glass:login-code-store))
+(ignore-errors (delete-file (glass:login-code-file)))
+
+(defparameter *alice* (hexkey #xA11CE))
+(defparameter *mallory* (hexkey #x27A11))
+
+(defun quietly (thunk)
+  "Run THUNK with the leak alarm captured rather than printed.  Returns (values RESULT SAID)."
+  (let* ((noise (make-string-output-stream))
+         (r (let ((*error-output* noise)) (multiple-value-list (funcall thunk)))))
+    (values r (get-output-stream-string noise))))
+
+(defun holder-of (token)
+  "The key the store says redeemed TOKEN's nonce, or NIL."
+  (let ((c (glass:find-login-code (nth-value 1 (glass:verify-login-token token)))))
+    (and c (glass:code-redeemer c))))
+
+(defun state-of (token)
+  (let ((c (glass:find-login-code (nth-value 1 (glass:verify-login-token token)))))
+    (and c (glass:code-state c))))
+
+(format t "~&   -- two different keys, one code: first wins --~%")
+(let ((code (glass:mint-login-token :ttl 900)))
+  (multiple-value-bind (via token status) (glass:admit-peer *alice* code)
+    (ok "the first key to present a code is admitted :code" (eq :code via))
+    (ok "  …with status :ok" (eq :ok status))
+    (ok "  …and is enrolled — the code was TRADED for the enrolment"
+        (and token (glass:device-enrolled-p *alice*)))
+    (ok "  …and the store says :redeemed, by that key, and not merely `spent'"
+        (and (eq :redeemed (state-of code)) (equal *alice* (holder-of code)))))
+  ;; the interceptor.  Loud on *error-output* by design, so it is captured rather than muted:
+  ;; a refusal nobody can see is not the feature.
+  (multiple-value-bind (r said) (quietly (lambda () (glass:admit-peer *mallory* code)))
+    (ok "a DIFFERENT key presenting the same code is REFUSED" (null (first r)))
+    (ok "  …with :spent, which is a different denial from :bad, :expired and :superseded"
+        (eq :spent (third r)))
+    (ok "  …and it is not enrolled by the attempt" (not (glass:device-enrolled-p *mallory*)))
+    (ok "  …and it is LOGGED LOUDLY — the only signal this system has that a link leaked"
+        (and (search "ALREADY REDEEMED" said) (search (subseq *alice* 0 8) said)
+             (search (subseq *mallory* 0 8) said))
+        (string-trim '(#\Newline #\Space) (subseq said 0 (min 96 (length said))))))
+  (ok "the first key still holds it after the attempt" (equal *alice* (holder-of code))))
+
+(format t "~&   -- the SAME key, twice: the retry case, which is the one that breaks users --~%")
+(let ((code (glass:mint-login-token :ttl 900))
+      (bob (hexkey #xB0B)))
+  (ok "first presentation admits" (eq :code (glass:admit-peer bob code)))
+  (ok "second presentation of the same code ALSO admits, via :code and not merely as a device"
+      (eq :code (glass:admit-peer bob code)))
+  (multiple-value-bind (via nil* status) (glass:admit-peer bob code)
+    (declare (ignore nil*))
+    (ok "  …a third time too, still :ok — relay fan-out delivers one offer several times"
+        (and (eq :code via) (eq :ok status))))
+  (ok "and the store holds ONE row for it, still naming that key"
+      (equal bob (holder-of code))))
+
+(format t "~&   -- and a probe does not spend: :ENROL NIL asks, it does not trade --~%")
+(let ((code (glass:mint-login-token :ttl 900))
+      (p (hexkey #x9805E)) (q (hexkey #x9805F)))
+  (ok "a non-enrolling call says the code would be accepted"
+      (eq :code (glass:admit-peer p code :enrol nil)))
+  (ok "  …and did NOT bind it — somebody else can still be the first to redeem"
+      (eq :code (glass:admit-peer q code)))
+  (ok "  …after which the prober is the one who is too late"
+      (null (first (quietly (lambda () (glass:admit-peer p code)))))))
+
+;;; ---- REDEMPTION IS NOT CONTINGENT ON NEED ------------------------------------
+;;; This is the case that works TODAY BY ACCIDENT: the client sends a code whenever it has one, and
+;;; the box's first-match COND puts `code' ahead of `device', so an already-enrolled terminal
+;;; redeems anyway.  Nothing stated it, and the obvious optimisation — "we have an enrolment, skip
+;;; the code" — would silently stop burning anything and leave live codes in DMs with no test
+;;; failing.  So it is stated in ADMIT-PEER and asserted here.
+
+(format t "~&   -- a tapped link burns its code even when the terminal did not need it --~%")
+(let ((already (hexkey #xE47011)))
+  (glass:enrol-device already)
+  (ok "the terminal is already enrolled and would be admitted with no code at all"
+      (and (glass:device-enrolled-p already) (eq :device (glass:admit-peer already nil))))
+  (let ((code (glass:mint-login-token :ttl 900)))
+    (multiple-value-bind (via nil* status) (glass:admit-peer already code)
+      (declare (ignore nil*))
+      (ok "presenting a code anyway is reported via=:code, ahead of the enrolment it did not need"
+          (eq :code via))
+      (ok "  …status :ok" (eq :ok status)))
+    (ok "  …and THE CODE IS SPENT: redemption is not contingent on need"
+        (and (eq :redeemed (state-of code)) (equal already (holder-of code))))
+    (ok "  …so nobody else can use the link that terminal already tapped"
+        (eq :spent (third (quietly (lambda () (glass:admit-peer (hexkey #xF00F) code))))))))
+;; the same, for an ALLOWLISTED caller — whose standing is permanent and who needs a code least
+(let ((code (glass:mint-login-token :ttl 900)))
+  (ok "an allowlisted owner presenting a code is via=:code, not via=:allowlist"
+      (eq :code (glass:admit-peer *owner* code)))
+  (ok "  …and burns it too — a link the owner tapped must not stay live in their DMs"
+      (and (eq :redeemed (state-of code)) (equal *owner* (holder-of code)))))
+
+;;; ---- ATOMICITY.  Not by inspection: by running the race. ---------------------
+;;; Two racing redemptions that both see the nonce unspent is the whole property lost to a missing
+;;; lock, and it is the failure that inspection is worst at catching — the window is a few
+;;; instructions wide and a single-threaded suite never opens it.
+
+(format t "~&   -- N threads, one code, many rounds --~%")
+(defparameter *race-threads* 32)
+(defparameter *race-rounds* 150)
+
+(let ((two-winners 0) (no-winner 0) (wrong-holder 0) (total 0) (t0 (get-internal-real-time)))
+  (dotimes (round *race-rounds*)
+    (let* ((code (glass:mint-login-token :ttl 900))
+           (nonce (nth-value 1 (glass:verify-login-token code)))
+           (exp (nth-value 2 (glass:verify-login-token code)))
+           (start (sb-thread:make-semaphore))
+           (results (make-array *race-threads* :initial-element nil))
+           (threads
+             (loop for i below *race-threads*
+                   collect (let ((i i))
+                             (sb-thread:make-thread
+                              (lambda ()
+                                ;; every thread parks on the semaphore and is released together, so
+                                ;; they arrive at the critical section at once rather than in the
+                                ;; order they were spawned
+                                (sb-thread:wait-on-semaphore start)
+                                (setf (aref results i)
+                                      (multiple-value-list
+                                       (glass:redeem-nonce nonce (hexkey (+ #x100000 i)) exp))))
+                              :name "race")))))
+      (sb-thread:signal-semaphore start *race-threads*)
+      (mapc #'sb-thread:join-thread threads)
+      (incf total *race-threads*)
+      (let* ((winners (loop for r across results when (eq :bound (second r)) collect (third r)))
+             (held (holder-of code)))
+        (cond ((> (length winners) 1) (incf two-winners))
+              ((null winners) (incf no-winner)))
+        ;; and the winner has to be the key the STORE says holds it — one thread returning :BOUND
+        ;; while a later one overwrote the binding would be the same bug wearing a disguise
+        (unless (and (= 1 (length winners)) (equal held (first winners)))
+          (incf wrong-holder)))))
+  (let ((ms (round (* 1000 (- (get-internal-real-time) t0)) internal-time-units-per-second)))
+    (ok "exactly ONE binding per code, every round — no round produced two winners"
+        (zerop two-winners)
+        (format nil "~d rounds x ~d threads = ~d concurrent redemptions in ~dms; ~
+                     rounds with two winners: ~d"
+                *race-rounds* *race-threads* total ms two-winners))
+    (ok "  …and never zero winners either — a lock that refused everybody would also `pass'"
+        (zerop no-winner))
+    (ok "  …and the winner is the key the store says holds the code" (zerop wrong-holder))))
+
+(format t "~&   -- and the same race through the whole of ADMIT-PEER, enrolment and all --~%")
+(let ((bad 0) (rounds 30) (n 12))
+  (dotimes (round rounds)
+    (let* ((code (glass:mint-login-token :ttl 900))
+           (start (sb-thread:make-semaphore))
+           (out (make-array n :initial-element nil))
+           (keys (loop for i below n collect (hexkey (+ #x200000 (* round 100) i))))
+           (threads (loop for i below n
+                          for k in keys
+                          collect (let ((i i) (k k))
+                                    (sb-thread:make-thread
+                                     (lambda ()
+                                       ;; BOUND INSIDE THE THREAD.  A new SBCL thread starts from
+                                       ;; the GLOBAL value of a special, not from the binding in
+                                       ;; force where MAKE-THREAD was called — so a LET around the
+                                       ;; spawn loop silences nothing, and the n-1 leak alarms come
+                                       ;; out interleaved across the suite's own output.
+                                       (let ((*error-output* (make-broadcast-stream)))
+                                         (sb-thread:wait-on-semaphore start)
+                                         (setf (aref out i)
+                                               (multiple-value-list (glass:admit-peer k code)))))
+                                     :name "admit-race")))))
+      (sb-thread:signal-semaphore start n)
+      (mapc #'sb-thread:join-thread threads)
+      (let ((admitted (loop for r across out count (eq :code (first r))))
+            (enrolled (count-if #'glass:device-enrolled-p keys)))
+        ;; exactly one admitted on the code, and exactly one enrolment bought with it
+        (unless (and (= 1 admitted) (= 1 enrolled)) (incf bad)))))
+  (ok "one admission and one enrolment per code, under concurrency, through the real entry point"
+      (zerop bad)
+      (format nil "~d rounds x ~d threads through ADMIT-PEER; bad rounds: ~d" rounds n bad)))
+
+;;; ==============================================================================
+(banner "a code nobody tapped: MINTING SUPERSEDES, so at most one link per person is live")
+;;; ==============================================================================
+;;;
+;;; Single use closes "somebody else redeemed it".  It does nothing about the commonest shape there
+;;; is — ask for a link, tap nothing, ask again — where the first link stays armed in a DM for the
+;;; rest of its TTL.  A LINK MINTED FOR A RECIPIENT CANCELS THAT RECIPIENT'S EARLIER OUTSTANDING
+;;; CODES, in the same critical section that mints it.
+
+(format t "~&   -- ask twice, tap the first: refused, and told why --~%")
+(let* ((rcpt (hexkey #x5EC0))
+       (first-link (glass:mint-login-token :ttl 900 :for rcpt)))
+  (ok "a link minted :FOR somebody is recorded as :outstanding" (eq :outstanding (state-of first-link)))
+  (ok "  …with that recipient on it, which is what forms a supersede group"
+      (equal rcpt (glass:code-recipient (glass:find-login-code
+                                         (nth-value 1 (glass:verify-login-token first-link))))))
+  (multiple-value-bind (second-link killed) (glass:mint-login-token :ttl 900 :for rcpt)
+    (ok "asking again supersedes the first, and says how many it cancelled" (eql 1 killed))
+    (ok "  …the older link is now :superseded in the store" (eq :superseded (state-of first-link)))
+    (ok "  …and the newer one is the live one" (eq :outstanding (state-of second-link)))
+    (ok "TAPPING THE OLDER LINK IS REFUSED" (null (glass:admit-peer (hexkey #x5EC1) first-link)))
+    (ok "  …with :superseded — `ask for a fresh one', which is NOT the leak alarm"
+        (eq :superseded (nth-value 2 (glass:admit-peer (hexkey #x5EC1) first-link))))
+    (ok "  …and the newer link still works" (eq :code (glass:admit-peer (hexkey #x5EC2) second-link)))))
+
+(format t "~&   -- but only the recipient's OWN outstanding codes, and only outstanding ones --~%")
+(let* ((mine (hexkey #x11AA)) (theirs (hexkey #x22BB))
+       (my-link (glass:mint-login-token :ttl 900 :for mine))
+       (their-link (glass:mint-login-token :ttl 900 :for theirs)))
+  (glass:mint-login-token :ttl 900 :for mine)
+  (ok "a mint for ME does not touch a link minted for SOMEBODY ELSE"
+      (eq :outstanding (state-of their-link)))
+  (ok "  …while mine is superseded" (eq :superseded (state-of my-link)))
+  (ok "  …and theirs still admits" (eq :code (glass:admit-peer (hexkey #x22BC) their-link))))
+
+(let* ((sitting (hexkey #x51771))
+       (link (glass:mint-login-token :ttl 900 :for sitting)))
+  (ok "a link that has ALREADY BEEN REDEEMED is not superseded by a later mint"
+      (and (eq :code (glass:admit-peer sitting link))
+           (progn (glass:mint-login-token :ttl 900 :for sitting)
+                  (eq :redeemed (state-of link)))))
+  (ok "  …so the terminal sitting on it keeps reconnecting — a new link must not log anybody out"
+      (eq :code (glass:admit-peer sitting link))))
+
+(format t "~&   -- superseding is atomic with minting: N mints for one recipient, one survivor --~%")
+(let ((bad 0) (rounds 60) (n 16))
+  (dotimes (round rounds)
+    (let* ((rcpt (hexkey (+ #x300000 round)))
+           (start (sb-thread:make-semaphore))
+           (out (make-array n :initial-element nil))
+           (threads (loop for i below n
+                          collect (let ((i i))
+                                    (sb-thread:make-thread
+                                     (lambda ()
+                                       (sb-thread:wait-on-semaphore start)
+                                       (setf (aref out i)
+                                             (glass:mint-login-token :ttl 900 :for rcpt)))
+                                     :name "mint-race")))))
+      (sb-thread:signal-semaphore start n)
+      (mapc #'sb-thread:join-thread threads)
+      ;; whichever mint landed last, EXACTLY ONE of the N codes may still be outstanding
+      (let ((live (count :outstanding (coerce out 'list) :key #'state-of)))
+        (unless (= 1 live) (incf bad)))))
+  (ok "exactly one outstanding code survives each concurrent burst of mints"
+      (zerop bad)
+      (format nil "~d rounds x ~d concurrent mints for one recipient; rounds with != 1 live: ~d"
+              rounds n bad)))
+
+;;; ---- WHAT MUST NOT SUPERSEDE -------------------------------------------------
+;;; The trap the user named: "they are already logged in, burn their outstanding codes".  A phone on
+;;; its enrolment and a laptop that was just sent a link are the same person, and burning on the
+;;; phone's reconnect kills the laptop's link before anybody taps it — failing exactly the way an
+;;; intercepted code fails, which is the one distinction this store exists to make legible.
+
+(format t "~&   -- an admission burns nothing but the code it was handed --~%")
+(let* ((person (hexkey #x1AB70))
+       (laptop-link (glass:mint-login-token :ttl 900 :for person)))
+  ;; the phone reconnects, repeatedly, on its enrolment and on renewals
+  (glass:enrol-device person)
+  (dotimes (i 5) (glass:admit-peer person nil))
+  (ok "A LINK MINTED FOR A PERSON SURVIVES THAT PERSON RECONNECTING ON THEIR ENROLMENT"
+      (eq :outstanding (state-of laptop-link)))
+  (ok "  …and is still tappable afterwards, by the browser it was sent to"
+      (eq :code (glass:admit-peer (hexkey #x1AB71) laptop-link))))
+
+(format t "~&   -- and a RENEWAL supersedes nothing, because it has no recipient --~%")
+(let* ((person (hexkey #x8E11))
+       (pending (glass:mint-login-token :ttl 900 :for person))
+       (code (glass:mint-login-token :ttl 900))
+       (issued (list code))
+       (all-code t))
+  (dotimes (i 20)
+    (multiple-value-bind (via token) (glass:admit-peer person code)
+      (unless (eq :code via) (setf all-code nil))
+      (push token issued)
+      (setf code token)))
+  (ok "twenty reconnects in a row, each on the renewal the last one handed back, all via :code"
+      all-code)
+  (ok "  …and the link that was outstanding for that same person is UNTOUCHED by all of it"
+      (eq :outstanding (state-of pending)))
+  (let ((nonces (mapcar (lambda (tk) (nth-value 1 (glass:verify-login-token tk))) issued)))
+    (ok "  …every renewal nonce is DISTINCT — no renewal ever arrives already spent"
+        (and (notany #'null nonces)
+             (= (length nonces) (length (remove-duplicates nonces :test #'equal))))
+        (format nil "~d issued, ~d distinct" (length nonces)
+                (length (remove-duplicates nonces :test #'equal))))
+    (ok "  …no renewal is ever recorded with a recipient, so none can join a supersede group"
+        (every (lambda (n) (let ((c (glass:find-login-code n)))
+                             (or (null c) (null (glass:code-recipient c)))))
+               nonces))
+    (ok "  …and each was redeemable exactly ONCE: a thief holding a used renewal is refused"
+        (eq :spent (third (quietly (lambda ()
+                                     (glass:admit-peer (hexkey #x7417F) (second issued)))))))
+    (ok "  …while the renewal that was never presented is still redeemable"
+        (eq :code (glass:admit-peer (hexkey #xFEED11) (first issued)))))
+  (ok "the mint is distinct per call at volume too — 200 mints, 200 nonces"
+      (= 200 (length (remove-duplicates
+                      (loop repeat 200
+                            collect (nth-value 1 (glass:verify-login-token
+                                                  (glass:mint-login-token :ttl 900))))
+                      :test #'equal)))))
+
+;;; ==============================================================================
+(banner "expiry, pruning, and a restart that does not resurrect anything")
+;;; ==============================================================================
+
+(format t "~&   -- expiry still refuses on its own, and rows are pruned at it --~%")
+(let* ((short (glass:mint-login-token :ttl 1))
+       (owner-of-it (hexkey #x5405)))
+  (ok "a one-second code admits while it is alive" (eq :code (glass:admit-peer owner-of-it short)))
+  (sleep 2)
+  (multiple-value-bind (via nil* status) (glass:admit-peer owner-of-it short :enrol nil)
+    (declare (ignore nil*))
+    (ok "once expired it is :EXPIRED even for the key that redeemed it — a binding is not a bypass"
+        (eq :expired status))
+    (ok "  …and that key is still admitted, as the enrolled DEVICE it became" (eq :device via)))
+  (ok "  …and a stranger gets :expired rather than :spent — expiry is checked first, and is the
+       unremarkable one a failure screen must be able to tell apart from the rest"
+      (eq :expired (third (quietly (lambda () (glass:admit-peer (hexkey #x5406) short))))))
+  (let ((nonce (nth-value 1 (glass:verify-login-token short))))
+    (ok "the row was written while the code was live" (search nonce (slurp (glass:login-code-file))))
+    ;; the prune runs inside the next transition's critical section
+    (glass:redeem-nonce (hexkey #xF00D) (hexkey #xBEEF) (+ (glass:unix-now) 900))
+    (ok "after the next redemption the expired row is pruned from memory"
+        (null (glass:find-login-code nonce)))
+    (ok "  …and from the file, so the store stays a handful of lines"
+        (not (search nonce (slurp (glass:login-code-file)))))))
+
+(format t "~&   -- an outstanding code that nobody ever taps is pruned too --~%")
+(let ((stale (glass:mint-login-token :ttl 1 :for (hexkey #x57A1E))))
+  (ok "it starts outstanding" (eq :outstanding (state-of stale)))
+  (sleep 2)
+  (glass:redeem-nonce (hexkey #xF00E) (hexkey #xBEEE) (+ (glass:unix-now) 900))
+  (ok "and after expiry it is gone from the store entirely — no state, nothing to keep"
+      (and (null (state-of stale))
+           (not (search (nth-value 1 (glass:verify-login-token stale))
+                        (slurp (glass:login-code-file)))))))
+
+(format t "~&   -- a restart does not resurrect a spent code --~%")
+(let* ((code (glass:mint-login-token :ttl 900))
+       (first-key (hexkey #x1111AA))
+       (second-key (hexkey #x2222BB))
+       (superseded (glass:mint-login-token :ttl 900 :for (hexkey #x3333CC))))
+  (glass:mint-login-token :ttl 900 :for (hexkey #x3333CC))     ; …which supersedes it
+  (ok "a code is redeemed by one key" (eq :code (glass:admit-peer first-key code)))
+  (ok "  …and it is on disk, in the store beside the enrolments"
+      (search (nth-value 1 (glass:verify-login-token code)) (slurp (glass:login-code-file))))
+  ;; A RESTART, exactly: a brand-new store object whose only knowledge is the file.  Nothing is
+  ;; carried over in memory — which is the whole thing being checked.
+  (let ((glass:*login-codes* (make-instance 'glass:login-code-store)))
+    (ok "a fresh store starts empty in memory and reads the file on first use"
+        (plusp (glass:login-code-count)))
+    (ok "AFTER THE RESTART the code is still spent — a stranger is refused"
+        (null (first (quietly (lambda () (glass:admit-peer second-key code))))))
+    (ok "  …and the key that traded it is still admitted on it, idempotently"
+        (eq :code (glass:admit-peer first-key code)))
+    (ok "  …and the store names the same holder it named before the restart"
+        (equal first-key (holder-of code)))
+    (ok "  …and a SUPERSEDED code is still superseded, with its reason intact and not collapsed"
+        (and (eq :superseded (state-of superseded))
+             (eq :superseded (nth-value 2 (glass:admit-peer (hexkey #x3333CD) superseded)))))))
+
+;;; ==============================================================================
+(banner "two TTLs, because a link and a renewal have opposite jobs")
+;;; ==============================================================================
+;;;
+;;; These were one parameter doing both, which is why neither could be tuned.  A LINK is a
+;;; credential in transit through a DM and its TTL is the only bound on a leaked one; a RENEWAL is a
+;;; credential at rest in localStorage that has to survive until the browser's next load.
+
+(ok "a LINK is minutes, not half an hour — the window a leaked link is usable for"
+    (and (integerp glass:*login-ttl*) (<= glass:*login-ttl* 900))
+    (format nil "*LOGIN-TTL* = ~ds" glass:*login-ttl*))
+(ok "a RENEWAL is unchanged at half an hour — shortening it silently demotes code to device"
+    (eql 1800 glass:*renewal-ttl*))
+(ok "they are DIFFERENT parameters now, which is the whole point"
+    (not (eql glass:*login-ttl* glass:*renewal-ttl*)))
+(ok "the `link' DM mints at the LINK ttl"
+    (let* ((r (glass:nostr-command-reply *owner* "link"))
+           (at (search "&code=" r))
+           (exp (nth-value 2 (glass:verify-login-token (subseq r (+ at 6))))))
+      (<= (- exp (glass:unix-now)) glass:*login-ttl*)))
+(ok "  …and the renewal that rides back with an admission mints at the RENEWAL ttl"
+    (let* ((peer (hexkey #x77111))
+           (token (nth-value 1 (glass:admit-peer peer (glass:mint-login-token :ttl 900))))
+           (exp (nth-value 2 (glass:verify-login-token token))))
+      (> (- exp (glass:unix-now)) glass:*login-ttl*)))
+(ok "the `link' DM says its replacement replaces the earlier ones"
+    (progn (glass:nostr-command-reply *owner* "link")
+           (search "no longer work" (glass:nostr-command-reply *owner* "link"))))
+(ok "  …and the first `link' to a person says nothing of the kind — there was nothing to replace"
+    (not (search "no longer work"
+                 (glass:nostr-command-reply
+                  (let ((k (hexkey #x9E4)))
+                    (glass:refresh-nostr-allow (format nil "~a,~a" *owner* k))
+                    k)
+                  "link"))))
+(glass:refresh-nostr-allow *owner*)
+
+;;; ==============================================================================
 (banner "the command surface — and who may run each command")
 ;;; ==============================================================================
 
@@ -256,9 +685,15 @@
   (ok "owner: link -> a magic link with the box npub and a live code in the fragment"
       (let ((r (reply *owner* "link")))
         (and (stringp r) (search "#box=npub1" r) (search "&code=" r))))
+  ;; the reply may carry a second paragraph now ("this replaces any earlier link"), so the code is
+  ;; taken up to whitespace rather than to end of string — which is what the browser does with the
+  ;; fragment too
   (ok "  …and the code in it verifies"
-      (let* ((r (reply *owner* "link")) (at (search "&code=" r)))
-        (glass:verify-login-token (subseq r (+ at 6)))))
+      (let* ((r (reply *owner* "link")) (at (search "&code=" r))
+             (end (or (position-if (lambda (c) (member c '(#\Space #\Newline #\Return #\Tab))) r
+                                   :start (+ at 6))
+                      (length r))))
+        (glass:verify-login-token (subseq r (+ at 6) end))))
   (ok "owner: devices -> the list" (search "enrolled terminal" (reply *owner* "devices")))
   (ok "owner: help -> mentions the management commands it may use"
       (let ((r (reply *owner* "help"))) (and (search "devices" r) (search "revoke" r))))
@@ -341,6 +776,21 @@
       (and (search " deny " r) (search "reason=absent" r))))
 (ok "admit with a rotten code says so specifically"
     (search "reason=bad" (raw (format nil "glass-admit/1 admit pub=~a code=zzz" *guest*))))
+;; the leak, over the wire.  A gateway logs whatever REASON it is handed, so `spent' has to reach it
+;; as its own word — a leaked link that arrived at the far end as `bad' would be diagnosed as a typo.
+(let ((code (glass:mint-login-token :ttl 900))
+      (first-key (hexkey #xC0FFEE))
+      (second-key (hexkey #xDECAF)))
+  (ok "over the socket: the first key to present a code is admitted via=code"
+      (search "via=code" (raw (format nil "glass-admit/1 admit pub=~a code=~a" first-key code))))
+  (ok "  …and a second key presenting it is DENIED with reason=spent, its own word on the wire"
+      (let ((r (raw (format nil "glass-admit/1 admit pub=~a code=~a" second-key code))))
+        (format t "     ~a~%" r)
+        (and (search " deny " r) (search "reason=spent" r))))
+  (ok "  …while the first key re-presenting it is admitted again — the retry, over the protocol"
+      (search "via=code" (raw (format nil "glass-admit/1 admit pub=~a code=~a" first-key code))))
+  ;; and put the store back the way the checks below it expect to find it
+  (glass:revoke-enrolments first-key))
 (ok "allowed is the allowlist and nothing else"
     (and (search "allowed=1" (raw (format nil "glass-admit/1 allowed pub=~a" *owner*)))
          (search "allowed=0" (raw (format nil "glass-admit/1 allowed pub=~a" *rando*)))))
@@ -367,6 +817,32 @@
            (at (search "token=" r)))
       (and at (glass:verify-login-token
                (subseq r (+ at 6) (or (position #\Space r :start at) (length r)))))))
+
+;; PUB IS THE AUTHORITY, `for' IS THE RECIPIENT, and their difference is the difference between a
+;; LINK and a TOP-UP.  The gateway sends `mint pub=X' with no `for' to top up an allowlist
+;; admission; that must keep behaving exactly as it did, or one signature stops buying a durable
+;; terminal.  A surface SENDING somebody a link says `for=' and gets superseding.
+(flet ((tok (r) (let ((at (search "token=" r)))
+                  (and at (subseq r (+ at 6) (or (position #\Space r :start at) (length r)))))))
+  (let ((rcpt (hexkey #xC0DE01)))
+    (let* ((a (tok (raw (format nil "glass-admit/1 mint pub=~a for=~a" *owner* rcpt))))
+           (r2 (raw (format nil "glass-admit/1 mint pub=~a for=~a" *owner* rcpt)))
+           (b (tok r2)))
+      (ok "mint for= names a recipient and supersedes their earlier outstanding code"
+          (and (search "superseded=1" r2)
+               (eq :superseded (glass:code-state (glass:find-login-code
+                                                  (nth-value 1 (glass:verify-login-token a))))))
+          r2)
+      (ok "  …and the newer one is the live one" (glass:verify-login-token b)))
+    (let* ((r (raw (format nil "glass-admit/1 mint pub=~a" *owner*)))
+           (top-up (tok r)))
+      (ok "mint with NO for= is a TOP-UP: nothing is recorded, so it supersedes nothing"
+          (and top-up (null (glass:find-login-code
+                             (nth-value 1 (glass:verify-login-token top-up))))))
+      (ok "  …and it carries the RENEWAL ttl, because it has to survive to the next cold load"
+          (> (- (nth-value 2 (glass:verify-login-token top-up)) (glass:unix-now))
+             glass:*login-ttl*)
+          r))))
 
 ;;; ---- and the client half, which is what a gateway actually calls -------------
 
@@ -414,13 +890,60 @@
 (ok "and none of it signalled" t)
 
 ;;; ==============================================================================
+(banner "core glass still carries no crypto — checked in a CHILD, not by assertion here")
+;;; ==============================================================================
+;;;
+;;; This image has cl-nostr and ironclad in it by definition: it just loaded :glass/nostr.  So the
+;;; claim in glass.asd — "core :glass carries no crypto and no relay client" — cannot be checked
+;;; from in here at all, and an assertion that pretended to would be checking nothing.  A separate
+;;; SBCL loads plain :glass and reports what packages exist in it.
+
+(defparameter *child-script* "/tmp/glass-nostr-gate-nocrypto.lisp")
+(with-open-file (s *child-script* :direction :output :if-exists :supersede
+                                  :if-does-not-exist :create)
+  (write-string "(require :asdf)
+(load \"~/quicklisp/setup.lisp\")
+(push #p\"/home/claude/glass/\" asdf:*central-registry*)
+(handler-bind ((warning #'muffle-warning))
+  (let ((*standard-output* (make-broadcast-stream))) (asdf:load-system :glass)))
+(format t \"~&VERDICT ~a ~a~%\"
+        (if (find-package :ironclad) \"ironclad\" \"no-ironclad\")
+        (if (find-package :cl-nostr.keys) \"cl-nostr\" \"no-cl-nostr\"))
+(finish-output)
+" s))
+(let* ((out (make-string-output-stream))
+       (proc (sb-ext:run-program "sbcl" (list "--non-interactive" "--disable-debugger"
+                                              "--load" *child-script*)
+                                 :output out :error out :search t))
+       (said (get-output-stream-string out)))
+  (ok "a child image that loads only :glass exits cleanly"
+      (eql 0 (sb-ext:process-exit-code proc)))
+  (ok "  …and has NO ironclad and NO cl-nostr in it — the optional system is really optional"
+      (search "VERDICT no-ironclad no-cl-nostr" said)
+      (string-trim '(#\Newline #\Space)
+                   (or (let ((at (search "VERDICT" said)))
+                         (and at (subseq said at (min (length said) (+ at 40)))))
+                       said))))
+
+;;; ==============================================================================
 (banner "the live enrolment file was never opened")
 ;;; ==============================================================================
 
 (ok "the live store's mtime is exactly what it was before this suite ran"
     (equal *live-mtime-before* (and (probe-file *live*) (file-write-date *live*)))
     (format nil "~a" *live-mtime-before*))
+(ok "and no login-code store was created beside it either"
+    (equal *live-codes-before* (and (probe-file *live-codes*) (file-write-date *live-codes*))))
+;; THE ONE THAT MATTERS MOST.  ~/.glass-devices is the store the running desktop admits people from;
+;; a suite that rewrote it would revoke somebody's terminal to pass, which has happened here before.
+;; It is checked by NAME rather than by trusting that *ENROLMENT-FILE* was rebound early enough.
+(let ((home-store (namestring (merge-pathnames ".glass-devices" (user-homedir-pathname)))))
+  (ok "the DESKTOP's own store was never named by anything this suite ran"
+      (and (not (equal glass:*enrolment-file* home-store))
+           (not (equal (glass:login-code-file) (concatenate 'string home-store ".codes"))))
+      home-store))
 (ignore-errors (delete-file *fixture*))
+(ignore-errors (delete-file (concatenate 'string *fixture* ".codes")))
 
 (format t "~&~%~a passed, ~a failed~%" *pass* *fail*)
 (finish-output)

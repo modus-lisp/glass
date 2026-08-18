@@ -59,8 +59,13 @@
 (defparameter *device* "2222222222222222222222222222222222222222222222222222222222222222")
 
 (dolist (f (list *key-fixture* *url-fixture* *devices-fixture*)) (ignore-errors (delete-file f)))
+;; …and the login-code store that rides on the enrolment file's path.  A `link' mint records the
+;; recipient there, so a leftover from the LAST run makes this run's first link say "this replaces
+;; an earlier one" — which is correct behaviour and a stale test.  Cleared with the rest.
+(ignore-errors (delete-file (concatenate 'string *devices-fixture* ".codes")))
 (with-open-file (s *key-fixture* :direction :output :if-exists :supersede) (write-line *toy-key* s))
 
+(setf glass:*login-codes* (make-instance 'glass:login-code-store))
 (setf glass:*site-key-file* *key-fixture*
       glass:*site-url-file* *url-fixture*
       glass:*site-npub* nil
@@ -151,9 +156,19 @@
 
 (defparameter *link1* (mint-link))
 (ok "the MINT names k101" (search "/k101.html" *link1*))
+;; taken up to whitespace, not to end of string: the reply may carry a second paragraph (the
+;; `link' command says so when it supersedes an earlier link), and the browser reads the fragment
+;; the same way.
+(defun link-code (link)
+  (let* ((at (search "&code=" link))
+         (start (and at (+ at 6)))
+         (end (and start (or (position-if (lambda (c)
+                                            (member c '(#\Space #\Newline #\Return #\Tab)))
+                                          link :start start)
+                             (length link)))))
+    (and start (subseq link start end))))
 (ok "  …and carries a token that verifies against the box secret"
-    (let ((at (search "&code=" *link1*)))
-      (and at (glass:verify-login-token (subseq *link1* (+ at 6))))))
+    (glass:verify-login-token (link-code *link1*)))
 
 ;;; --- and now the half a frozen variable cannot do -----------------------------
 ;;; Second publish, different tag, NOTHING RESTARTED and nothing re-read.  A LOGIN_URL_BASE frozen
@@ -299,6 +314,7 @@
     (not (search *real-site-npub* (or glass:*login-url-base* ""))))
 
 (dolist (f (list *key-fixture* *url-fixture* *devices-fixture*
+                 (concatenate 'string *devices-fixture* ".codes")
                  "/tmp/glass-site-gate-junk" "/tmp/glass-site-gate-cmt"))
   (ignore-errors (delete-file f)))
 
