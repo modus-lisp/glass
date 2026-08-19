@@ -56,6 +56,18 @@ The VNC password comes from `~/.glass-vnc-pass` if that file exists (create it
 yourself, mode 600 — it is not in the repo). Absent, the server keeps the open
 posture described in the README.
 
+## Or skip all of it
+
+[kiln](https://github.com/modus-lisp/kiln) packages every prerequisite below —
+SBCL, Quicklisp, McCLIM and all 38 sibling repos — into one container image:
+
+```sh
+kiln build && kiln vnc
+```
+
+The rest of this file is what that image is doing on your behalf, and what to do
+if you would rather run the desktop directly.
+
 ## Prerequisites
 
 - **SBCL.** The only platform dependency is `sb-bsd-sockets`; the desktop also uses
@@ -116,11 +128,24 @@ shrinks rather than gets rediscovered.
    which repo is missing or where to get it.
 3. **`backend/mcclim-glass.asd` is invisible to ASDF** unless a script loads it.
    `glass.asd` does not reference it, so the same REPL caveat applies.
-4. **`:glass/hearing` cannot be built from the public repos.** It depends on
-   `stave`, and there is no `github.com/modus-lisp/stave` — the org's repo list
-   does not include it and `api.github.com/repos/modus-lisp/stave` is a 404. So a
-   full org sync still leaves this one system unbuildable. Either stave is private
-   / unpublished, or the dependency needs to name where it actually comes from.
+4. **The `inspect/` gates hardcode `/home/claude/...`.** Thirteen
+   `(asdf:load-asd "/home/claude/glass/...")` calls across eleven files under
+   `inspect/` and `backend/inspect/` name the container the gates were written
+   in, so they cannot run from any other checkout. This is not cosmetic: it is
+   why a client-side ZRLE regression went unnoticed — `inspect/remote-gate.lisp`
+   is exactly the test for it and could not be run. That one file now resolves
+   glass and its siblings from its own `*load-truename*`; the pattern is
+
+   ```lisp
+   (asdf:initialize-source-registry
+    (let ((here (make-pathname :name nil :type nil :defaults *load-truename*)))
+      `(:source-registry (:tree ,(merge-pathnames "../../" here))
+                         (:exclude "vendor" "deps") :inherit-configuration)))
+   ```
+
+   and the remaining ten files want the same treatment. `climacs-gate.lisp` also
+   uses the path as *test data* for a directory predicate, which needs a real
+   directory rather than the same substitution.
 5. **The `*wav*` fixture in the audio gates** points at a path inside stave's
    checkout, unlike the voice and ears models it has no environment-variable
    override.
