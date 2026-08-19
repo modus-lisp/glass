@@ -29,6 +29,33 @@
 
 (setf glass:*desktop-name* (format nil "modus-lisp :: glass desktop :~d" *display*))
 
+;;; Windows opened at startup.  Empty by default: the desktop comes up as a bare
+;;; workspace, and every app — terminal included — is one right-click away on the
+;;; root menu.  Opening a shell nobody asked for is a decision, not a default, and
+;;; on a desktop reachable over VNC it is a shell sitting there for whoever
+;;; connects first.
+;;;
+;;; GLASS_APPS is a comma-separated list that puts windows back: "terminal" for a
+;;; shell, or any McCLIM frame-class name (in the CLIM-GLASS package unless the
+;;; name is package-qualified).  GLASS_APPS=terminal is exactly what this file
+;;; used to do unconditionally.
+(defun %split-commas (string)
+  (loop with len = (length string)
+        for start = 0 then (1+ end)
+        for end = (or (position #\, string :start start) len)
+        for piece = (string-trim '(#\Space #\Tab) (subseq string start end))
+        unless (zerop (length piece)) collect piece
+        while (< end len)))
+
+(defparameter *startup-apps*
+  (loop for name in (%split-commas (or (sb-ext:posix-getenv "GLASS_APPS") ""))
+        collect (if (string-equal name "terminal")
+                    '(:terminal :cols 80 :rows 24 :ppem 14)
+                    ;; A frame class: read it in CLIM-GLASS so an unqualified
+                    ;; name resolves where the desktop's frames actually live.
+                    (list (let ((*package* (find-package :clim-glass)))
+                            (read-from-string name))))))
+
 ;;; Bare-TCP control/eval socket on 127.0.0.1:4009 — read one form, eval it in the
 ;;; clim-glass package, write the printed result.  Lets us read live perf and poke
 ;;; at the RUNNING desktop with no restart:
@@ -105,6 +132,6 @@
   ;; is still a desktop, just a mute one.
   (when (find-package :glass-speak)
     (ignore-errors (funcall (find-symbol "REGISTER" :glass-speak))))
-  (clim-glass:run-wm '((:terminal :cols 80 :rows 24 :ppem 14))
+  (clim-glass:run-wm *startup-apps*
                      :port *vnc-port* :width 1280 :height 800
                      :background wp :background-mode :cover))
