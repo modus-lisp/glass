@@ -128,29 +128,20 @@ shrinks rather than gets rediscovered.
    which repo is missing or where to get it.
 3. **`backend/mcclim-glass.asd` is invisible to ASDF** unless a script loads it.
    `glass.asd` does not reference it, so the same REPL caveat applies.
-4. **The `inspect/` gates hardcode `/home/claude/...`.** Thirteen
-   `(asdf:load-asd "/home/claude/glass/...")` calls across eleven files under
-   `inspect/` and `backend/inspect/` name the container the gates were written
-   in, so they cannot run from any other checkout. This is not cosmetic: it is
-   why a client-side ZRLE regression went unnoticed — `inspect/remote-gate.lisp`
-   is exactly the test for it and could not be run. That one file now resolves
-   glass and its siblings from its own `*load-truename*`; the pattern is
-
-   ```lisp
-   (asdf:initialize-source-registry
-    (let ((here (make-pathname :name nil :type nil :defaults *load-truename*)))
-      `(:source-registry (:tree ,(merge-pathnames "../../" here))
-                         (:exclude "vendor" "deps") :inherit-configuration)))
-   ```
-
-   and the remaining ten files want the same treatment. `climacs-gate.lisp` also
-   uses the path as *test data* for a directory predicate, which needs a real
-   directory rather than the same substitution.
-5. **The `*wav*` fixture in the audio gates** points at a path inside stave's
+4. **The `*wav*` fixture in the audio gates** points at a path inside stave's
    checkout, unlike the voice and ears models it has no environment-variable
    override.
 
-*Fixed since this list was written:* scribe used to define a `DEFLATE` package
+*Fixed since this list was written:* the gates under `inspect/` and
+`backend/inspect/` used to name one container's absolute paths in their
+`(asdf:load-asd ...)` calls, so they could not run from any other checkout. That
+was not cosmetic — it is why a client-side ZRLE regression went unnoticed, since
+`inspect/remote-gate.lisp` is exactly the test for it and could not be run. Every
+such call now derives the `.asd` from the loading file's own `*load-truename*`,
+and `climacs-gate.lisp`, which uses a path as *test data* for a directory
+predicate, asks about this checkout's own root.
+
+scribe used to define a `DEFLATE` package
 that collided with the Quicklisp `deflate` system McCLIM pulls in through
 opticl → retrospectiff, so `(asdf:load-system :mcclim-glass)` failed on the
 package-variance warning unless it was muffled. scribe now uses

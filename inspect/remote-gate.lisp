@@ -11,7 +11,7 @@
 (require :asdf)
 (load "~/quicklisp/setup.lisp")
 ;; Find glass and its siblings relative to THIS file, so the gate runs from any
-;; checkout.  It used to name /home/claude/glass/glass.asd — the container it was
+;; checkout.  It used to name an absolute path into the container it was
 ;; written in — which meant the one test that decodes ZRLE with the real client
 ;; could not be run at all, and a client-side ZRLE regression had nothing
 ;; watching it.

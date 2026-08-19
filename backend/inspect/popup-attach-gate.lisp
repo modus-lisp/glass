@@ -36,7 +36,7 @@
   (let ((*standard-output* (make-broadcast-stream)))
     (ql:quickload '(:glass :mcclim :mcclim-render :sb-concurrency))
     (ignore-errors (ql:quickload :zpng))
-    (asdf:load-asd "/home/claude/glass/backend/mcclim-glass.asd")
+    (asdf:load-asd (merge-pathnames "../mcclim-glass.asd" *load-truename*))
     (asdf:load-system :mcclim-glass)))
 (in-package :clim-glass)
 

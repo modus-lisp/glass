@@ -40,7 +40,7 @@
 (load "~/quicklisp/setup.lisp")
 (handler-bind ((warning #'muffle-warning))
   (let ((*standard-output* (make-broadcast-stream)))
-    (asdf:load-asd "/home/claude/glass/glass.asd")
+    (asdf:load-asd (merge-pathnames "../glass.asd" *load-truename*))
     (ql:quickload '(:glass/client :glass/text))))
 
 (defpackage #:glass-nested-copyrect (:use #:cl) (:local-nicknames (#:gc #:glass-client)))

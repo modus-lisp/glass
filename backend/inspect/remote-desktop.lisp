@@ -24,9 +24,9 @@
 
 (handler-bind ((warning #'muffle-warning))
   (let ((*standard-output* (make-broadcast-stream)))
-    (asdf:load-asd "/home/claude/glass/glass.asd")
+    (asdf:load-asd (merge-pathnames "../../glass.asd" *load-truename*))
     (ql:quickload '(:glass :glass/client :mcclim :mcclim-render :sb-concurrency :pigment))
-    (asdf:load-asd "/home/claude/glass/backend/mcclim-glass.asd")
+    (asdf:load-asd (merge-pathnames "../mcclim-glass.asd" *load-truename*))
     (asdf:load-system :mcclim-glass)
     (asdf:load-system :mcclim-glass/remote)))
 

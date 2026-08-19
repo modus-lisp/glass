@@ -81,7 +81,7 @@
 ;;;
 ;;; DIRECTORY-PATHNAME-P (climacs/core.lisp, adapted from cl-fad) is purely
 ;;; syntactic: a pathname is a directory iff it has no name and no type.  So
-;;; #P"/home/claude/glass/" is a directory and #P"/home/claude/glass" is a file,
+;;; #P"/some/dir/" is a directory and #P"/some/dir" is a file,
 ;;; regardless of what is actually on disk.
 ;;;
 ;;; C-x C-f completes directories WITH the trailing slash, so the common way to

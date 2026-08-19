@@ -82,7 +82,7 @@
   (handler-bind ((warning #'muffle-warning))
     (let ((*standard-output* (make-broadcast-stream)))
       (ql:quickload '(:glass :mcclim :mcclim-render :sb-concurrency))
-      (asdf:load-asd "/home/claude/glass/backend/mcclim-glass.asd")
+      (asdf:load-asd (merge-pathnames "../mcclim-glass.asd" *load-truename*))
       (asdf:load-system :mcclim-glass)
       ;; MCCLIM-GLASS/CLIMACS, not bare :CLIMACS — that system is climacs plus the
       ;; two upstream corrections, and loading it here is the same thing a desktop
@@ -340,14 +340,25 @@
               ;; it into a file as far as Climacs is concerned — and opening a
               ;; directory as a file on SBCL signals a STREAM-ERROR, which is not
               ;; the FILE-ERROR COM-FIND-FILE is watching for.
-              (let ((dp (find-symbol "DIRECTORY-PATHNAME-P" "CLIMACS-CORE")))
-                (check (and dp (funcall dp #p"/home/claude/glass"))
+              ;; The directory we ask about has to be one that really exists, so
+              ;; use this checkout's own root — named with the trailing slash and
+              ;; without it — rather than a path from the box this was written on.
+              (let* ((dp (find-symbol "DIRECTORY-PATHNAME-P" "CLIMACS-CORE"))
+                     (root/ (truename
+                             (merge-pathnames
+                              "../../" (make-pathname :name nil :type nil
+                                                      :defaults *load-truename*))))
+                     (dirs (pathname-directory root/))
+                     (root (make-pathname :directory (butlast dirs)
+                                          :name (car (last dirs)) :type nil
+                                          :defaults root/)))
+                (check (and dp (funcall dp root))
                        "an existing directory named without a slash is a directory")
-                (check (and dp (funcall dp #p"/home/claude/glass/"))
+                (check (and dp (funcall dp root/))
                        "...and with one")
                 (check (and dp (not (funcall dp (or *load-pathname* #p"/etc/hostname"))))
                        "...and an existing FILE is not")
-                (check (and dp (not (funcall dp #p"/home/claude/no-such-thing-here")))
+                (check (and dp (not (funcall dp (merge-pathnames "no-such-thing-here" root/))))
                        "...and a name that is not on disk is still judged by its name"))
 
               ;; --- 10. a minibuffer message is not a one-second fuse -----------

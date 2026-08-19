@@ -13,7 +13,7 @@ That argument is currently false in practice. The only mixer running on this box
 lives in the **gateway** process (webrtc-data/demo/glass-webrtc/gateway-nostr.lisp
 :341-390), which builds its own, registers `AUDIO_MP3` on it, and subscribes one
 sink per peer. The glass desktop serving :3 — the desktop the gateway captures
-video from, pid 3701235, launched from `/home/claude/warren/desktop-5903.lisp`,
+video from, pid 3701235, launched from `warren/desktop-5903.lisp`,
 control socket 4013 — has no mixer at all: `glass/audio` is not loaded in it.
 
 So the box's picture comes from the desktop and the box's sound comes from

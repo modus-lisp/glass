@@ -32,7 +32,7 @@
     (asdf:load-system :glass/headset)
     (asdf:load-system :glass/hearing)
     (asdf:load-system :glass/dictation)
-    (asdf:load-asd "/home/claude/glass/backend/mcclim-glass.asd")
+    (asdf:load-asd (merge-pathnames "../mcclim-glass.asd" *load-truename*))
     (asdf:load-system :mcclim-glass)))
 (in-package :clim-glass)
 
