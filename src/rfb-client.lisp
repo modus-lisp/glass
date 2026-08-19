@@ -104,7 +104,10 @@
   (let* ((v (if (typep data '(simple-array (unsigned-byte 8) (*)))
                 data (coerce data '(simple-array (unsigned-byte 8) (*)))))
          (start (if (zin-started z) 0 2))          ; the 2-byte zlib header, once
-         (br (cram::%make-bitr :data v :pos start))
+         ;; :END is not optional — cram's bit reader bounds-checks against it and
+         ;; it defaults to 0, which fails the very first BR-NEED with "out of
+         ;; input".  The chunk occupies v[0..END).
+         (br (cram::%make-bitr :data v :pos start :end end))
          (out (zin-out z))
          (from (fill-pointer out)))
     (setf (zin-started z) t)

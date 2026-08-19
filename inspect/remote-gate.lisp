@@ -10,9 +10,17 @@
 
 (require :asdf)
 (load "~/quicklisp/setup.lisp")
+;; Find glass and its siblings relative to THIS file, so the gate runs from any
+;; checkout.  It used to name /home/claude/glass/glass.asd — the container it was
+;; written in — which meant the one test that decodes ZRLE with the real client
+;; could not be run at all, and a client-side ZRLE regression had nothing
+;; watching it.
+(asdf:initialize-source-registry
+ (let ((here (make-pathname :name nil :type nil :defaults *load-truename*)))
+   `(:source-registry (:tree ,(merge-pathnames "../../" here))
+                      (:exclude "vendor" "deps") :inherit-configuration)))
 (handler-bind ((warning #'muffle-warning))
   (let ((*standard-output* (make-broadcast-stream)))
-    (asdf:load-asd "/home/claude/glass/glass.asd")
     (ql:quickload '(:glass/client :glass/text :zpng))))
 
 (defpackage #:glass-remote-gate (:use #:cl) (:local-nicknames (#:gc #:glass-client)))
