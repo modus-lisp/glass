@@ -2190,9 +2190,40 @@
     (start-wm-session p specs)
     (run-wm-loop p)))
 
+(defun wm-seat-serve-address (asked)
+  "The interface a NEW seat's listener binds, given what the caller ASKED for — a string
+   they typed, or :DEFAULT for `you decide'.
+
+   A string is obeyed, whatever it is: somebody who writes 0.0.0.0 has said the word, and
+   OPEN-SEAT-TRANSPORT under this binds precisely what it is told.
+
+   :DEFAULT is *SEAT-BIND-ADDRESS* when this desktop can actually demand a credential, and
+   127.0.0.1 when it cannot.  That is SERVE-SEAT-VNC's rule (see its address parameter), and
+   it is here for the same reason: ADD-WM-SEAT is typed at a live desktop — over a control
+   socket, at a REPL — by somebody who named a port number and nothing else, and choosing an
+   interface on their behalf is exactly what obliges us not to choose an exposing one.  A
+   session-wide password with no DES verifier in the image is not a credential, it is a
+   listener that rejects every client, so it counts as none: the question here is the same
+   one the handshake will actually ask.
+
+   The overrule is announced, because a seat you cannot reach from the machine you are
+   sitting at is otherwise indistinguishable from a seat that failed to start."
+  (if (stringp asked)
+      asked
+      (let ((credential (and (glass:vnc-auth-available-p)
+                             (glass:effective-vnc-password :inherit))))
+        (cond (credential *seat-bind-address*)
+              ((loopback-address-p *seat-bind-address*) *seat-bind-address*)
+              (t (format *error-output*
+                         "~&glass: this session has no VNC credential, so the new seat is on ~
+                          127.0.0.1 and not ~a — pass :ADDRESS to say otherwise.~%"
+                         *seat-bind-address*)
+                 (force-output *error-output*)
+                 "127.0.0.1")))))
+
 (defun add-wm-seat (port &key port-num (width 1000) (height 720) name background
                               (background-mode :cover) (audio t) (serve t)
-                              (address *seat-bind-address*)
+                              (address :default)
                               (kind *seat-transport-kind*) path)
   "Attach a SECOND (third, …) person to a running desktop: a screen of their own at
    WIDTH x HEIGHT serving on PORT-NUM, with their own pointer, keyboard, focus, menu,
@@ -2209,11 +2240,19 @@
    their own microphone, on the ports beside it (5923 -> 5933 out, 5934 in) — so seat
    ports want a decade of room between them, and a seat with no sound is one :audio nil.
 
-   SERVE t (the default) also opens the RFB listener, on ADDRESS — the same convenience
-   RUN-WM is, and for the same reason: a second person asked for by port number wants the
-   port.  :SERVE NIL makes the seat and leaves it unreachable, which is what a seat whose
-   wire is something other than a VNC listener wants (OPEN-SEAT-TRANSPORT later, or a
-   transport this file does not know about).
+   SERVE t (the default) also opens the RFB listener — the same convenience RUN-WM is, and
+   for the same reason: a second person asked for by port number wants the port.  :SERVE NIL
+   makes the seat and leaves it unreachable, which is what a seat whose wire is something
+   other than a VNC listener wants (OPEN-SEAT-TRANSPORT later, or a transport this file does
+   not know about).
+
+   AND IT OPENS IT ON LOOPBACK UNLESS THIS SESSION HAS A CREDENTIAL.  ADDRESS is a string
+   you mean literally; unset, it is 127.0.0.1 while there is no password to go with the port
+   and *SEAT-BIND-ADDRESS* once there is (WM-SEAT-SERVE-ADDRESS).  The opt-in-serving split
+   moved the listener out of RUN-WM and did not come this far, so `add a second seat' went
+   on binding 0.0.0.0 with no authentication — a whole desktop, on every interface, from a
+   call whose only argument was a port number.  A seat is a person's place at the session,
+   not a decision to publish it.
 
    Returns the seat."
   (check-type port-num (integer 1 65535))
@@ -2225,7 +2264,8 @@
             (ignore-errors (wm-render-background seat background :mode background-mode))))
     ;; the transport first: it is what fills SEAT-INJECTOR, which is the keyboard this
     ;; seat's dictation types on
-    (when serve (open-seat-transport seat :port-num port-num :address address
+    (when serve (open-seat-transport seat :port-num port-num
+                                          :address (wm-seat-serve-address address)
                                           :kind kind :path path))
     (when audio (start-seat-audio port :seat seat))
     (composite-seat seat)

@@ -51,6 +51,9 @@ McCLIM application frames, PTY **terminals**, and a **browser** side by side. Ea
 `(clim-glass::add-wm-seat PORT :port-num N :width W :height H)` attaches a **second
 person** to a running desktop — a screen of their own on RFB port `N`, with their own
 pointer, keyboard, focus, open menu, clipboard, and **arrangement of the same windows**.
+The listener it opens binds **127.0.0.1 unless this session has a VNC credential**, and
+says so when it overrules; `:address` is how you mean something else. Adding a person to
+your desktop is not a decision to publish it.
 
 The axis is: **what runs** is shared, **who watches** is per-seat. The applications and
 each window's *content* framebuffer are shared, and so is each window's *size* — size is
@@ -143,6 +146,16 @@ two microphones and the dictation routing; `backend/inspect/seat-dictation-e2e.l
 runs it for real — two sentences synthesised by chord, pushed into two microphone ports,
 transcribed by two stave recognizers, typed into two windows, neither one's words in the
 other's.
+
+`backend/inspect/two-seat-desktop-gate.lisp` is the **acceptance** one, and the difference
+is that it stands a desktop *up*: a real `run-wm` with its compositing loop ticking, a real
+terminal with a real shell, a second person joining the running port with `add-wm-seat`, and
+every claim above asserted on that — mostly on a **digest of each seat's whole screen**,
+because "seat A's screen did not change while seat B moved a window" is a statement about
+half a million pixels and the only honest way to make it is to hash them. It also holds the
+line on what adding a seat may open (loopback unless there is a credential), on
+`seat-move-window` staying a pure setter, and on the control socket answering a form it
+cannot read instead of closing on it.
 
 Also a **message-port** backend (`clim-glass:make-message-port`) + **compositor**
 that run each app as an isolated actor drawing to a shared display over a mailbox —
