@@ -61,27 +61,11 @@
 ;;; at the RUNNING desktop with no restart:
 ;;;   echo '(glass:perf-reset)'  | nc -q1 127.0.0.1 4009
 ;;;   echo '(glass:perf-report)' | nc -q1 127.0.0.1 4009
-(defun start-control-socket (&optional (port 4009))
-  (sb-thread:make-thread
-   (lambda ()
-     (let ((listen (glass:tcp-listen port :address "127.0.0.1")))
-       (loop
-         (handler-case
-             (let ((s (sb-bsd-sockets:socket-make-stream
-                       (sb-bsd-sockets:socket-accept listen)
-                       :input t :output t :element-type 'character :buffering :full)))
-               (unwind-protect
-                    (let ((*package* (find-package :clim-glass))
-                          (form (read s nil nil)))
-                      (when form
-                        (write-string
-                         (handler-case (princ-to-string (eval form))
-                           (error (e) (format nil "ERROR: ~a" e)))
-                         s)
-                        (terpri s) (force-output s)))
-                 (ignore-errors (close s))))
-           (error () nil)))))
-   :name "glass-control"))
+;;;
+;;; CLIM-GLASS:START-CONTROL-SOCKET now, and not a copy of it here: this file's copy
+;;; swallowed reader errors (a symbol in the wrong package closed the connection with no
+;;; output at all, which reads like an answer), and it had three siblings with the same
+;;; bug.  backend/control.lisp is the one that answers.
 
 ;; VNC password: if ~/.glass-vnc-pass exists (create it yourself, mode 600 — it is
 ;; NOT in the repo), require + verify it (secures the 0.0.0.0 bind, and macOS saves
@@ -94,7 +78,7 @@
 
 (let ((wp (namestring (merge-pathnames "assets/wallpaper.svg"
                                        (asdf:system-source-directory :mcclim-glass)))))
-  (start-control-socket *control-port*)
+  (clim-glass:start-control-socket :port *control-port*)
   ;; The session's sound, on its own port beside the screen (see src/audio-stream.lisp): one
   ;; mixer in the process the applications run in, and any number of listeners in OTHER
   ;; processes subscribing to the same mix.  Found by name, so a build without

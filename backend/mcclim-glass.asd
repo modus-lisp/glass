@@ -16,6 +16,7 @@
                (:file "backend")
                (:file "message-port")
                (:file "wm")
+               (:file "control")
                (:file "compositor")))
 
 (asdf:defsystem "mcclim-glass/speak"

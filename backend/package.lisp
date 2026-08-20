@@ -24,4 +24,6 @@
            ;; plain VNC on demand: the root-menu item's two verbs, and the policy
            #:serve-seat-vnc #:stop-seat-vnc #:seat-vnc-transport
            #:*seat-vnc-address* #:*vnc-password-file* #:vnc-password-file-credential
-           #:local-address #:loopback-address-p))
+           #:local-address #:loopback-address-p
+           ;; the wire you poke a running desktop with (backend/control.lisp)
+           #:start-control-socket #:control-answer))

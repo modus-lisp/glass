@@ -44,28 +44,10 @@
     (prog1 (wm-spawn-spec p (cdr (assoc "Remote desktop" (wm-default-menu) :test #'equal)))
       (composite-all p))))
 
-(defun start-control-socket (port)
-  (sb-thread:make-thread
-   (lambda ()
-     (let ((listen (glass:tcp-listen port :address "127.0.0.1")))
-       (loop
-         (handler-case
-             (let ((s (sb-bsd-sockets:socket-make-stream
-                       (sb-bsd-sockets:socket-accept listen)
-                       :input t :output t :element-type 'character :buffering :full)))
-               (unwind-protect
-                    (let* ((*package* (find-package :clim-glass))
-                           (form (read s nil nil)))
-                      (when form
-                        (write-string (handler-case (princ-to-string (eval form))
-                                        (error (e) (format nil "ERROR: ~a" e)))
-                                      s)
-                        (terpri s) (force-output s)))
-                 (ignore-errors (close s))))
-           (error () nil)))))
-   :name (format nil "glass-control-~d" port)))
-
-(start-control-socket (symbol-value 'cl-user::*control*))
+;; The shipped one (backend/control.lisp), not a copy: the copy that used to live here
+;; closed the connection without a byte when a form would not READ.
+(start-control-socket :port (symbol-value 'cl-user::*control*)
+                      :name (format nil "glass-control-~d" (symbol-value 'cl-user::*control*)))
 
 (let ((wp (namestring (merge-pathnames "assets/wallpaper.svg"
                                        (asdf:system-source-directory :mcclim-glass)))))
