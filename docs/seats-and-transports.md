@@ -326,6 +326,58 @@ The remedy here was not a better file: it was putting the writer and the reader 
 fact is a variable. What survives on disk (`~/.glass/site-url`) is read by the *same* image, once,
 before it has minted anything — which is a memo, and the distinction is the whole of the fix.
 
+## What met the code a fifth time: two seats, on a desktop, at last
+
+A fifth round, and this one did not come from re-reading the note. It came from *adding a second
+seat to the live desktop by hand* — ten minutes of it — and then from writing the acceptance test
+that ought to have existed already (`backend/inspect/two-seat-desktop-gate.lisp`: one real
+`RUN-WM`, its tick loop running, a real terminal, a second person joining it, and the contract
+asserted on the pixels).
+
+**15. The opt-in-serving split did not reach `ADD-WM-SEAT`, and that is where it mattered most.**
+Point 1 above says the whole conflation was one line — `start-glass-server` inside `RUN-WM` — and
+that moving it was the whole of the change. It was one line *in `RUN-WM`*. `ADD-WM-SEAT` had its
+own, and it went on opening an RFB listener on `*SEAT-BIND-ADDRESS*` — `0.0.0.0`, every interface,
+with whatever credential the session had, which is none — from a call whose only required argument
+is a port number. Adding a second seat to the desktop on this box put the desktop on the internet,
+and nobody typed an address to make that happen.
+
+It is the worse half of the two, and the note's own reasoning says why. Point 11 draws the line
+between a **launcher**, where a person wrote the call and knows the box, and a **root-menu item**,
+which *has nobody to ask* — and concludes that the thing which picks an address on somebody's
+behalf is exactly the thing that must not pick an exposing one. `RUN-WM` is a launcher.
+`ADD-WM-SEAT` is typed at a desktop that is already running, over a control socket or at a REPL, by
+somebody naming a port number and nothing else: it is on the menu-item side of that line, and it was
+given the launcher's default. It now takes `SERVE-SEAT-VNC`'s rule instead — bind what you are told,
+and when you are told nothing, `0.0.0.0` only if there is a credential to go with it — and says out
+loud when it overrules, because a seat you cannot reach is otherwise indistinguishable from a seat
+that failed to start. A seat is a person's place at the session; it is not a decision to publish it.
+
+**16. A control socket that cannot READ says nothing at all, and silence reads like an answer.**
+Every launcher grew its own copy of the eval socket, and all four (`serve-desktop`,
+`scroll-desktop`, `remote-desktop`, and warren's `desktop-5903`) put the `READ` inside the accept
+loop's blanket `(handler-case … (error () nil))` and outside the one that reports. So an *eval*
+error came back as `ERROR: …` and a *read* error came back as nothing whatever — the connection
+simply closed. Asking a live desktop about `glass:seat-name` (it is `clim-glass:seat-name`) is a
+read error, and the answer was an empty reply, which was twice read as *this desktop has no seats*.
+
+Two things generalise. The first is point 7's again, exactly: a bug found once is a search pattern,
+and four copies of one loop is four copies of whatever is wrong with it — so there is one now
+(`CLIM-GLASS:START-CONTROL-SOCKET`, `backend/control.lisp`), and the launchers call it. The second
+is new and is about *diagnosis*: an error path that produces no output is worse than one that
+produces a wrong answer, because a wrong answer is contested and silence is interpreted. The half of
+a control socket most likely to fail is the half that meets what a person typed, and it was the half
+with no reporting on it.
+
+**17. `SEAT-MOVE-WINDOW` is a pure setter, and that is correct — but it is not obvious.** It moves a
+window for a seat and damages nothing, composites nothing, wakes nothing. Right for the drag path,
+which damages the union of where the window was and where it now is and is the only thing that knows
+both. But it means anything driving a seat *programmatically* — a script, a control socket, a test —
+changes nothing anybody can see until it composites, and a suite whose helper forgot that would pass
+every per-seat pixel claim by never drawing anything. The gate moves windows through the window
+manager's own drag step and asserts the distinction, so that the day somebody "fixes" the silence by
+putting a composite inside the setter, something says why it was silent.
+
 ### Still not built
 
 **Per-seat admission** (the `invoker` becoming a principal) is unchanged and still wanted. **Capture
