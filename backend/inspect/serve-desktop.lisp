@@ -8,7 +8,15 @@
 ;;;; file.  Display N: VNC on 5900+N, the session's audio on 5910+N, the control socket on
 ;;;; 4008+N — which leaves display 1 on exactly the ports it has always used.
 (require :asdf)
-(load "~/quicklisp/setup.lisp")
+;; Quicklisp, wherever it is -- and not at all when it is already here.  A
+;; hardcoded ~/quicklisp assumes the process has a home it owns and that
+;; Quicklisp is under it; an image that runs unprivileged has neither, and a core
+;; with the systems already in it needs none of this.  (RUNNING.md's rough edge
+;; #1, for this file at least.)
+(let ((ql (find-if #'probe-file
+                   (list #p"/opt/quicklisp/setup.lisp"
+                         (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname))))))
+  (when (and ql (not (find-package '#:quicklisp))) (load ql)))
 (handler-bind ((warning #'muffle-warning))
   (let ((*standard-output* (make-broadcast-stream)))
     (ql:quickload '(:glass :glass/vncauth :mcclim :mcclim-render :sb-concurrency
