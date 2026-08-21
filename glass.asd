@@ -251,6 +251,20 @@ no X.  (sb-ext:run-program + one winsize ioctl are the platform seam.)"
   :serial t
   :components ((:module "src" :serial t :components ((:file "term")))))
 
+(asdf:defsystem :glass/repl
+  :description "The terminal with a Lisp listener on the other end instead of a
+shell.  glass/term's grid, VT parser and scribe rendering are portable Common
+Lisp; the pty, the shell and two ioctls were the only Unix in it, and on a Lisp
+machine none of those exist.  TERMINAL-PTY is just a bidirectional character
+stream, so this is a stream pair and a read-eval-print loop on the far end -- no
+pty, no fork, no shell, no FFI."
+  :version "0.0.1"
+  :author "ynniv"
+  :license "MIT"
+  :depends-on ("glass/term")   ; sb-gray is in SBCL itself, not a module
+  :serial t
+  :components ((:module "src" :serial t :components ((:file "repl")))))
+
 (asdf:defsystem :glass/test
   :description "Self-test for glass: an RFB client that drives the server.  Uses
 chipz as an independent inflate oracle for the ZRLE stream (cram compresses;

@@ -160,3 +160,7 @@
    ;; standing perf counters (read a snapshot over the control socket)
    #:*perf-on* #:perf-reset #:perf-report #:perf-record-send #:perf-record-composite
    #:*send-lag* #:*send-queue*))
+
+(defpackage #:glass-repl
+  (:use #:cl)
+  (:export #:make-repl-terminal #:listener-loop #:make-pipe-pair))

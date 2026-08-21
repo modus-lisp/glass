@@ -657,7 +657,16 @@
    Font — WezTerm's default set; colour emoji comes from scribe's Twemoji fallback)."
   (glass:load-font (asdf:system-relative-pathname :glass/term (format nil "fonts/~a" name))))
 
-(defun make-terminal (&key (cols 80) (rows 24) (ppem 16) (shell "/bin/bash") emoji-font)
+(defun make-terminal (&key (cols 80) (rows 24) (ppem 16) (shell "/bin/bash") emoji-font
+                           pty)
+  "A terminal.  With PTY, talk to THAT bidirectional character stream instead of
+   spawning SHELL on a pseudo-terminal.
+
+   The stream is the whole seam: ON-KEY writes to it and PUMP reads from it, so
+   anything that can be read and written a character at a time can sit on the
+   other end.  glass/repl puts a Lisp listener there, which is what this was for
+   before it grew a shell -- and on modus there is no shell, no pty and no
+   process to run in one, so the stream is the only end that will exist."
   (let* ((font (%term-font "JetBrainsMono-Regular.ttf"))
          (nerd (ignore-errors (%term-font "SymbolsNerdFontMono-Regular.ttf")))
          (upem (scribe:font-units-per-em font))
@@ -674,30 +683,36 @@
          ;; (bash may say "cannot set terminal process group" — the pty still
          ;; reads and writes normally).  A missing setsid used to be a hard
          ;; error, which took the whole desktop down with it.
-         (setsid (find-if #'probe-file '("/usr/bin/setsid" "/bin/setsid")))
+         (setsid (unless pty (find-if #'probe-file '("/usr/bin/setsid" "/bin/setsid"))))
          (argv (if setsid (list "-c" shell "--norc" "-i") (list "--norc" "-i")))
-         (proc (sb-ext:run-program (or setsid shell) argv
+         (proc (unless pty
+                 (sb-ext:run-program (or setsid shell) argv
                                    :pty t :wait nil
                                    :external-format :latin-1   ; read raw bytes; we UTF-8 decode
                                    :environment (list "TERM=xterm-256color" "PS1=\\w $ "
                                                       "PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
                                                       (format nil "COLUMNS=~d" cols) (format nil "LINES=~d" rows)
-                                                      (format nil "HOME=~a" (or (sb-ext:posix-getenv "HOME") "/root")))))
-         (pty (sb-ext:process-pty proc)))
+                                                      (format nil "HOME=~a" (or (sb-ext:posix-getenv "HOME") "/root"))))))
+         (pty (or pty (sb-ext:process-pty proc))))
     (multiple-value-bind (gch gco) (make-grid cols rows)
      (let ((tm (%make-terminal :cols cols :rows rows :chars gch :colors gco
                             :bot (1- rows) :pty pty :proc proc :font font :nerd-font nerd :ppem ppem
                             :emoji-font (load-emoji-font emoji-font)
                             :cell-w cell-w :cell-h cell-h :ascent asc
                             :fb (glass:make-framebuffer (* cols cell-w) (* rows cell-h) glass:+black+))))
-    (set-winsize pty rows cols)
-    (enable-echo pty)                       ; SBCL's pty comes up -echo; the shell needs it on
+    ;; Both of these are ioctls on a file descriptor, so they apply to a real
+    ;; pty and to nothing else.  A stream-backed terminal has no fd, no winsize
+    ;; and no termios -- and needs none: its other end is in this image.
+    (when proc
+      (set-winsize pty rows cols)
+      (enable-echo pty))                    ; SBCL's pty comes up -echo; the shell needs it on
     tm))))
 
 (defun kill-terminal (tm)
   "Close the terminal: SIGHUP the shell's whole process group (so children die
    too) and close the pty; the pump thread then sees EOF and exits."
-  (ignore-errors (sb-ext:process-kill (terminal-proc tm) 1 :process-group))   ; SIGHUP the group
+  (when (terminal-proc tm)
+    (ignore-errors (sb-ext:process-kill (terminal-proc tm) 1 :process-group)))  ; SIGHUP the group
   (ignore-errors (close (terminal-pty tm))))
 
 (defun resize-terminal (tm cols rows)
