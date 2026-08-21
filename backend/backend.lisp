@@ -324,14 +324,19 @@
    anything connecting over TCP stops finding it.  That is the whole of the migration and
    it is one word in one launcher, deliberately left to whoever knows what is connected.")
 
-(defparameter *seat-bind-address* "0.0.0.0"
+(defparameter *seat-bind-address* "127.0.0.1"
   "The interface a seat's RFB listener binds when nobody says otherwise.
 
-   0.0.0.0 — every interface — because that is what glass has always bound and changing
-   it here would silently cut off whatever is already pointed at a desktop on this box.
-   It is a PARAMETER so the choice is one place and one line: binding \"127.0.0.1\" (here,
-   or per call via OPEN-SEAT-TRANSPORT's :ADDRESS) closes the exposure the note calls out,
-   and it is the operator's call because they are the ones who know what is connected.")
+   LOOPBACK.  This was 0.0.0.0, on the reasoning that it is what glass had always bound
+   and that changing it might cut off something already pointed at a desktop here — with
+   the note that it was the operator's call.  The operator made it: nothing should be
+   reachable off this machine because a default said so.  Exposure is now something a
+   caller ASKS for, per call via OPEN-SEAT-TRANSPORT's :ADDRESS or by rebinding this.
+
+   Nothing was cut off, and the check is worth recording: at the time of the change no
+   glass desktop on this box was listening on TCP at all — the live session ran entirely
+   on UNIX sockets at 0600 (~/.glass/run/seat-0.rfb and friends), which is the stronger
+   form of the same posture and the one to prefer when a socket file will do.")
 
 (defun seat-socket-path (seat)
   "Where SEAT's UNIX-domain RFB socket lives when nobody names a path.

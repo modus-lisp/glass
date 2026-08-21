@@ -70,6 +70,11 @@
 ;; VNC password: if ~/.glass-vnc-pass exists (create it yourself, mode 600 — it is
 ;; NOT in the repo), require + verify it (secures the 0.0.0.0 bind, and macOS saves
 ;; it to Keychain so it stops prompting).  Absent -> the open any-password posture.
+;; WHERE THE SCREEN LISTENS.  Loopback unless GLASS_BIND says otherwise — reaching this
+;; desktop from another machine is a thing to ask for, not a thing to discover.  A socket
+;; file (run-wm's :KIND :RFB-UNIX) is better still where the viewer is local.
+(defvar *bind-address* (or (sb-ext:posix-getenv "GLASS_BIND") "127.0.0.1"))
+
 (let ((pwfile (merge-pathnames ".glass-vnc-pass" (user-homedir-pathname))))
   (when (probe-file pwfile)
     (let ((pw (string-trim '(#\Space #\Tab #\Newline #\Return)
@@ -92,7 +97,15 @@
         (here "/mnt/lisp/chord/export/en_US-lessac-medium.graph"))
     (when (and var (boundp var) (null (symbol-value var)) (probe-file here))
       (setf (symbol-value var) here)))
-  (format *error-output* "~&@@ glass desktop :~d serving on 0.0.0.0:~d (~a)~%" *display* *vnc-port* wp)
+  ;; THE ADDRESS IT ACTUALLY BOUND.  This said "0.0.0.0" unconditionally — a literal in a
+  ;; log line, correct only by coincidence and wrong the moment the default moved.  A
+  ;; startup banner that states a posture rather than reporting one is worse than none.
+  (format *error-output* "~&@@ glass desktop :~d serving on ~a:~d (~a)~%"
+          *display* *bind-address* *vnc-port* wp)
+  (when (string= *bind-address* "0.0.0.0")
+    (format *error-output* "@@ WARNING: bound to every interface (GLASS_BIND) — ~
+                            ~:[NO PASSWORD IS SET~;a password is set~]~%"
+            (and (boundp 'glass:*vnc-password*) glass:*vnc-password*)))
   (format *error-output* "@@ control socket on 127.0.0.1:~d, session audio on 127.0.0.1:~d~%"
           *control-port* *audio-port*)
   (format *error-output* "@@ voice: ~:[none — set GLASS_VOICE~;~:*~a~]~%"
@@ -117,5 +130,5 @@
   (when (find-package :glass-speak)
     (ignore-errors (funcall (find-symbol "REGISTER" :glass-speak))))
   (clim-glass:run-wm *startup-apps*
-                     :port *vnc-port* :width 1280 :height 800
+                     :port *vnc-port* :address *bind-address* :width 1280 :height 800
                      :background wp :background-mode :cover))
