@@ -168,9 +168,17 @@
   ;; to answer.  Gated on the key because a desktop without one cannot answer it — and it is
   ;; the SAME key the gateway runs on, or every issued link and every enrolled device stops
   ;; verifying.  Found by name, so a build without :glass/nostr still starts a desktop.
-  (let ((start (find-symbol "START-SESSION-NOSTR" :glass)))
-    (when (and start (fboundp start)
-               (let ((k (sb-ext:posix-getenv "GLASS_NOSTR_SEC"))) (and k (plusp (length k)))))
+  (let ((start (find-symbol "START-SESSION-NOSTR" :glass))
+        (secvar (find-symbol "*BOX-SECRET*" :glass))
+        (key (or (sb-ext:posix-getenv "GLASS_NOSTR_SEC") (sb-ext:posix-getenv "NOSTR_SEC"))))
+    (when (and start (fboundp start) key (plusp (length key)))
+      ;; FILL THE SECRET IN AFTER LOAD, which is what *BOX-SECRET* documents itself as
+      ;; wanting: it is a DEFVAR read from the environment when :glass/nostr loads.  In a
+      ;; saved core that load happened at IMAGE-BUILD time, where there was no identity to
+      ;; read, and a defvar keeps that NIL through every later load -- so a box with a
+      ;; perfectly good key in its environment still says "this desktop has no identity"
+      ;; and refuses everyone.  The launcher is the one that knows, so the launcher sets it.
+      (when secvar (setf (symbol-value secvar) key))
       (handler-case
           (funcall start :path (and *rfb-socket* (glass:socket-sibling *rfb-socket* "admit")))
         (serious-condition (e)
