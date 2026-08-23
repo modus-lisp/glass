@@ -110,22 +110,15 @@ to know what landed without racing the app it landed in.")
 ;;; ---- what gets typed --------------------------------------------------------
 
 (defun dictation-text (text)
-  "TEXT as it should be TYPED: sentence-cased, one trailing space.
+  "TEXT as it should be TYPED: STAVE:SENTENCE-CASE plus one trailing space.
 
-The recognizer's `AFTER EARLY NIGHTFALL THE YELLOW LAMPS WOULD LIGHT UP' becomes `After early
-nightfall the yellow lamps would light up '.  Pure — no ear, no keyboard — so the shape of the
-output can be checked without a desktop.
-
-The trailing space is what makes consecutive utterances read as prose instead of running
-together; it is also why this does NOT capitalize after a period, since there are no periods.
-Lowercasing is lossy for proper nouns, and unavoidable: the recognizer did not tell us which
-words were names, and inventing that would be inventing a fact."
-  (let ((s (string-trim '(#\Space #\Tab #\Newline #\Return) (or text ""))))
-    (if (zerop (length s))
-        ""
-        (let ((low (string-downcase s)))
-          (setf (char low 0) (char-upcase (char low 0)))
-          (concatenate 'string low " ")))))
+The recase — bare uppercase to sentence case — moved to stave, where it belongs: it is a fact about
+what the recognizer emits, not about typing, and stave is what emitted it.  So `AFTER EARLY
+NIGHTFALL' becomes `After early nightfall '.  What stays HERE, because it is genuinely a dictation
+concern, is the TRAILING SPACE: it is what makes consecutive typed utterances read as prose instead
+of running together (and it is also why there is nothing to capitalize after — there are no periods)."
+  (let ((s (stave:sentence-case text)))
+    (if (zerop (length s)) "" (concatenate 'string s " "))))
 
 ;;; ---- when it is safe to type ------------------------------------------------
 
