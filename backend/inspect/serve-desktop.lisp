@@ -25,6 +25,7 @@
     (ignore-errors (asdf:load-system :warren))                ; the file browser (optional)
     (ignore-errors (asdf:load-system :glass/audio-stream))    ; the session's sound (optional)
     (ignore-errors (asdf:load-system :glass/speech))          ; and its voice, via chord (optional)
+    (ignore-errors (asdf:load-system :glass/nostr))           ; admission + enrolment (optional)
     (asdf:load-asd (merge-pathnames "../mcclim-glass.asd" *load-truename*))
     (asdf:load-system :mcclim-glass)
     (ignore-errors (asdf:load-system :mcclim-glass/speak))))  ; type-and-say window (optional)
@@ -83,6 +84,19 @@
 ;; file (run-wm's :KIND :RFB-UNIX) is better still where the viewer is local.
 (defvar *bind-address* (or (sb-ext:posix-getenv "GLASS_BIND") "127.0.0.1"))
 
+;;; ...and a SOCKET FILE instead of a port, which is better wherever the client is local:
+;;; nothing to publish, no interface to get wrong, and the file's own 0600 mode is the
+;;; access control rather than a password sitting in front of an open port.  GLASS_RFB_SOCKET
+;;; =auto puts it in the runtime directory under this seat's name; an absolute path puts it
+;;; exactly there.  The three sibling sockets — audio, microphone, admission — are DERIVED
+;;; from this one (SOCKET-SIBLING), so naming one names all four and they cannot drift.
+(defvar *rfb-socket*
+  (let ((v (sb-ext:posix-getenv "GLASS_RFB_SOCKET")))
+    (cond ((or (null v) (string= v "") (string= v "0")) nil)
+          ((or (string= v "auto") (string= v "1"))
+           (glass:socket-path (format nil "seat-~d.rfb" *display*)))
+          (t v))))
+
 (let ((pwfile (merge-pathnames ".glass-vnc-pass" (user-homedir-pathname))))
   (when (probe-file pwfile)
     (let ((pw (string-trim '(#\Space #\Tab #\Newline #\Return)
@@ -96,8 +110,13 @@
   ;; mixer in the process the applications run in, and any number of listeners in OTHER
   ;; processes subscribing to the same mix.  Found by name, so a build without
   ;; :glass/audio-stream still starts a desktop — silence is a working desktop, no desktop is not.
+  ;; ...and it follows the screen: a socket screen means a socket mixer beside it, by the
+  ;; same SOCKET-SIBLING rule the gateway uses to find it.  Four endpoints, one name.
   (let ((start (find-symbol "START-SESSION-AUDIO" :glass)))
-    (when (and start (fboundp start)) (funcall start :port *audio-port* :address "127.0.0.1")))
+    (when (and start (fboundp start))
+      (if *rfb-socket*
+          (funcall start :path (glass:socket-sibling *rfb-socket* "audio"))
+          (funcall start :port *audio-port* :address "127.0.0.1"))))
   ;; The voice (see src/speech.lisp), if :glass/speech loaded and a voice is actually on this
   ;; box.  GLASS_VOICE still wins; this only fills in the one that lives here, and leaves the
   ;; variable alone — so SPEAK's complaint stays accurate — when the file is missing.
@@ -108,14 +127,20 @@
   ;; THE ADDRESS IT ACTUALLY BOUND.  This said "0.0.0.0" unconditionally — a literal in a
   ;; log line, correct only by coincidence and wrong the moment the default moved.  A
   ;; startup banner that states a posture rather than reporting one is worse than none.
-  (format *error-output* "~&@@ glass desktop :~d serving on ~a:~d (~a)~%"
-          *display* *bind-address* *vnc-port* wp)
-  (when (string= *bind-address* "0.0.0.0")
+  (if *rfb-socket*
+      (format *error-output* "~&@@ glass desktop :~d serving on ~a (~a)~%"
+              *display* *rfb-socket* wp)
+      (format *error-output* "~&@@ glass desktop :~d serving on ~a:~d (~a)~%"
+              *display* *bind-address* *vnc-port* wp))
+  (when (and (null *rfb-socket*) (string= *bind-address* "0.0.0.0"))
     (format *error-output* "@@ WARNING: bound to every interface (GLASS_BIND) — ~
                             ~:[NO PASSWORD IS SET~;a password is set~]~%"
             (and (boundp 'glass:*vnc-password*) glass:*vnc-password*)))
-  (format *error-output* "@@ control socket on 127.0.0.1:~d, session audio on 127.0.0.1:~d~%"
-          *control-port* *audio-port*)
+  (if *rfb-socket*
+      (format *error-output* "@@ control socket on 127.0.0.1:~d, session audio on ~a~%"
+              *control-port* (glass:socket-sibling *rfb-socket* "audio"))
+      (format *error-output* "@@ control socket on 127.0.0.1:~d, session audio on 127.0.0.1:~d~%"
+              *control-port* *audio-port*))
   (format *error-output* "@@ voice: ~:[none — set GLASS_VOICE~;~:*~a~]~%"
           (let ((var (find-symbol "*SPEECH-VOICE*" :glass)))
             (and var (boundp var) (symbol-value var))))
@@ -137,6 +162,24 @@
   ;; is still a desktop, just a mute one.
   (when (find-package :glass-speak)
     (ignore-errors (funcall (find-symbol "REGISTER" :glass-speak))))
-  (clim-glass:run-wm *startup-apps*
-                     :port *vnc-port* :address *bind-address* :width 1280 :height 800
-                     :background wp :background-mode :cover))
+  ;; ADMISSION, when this desktop has an identity of its own.  The allowlist, the enrolment
+  ;; store and the login tokens live HERE now rather than in whatever gateway is in front:
+  ;; a gateway is a pipe, and "may this person open the desktop" is the desktop's question
+  ;; to answer.  Gated on the key because a desktop without one cannot answer it — and it is
+  ;; the SAME key the gateway runs on, or every issued link and every enrolled device stops
+  ;; verifying.  Found by name, so a build without :glass/nostr still starts a desktop.
+  (let ((start (find-symbol "START-SESSION-NOSTR" :glass)))
+    (when (and start (fboundp start)
+               (let ((k (sb-ext:posix-getenv "GLASS_NOSTR_SEC"))) (and k (plusp (length k)))))
+      (handler-case
+          (funcall start :path (and *rfb-socket* (glass:socket-sibling *rfb-socket* "admit")))
+        (serious-condition (e)
+          ;; A desktop that cannot answer admission is still a desktop; it just refuses
+          ;; everyone, which the gateway reports as "admission service unreachable".
+          (format *error-output* "~&@@ admission failed to start: ~a~%" e)
+          (finish-output *error-output*)))))
+  (apply #'clim-glass:run-wm *startup-apps*
+         :width 1280 :height 800 :background wp :background-mode :cover
+         (if *rfb-socket*
+             (list :kind :rfb-unix :path *rfb-socket*)
+             (list :port *vnc-port* :address *bind-address*))))
