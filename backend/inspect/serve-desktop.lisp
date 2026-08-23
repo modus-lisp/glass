@@ -26,6 +26,7 @@
     (ignore-errors (asdf:load-system :glass/audio-stream))    ; the session's sound (optional)
     (ignore-errors (asdf:load-system :glass/speech))          ; and its voice, via chord (optional)
     (ignore-errors (asdf:load-system :glass/nostr))           ; admission + enrolment (optional)
+    (ignore-errors (asdf:load-system :glass/mic-stream))      ; a peer's microphone, inbound (optional)
     (asdf:load-asd (merge-pathnames "../mcclim-glass.asd" *load-truename*))
     (asdf:load-system :mcclim-glass)
     (ignore-errors (asdf:load-system :mcclim-glass/speak))))  ; type-and-say window (optional)
@@ -117,6 +118,19 @@
       (if *rfb-socket*
           (funcall start :path (glass:socket-sibling *rfb-socket* "audio"))
           (funcall start :port *audio-port* :address "127.0.0.1"))))
+  ;; ...and the way back IN: the peer's microphone, on its own sibling socket.  Nothing
+  ;; started this, so a gateway would connect a browser's mic to a socket nobody was
+  ;; listening on and say so -- "no ear at …seat-1.mic, the microphone goes nowhere" --
+  ;; which is a desktop that can speak and cannot hear.  Same optional treatment as the
+  ;; mixer: found by name, and a build without :glass/mic-stream still starts a desktop.
+  (let ((start (find-symbol "START-SESSION-MIC" :glass)))
+    (when (and start (fboundp start))
+      (handler-case
+          (if *rfb-socket*
+              (funcall start :path (glass:socket-sibling *rfb-socket* "mic"))
+              (funcall start :port (glass:seat-mic-port *vnc-port*) :address "127.0.0.1"))
+        (serious-condition (e)
+          (format *error-output* "~&@@ microphone not listening: ~a~%" e)))))
   ;; The voice (see src/speech.lisp), if :glass/speech loaded and a voice is actually on this
   ;; box.  GLASS_VOICE still wins; this only fills in the one that lives here, and leaves the
   ;; variable alone — so SPEAK's complaint stays accurate — when the file is missing.
