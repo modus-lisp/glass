@@ -688,13 +688,63 @@
                  (when (and (<= 0 sx) (< sx iw) (<= 0 sy) (< sy ih)) (put dx dy sx sy)))))))))
       fb))))
 
+(defun seat-wallpaper (seat)
+  "SEAT's wallpaper, rasterised for the screen SIZE IT HAS NOW, or NIL for none.
+
+   The picture is the session's; the pixels are this seat's; and the size those pixels
+   were cut for is a fact that can go stale.  It goes stale exactly when a seat's screen
+   is resized, which is why this re-renders rather than returning the cached image
+   blindly: the alternative is a wallpaper drawn for a screen that no longer exists,
+   blitted at 0,0 into one that does — too small and leaving a margin, or too large and
+   silently cropped.
+
+   Cached until the size changes, so the common path is one comparison."
+  (let ((fb (seat-fb seat)))
+    (when fb
+      (let ((bg (seat-bg seat)))
+        (if (and bg
+                 (= (glass:fb-width bg) (glass:fb-width fb))
+                 (= (glass:fb-height bg) (glass:fb-height fb)))
+            bg
+            (setf (seat-bg seat)
+                  (let ((path (seat-bg-path seat)))
+                    (and path (ignore-errors
+                               (wm-render-background seat path :mode (seat-bg-mode seat)))))))))))
+
+(defun resize-seat-screen (seat width height)
+  "Resize SEAT's screen to WIDTH x HEIGHT and repaint it.  Returns T if it changed.
+
+   This is the per-seat resize that GLASS-ON-RESIZE explicitly is not: that one resizes
+   the CLIM main top-level sheet, which in WM mode is one application's window and not
+   anybody's screen.  A seat's screen is its framebuffer, and resizing it is this.
+
+   The wallpaper needs no attention here — SEAT-WALLPAPER notices the new size and cuts
+   the picture again — which is the whole point of keeping the picture."
+  (let ((fb (seat-fb seat)))
+    (when (and fb (plusp width) (plusp height)
+               (not (and (= width (glass:fb-width fb)) (= height (glass:fb-height fb)))))
+      (glass:fb-resize fb width height +wm-teal+)
+      (setf (seat-screen-w seat) width (seat-screen-h seat) height)
+      ;; Whole-screen: COMPOSITE-SEAT's own docstring lists resize among the cases that
+      ;; are not a believable partial update.
+      (composite-seat seat)
+      t)))
+
 (defun wm-set-background (port path &key (mode :cover) seat)
   "Set the desktop background to the image at PATH (NIL clears it -> flat teal).  With
    no SEAT this is the session's taste and every seat gets it, each rasterised AT ITS OWN
    SCREEN SIZE — the same picture, not the same pixels, which is the whole reason the
    wallpaper is a per-seat slot.  With a SEAT, only that seat's changes."
+  ;; The session's taste, so a seat added later inherits the picture rather than the
+  ;; absence of one.
+  (unless seat
+    (setf (glass-port-bg-path port) path (glass-port-bg-mode port) mode))
   (dolist (s (if seat (list (port-seat port seat)) (glass-port-seats port)))
-    (setf (seat-bg s) (and path (ignore-errors (wm-render-background s path :mode mode)))))
+    ;; ...and on the seat, WHAT it was rendered from -- that is what makes the pixels
+    ;; reproducible at another size instead of being the only copy of the picture.
+    (setf (seat-bg-path s) path
+          (seat-bg-mode s) mode
+          (seat-bg s) (and path (ignore-errors (wm-render-background s path :mode mode)))))
   (when (glass-port-fb port)
     (if seat (composite-seat (port-seat port seat)) (composite-all port)))
   (seat-bg (port-seat port seat)))
@@ -803,9 +853,10 @@
    composite that is not a believable scroll does."
   (let ((seat (port-seat port seat)))
     (unless (and *wm-skip-covered-background* (wm-covered-p port box seat))
-      (if (seat-bg seat)
-          (blit-fb (seat-bg seat) 0 0 fb)                       ; desktop wallpaper
-          (glass:fb-fill fb +wm-teal+)))
+      (let ((bg (seat-wallpaper seat)))                       ; cut for THIS screen size
+        (if bg
+            (blit-fb bg 0 0 fb)                                 ; desktop wallpaper
+            (glass:fb-fill fb +wm-teal+))))
     (dolist (w (reverse (wm-stacking-order port seat)))         ; every window, bottom-to-top
       (if (wm-surface-p w)
           (handler-case (wm-draw-surface w fb port seat)        ; isolate each surface's draw
@@ -2259,9 +2310,16 @@
   (let ((seat (add-seat port :name (or name (format nil "seat-~d" port-num))
                              :port-num port-num :width width :height height
                              :fb (glass:make-framebuffer width height +wm-teal+))))
-    (when background
-      (setf (seat-bg seat)
-            (ignore-errors (wm-render-background seat background :mode background-mode))))
+    ;; A seat added to a session that already has a wallpaper gets that wallpaper, cut
+    ;; for ITS screen: the picture is the session's taste and this is another pair of
+    ;; eyes on it.  Recording the source (not just the pixels) is what lets this seat
+    ;; re-cut it if its screen is later resized.
+    (let ((path (or background (glass-port-bg-path port)))
+          (mode (if background background-mode (glass-port-bg-mode port))))
+      (when path
+        (setf (seat-bg-path seat) path
+              (seat-bg-mode seat) mode
+              (seat-bg seat) (ignore-errors (wm-render-background seat path :mode mode)))))
     ;; the transport first: it is what fills SEAT-INJECTOR, which is the keyboard this
     ;; seat's dictation types on
     (when serve (open-seat-transport seat :port-num port-num

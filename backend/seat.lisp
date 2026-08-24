@@ -256,6 +256,11 @@
    ;; seat and a desktop seat looking at the same session want the same image and not
    ;; the same pixels.  The PATH is the session's taste; these are one seat's pixels.
    (bg       :initform nil :accessor seat-bg)
+    ;; ...and WHAT THEY WERE RASTERISED FROM, so they can be rasterised again when this
+    ;; seat's screen changes size.  Without these the pixels above are the only record of
+    ;; the picture, and a resized screen keeps a wallpaper cut for the size it used to be.
+    (bg-path  :initform nil :accessor seat-bg-path)
+    (bg-mode  :initform :cover :accessor seat-bg-mode)
    ;; --- the hands ---
    (mods     :initform 0   :accessor seat-mods)        ; CLIM modifier state
    (buttons  :initform 0   :accessor seat-buttons)     ; RFB button mask

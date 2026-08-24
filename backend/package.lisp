@@ -15,7 +15,7 @@
            ;; a seat is what you connect to; a transport is what carries it
            #:add-wm-seat #:port-seat #:seat-name #:seat-identity #:seat-npub
            ;; a viewer in THIS image: the seat's pixels and hands, with no wire
-           #:attach-seat-local
+           #:attach-seat-local #:resize-seat-screen #:seat-wallpaper
            #:open-seat-transport #:close-seat-transport #:close-seat-transports
            #:seat-serving-p #:seat-transports #:transport-open-p
            #:transport-kind #:transport-address #:transport-port-num

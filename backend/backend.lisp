@@ -47,6 +47,13 @@
    (clock    :initform 0   :accessor glass-port-clock)        ; monotonic timestamps
    ;; --- window-manager mode (OPEN LOOK) ---
    (wm-p     :initform nil :accessor glass-port-wm-p)         ; decorate + manage windows?
+   ;; THE SESSION'S TASTE IN WALLPAPER: the picture, not any seat's pixels of it.
+   ;; SEAT-BG holds a rasterisation at ONE seat's screen size -- that is why the two are
+   ;; separate, and why this has to exist at all.  Without it the picture is consumed at
+   ;; set time and discarded, so a seat whose screen CHANGES SIZE is left holding a
+   ;; wallpaper rendered for a size it no longer is, with nothing to re-render from.
+   (bg-path  :initform nil :accessor glass-port-bg-path)
+   (bg-mode  :initform :cover :accessor glass-port-bg-mode)
    ;; Next window placement offset.  SESSION-wide, not per-seat, because what it places
    ;; is a window's DEFAULT position — the one a seat sees until it moves the window
    ;; itself — and there is only one default to place.
@@ -629,7 +636,13 @@
     (values (seat-fb seat)
             on-key
             (lambda (b x y) (glass-on-pointer port b x y seat))
-            (lambda (w h) (glass-on-resize port w h seat))
+            ;; A LOCAL VIEWER IS THIS SEAT'S SCREEN, so "resize" means resize the seat --
+            ;; not GLASS-ON-RESIZE, which is the SetDesktopSize path and resizes the CLIM
+            ;; main top-level sheet (one application's window, and nothing at all when no
+            ;; application is open).  A transport hands its clients the other one because
+            ;; an RFB client asking for a size is asking on behalf of a window; a viewer
+            ;; in this image holding the whole screen is not.
+            (lambda (w h) (resize-seat-screen seat w h))
             (seat-wake seat))))
 
 (defun serve-seat-vnc (seat &key (port-num (seat-port-num seat))
