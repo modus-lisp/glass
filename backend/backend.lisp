@@ -604,6 +604,34 @@
            (ignore-errors (sb-bsd-sockets:socket-close sock)))))
       fallback))
 
+(defun attach-seat-local (seat)
+  "Everything a viewer IN THIS IMAGE needs to show SEAT and put hands on it, with no wire
+   between them.  Returns (values FB ON-KEY ON-POINTER ON-RESIZE WAKE) — the same five
+   things OPEN-SEAT-TRANSPORT closes over before it hands them to GLASS:SERVE, and the
+   whole of what a seat is to a viewer.
+
+   The point is what is NOT here.  A viewer in this image already has the pixels: the
+   framebuffer is an object, not a stream of rectangles, and asking a socket to hand it
+   back means encoding a screen the caller is holding, writing it to the kernel, reading
+   it out again and decoding it — a process talking to itself in a protocol designed for
+   a network it does not have to cross.  On the hardware this is eventually for there is
+   no socket to have; `glass/fb' IS the screen, and this is what that looks like from
+   here.
+
+   IT FILLS SEAT-INJECTOR, exactly as opening a transport does.  A seat made with
+   :SERVE NIL has none, and the injector is the keyboard this seat's dictation types on
+   — so a locally-attached seat that skipped it would be a desktop you can type into by
+   hand and not by voice, which is a difference nobody would think to look for."
+  (let* ((port (seat-port seat))
+         (on-key (or (seat-injector seat)
+                     (setf (seat-injector seat)
+                           (lambda (down k) (glass-on-key port down k seat))))))
+    (values (seat-fb seat)
+            on-key
+            (lambda (b x y) (glass-on-pointer port b x y seat))
+            (lambda (w h) (glass-on-resize port w h seat))
+            (seat-wake seat))))
+
 (defun serve-seat-vnc (seat &key (port-num (seat-port-num seat))
                                  (address *seat-vnc-address*)
                                  (password :generate))
