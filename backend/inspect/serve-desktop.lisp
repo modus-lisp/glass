@@ -37,7 +37,13 @@
 (defparameter *audio-port* (+ 5910 *display*))
 (defparameter *control-port* (+ 4008 *display*))
 
-(setf glass:*desktop-name* (format nil "modus-lisp :: glass desktop :~d" *display*))
+;; ONLY IF NOBODY HAS NAMED IT.  A launcher that gave this session an identity also
+;; gave it a name (kiln does: three words read off its own pubkey), and this file
+;; loading afterwards must not paint over it with a description.  "glass" is the
+;; placeholder GLASS:*DESKTOP-NAME* starts as, so anything else was somebody's choice.
+(when (or (null glass:*desktop-name*)
+          (string= glass:*desktop-name* "glass"))
+  (setf glass:*desktop-name* (format nil "modus-lisp :: glass desktop :~d" *display*)))
 
 ;;; Windows opened at startup.  Empty by default: the desktop comes up as a bare
 ;;; workspace, and every app — terminal included — is one right-click away on the
