@@ -19,6 +19,8 @@
    ;; text (the :glass/text system; scribe-backed)
    #:fb-text #:text-width #:load-font #:default-font
    ;; server: (serve fb port &key on-key on-pointer on-resize name once wake)
+   ;; naming things people say out loud (wordlist.lisp)
+   #:word-name #:*wordlist*
    #:serve #:serve-one #:*desktop-name* #:tcp-listen #:close-listener #:make-wake #:wake-signal
    ;; transports (src/socket.lisp) — a port anybody on the box can reach, or a socket file
    ;; only its owner can open.  Siblings: everything above them is a stream protocol.

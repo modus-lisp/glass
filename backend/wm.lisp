@@ -847,6 +847,30 @@
     (unless (wm-composite-scroll port fb box seat)
       (wm-composite-whole port fb box seat))))
 
+(defparameter *wm-session-label-p* t
+  "Whether the desktop writes its own name in the corner.  On, because the moment there
+   is more than one of these the screen itself is the only thing that says which one you
+   are looking at — a VNC window and an SDL window look identical.")
+
+(defun wm-draw-session-name (fb)
+  "Write GLASS:*DESKTOP-NAME* small in FB's lower-left.
+
+   A shadow under it because a wallpaper can be any colour: one dark pixel offset costs
+   nothing and keeps the name legible on a light picture, where plain grey text would
+   disappear exactly when somebody is trying to read it."
+  (when (and *wm-session-label-p*
+             (stringp glass:*desktop-name*)
+             (plusp (length glass:*desktop-name*)))
+    (ignore-errors
+     (let* ((size 12)
+            (x 16)
+            (y (- (glass:fb-height fb) 26)))
+       (when (plusp y)
+         (glass:fb-text fb (1+ x) (1+ y) glass:*desktop-name*
+                        :size size :color (glass:rgb 0 0 0))
+         (glass:fb-text fb x y glass:*desktop-name*
+                        :size size :color (glass:rgb 210 210 210)))))))
+
 (defun wm-composite-whole (port fb box &optional seat)
   "Rebuild region BOX (NIL = the whole screen) from the bottom up: desktop, McCLIM
    windows, surface windows, drag wireframe, menus.  Always correct, and what every
@@ -856,7 +880,13 @@
       (let ((bg (seat-wallpaper seat)))                       ; cut for THIS screen size
         (if bg
             (blit-fb bg 0 0 fb)                                 ; desktop wallpaper
-            (glass:fb-fill fb +wm-teal+))))
+            (glass:fb-fill fb +wm-teal+)))
+      ;; ...and whose desktop this is, in the corner.  Part of the BACKGROUND layer on
+      ;; purpose: it is then clipped, damaged and repainted exactly like the pixels
+      ;; behind it, and it follows a resize without being told.  Drawn whether or not
+      ;; there is a wallpaper — the question "which desktop am I looking at" does not
+      ;; depend on somebody having set a picture.
+      (wm-draw-session-name fb))
     (dolist (w (reverse (wm-stacking-order port seat)))         ; every window, bottom-to-top
       (if (wm-surface-p w)
           (handler-case (wm-draw-surface w fb port seat)        ; isolate each surface's draw

@@ -13,7 +13,17 @@
 
 (in-package #:glass)
 
-(defvar *desktop-name* "glass")
+(defvar *desktop-name* "glass"
+  "THE SESSION'S NAME — not a seat's, and not the box's.  Several seats can be watching
+   one session; what they are watching is this, and it is what an RFB client puts in its
+   title bar.
+
+   \"glass\" is a placeholder and launchers are expected to replace it, typically with
+   GLASS:WORD-NAME — a few BIP-39 words, which can be read off a screen, repeated down a
+   phone and typed without spelling.  DELIBERATELY NOT (WORD-NAME) as the initform: a
+   DEFVAR runs at load time, and in a saved core that is image-BUILD time, so every
+   container started from it would come up with the same name baked in.  A name is
+   something a session picks when it starts.")
 (defparameter *tile* 32 "Dirty-tracking granularity (pixels).")
 
 (defun string->bytes (s)
