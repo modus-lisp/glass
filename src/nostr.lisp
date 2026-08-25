@@ -2269,6 +2269,47 @@ still a desktop, and a desktop that did not start is not."
     (when (eq bot *session-nostr-bot*) (setf *session-nostr-bot* nil)))
   t)
 
+(defun send-login-link (target &key (ttl *login-ttl*) (bot *session-nostr-bot*))
+  "Mint a login link for TARGET and gift-wrap it to them, UNPROMPTED.  Returns the URL,
+   or NIL with a reason on *ERROR-OUTPUT*.
+
+   The `link' command answers somebody who asked; this is the other direction — a box
+   that has just started saying `here is the way in' to the identity it was started for.
+   Same token, same wrap, same relays: it is the reply path with nobody to reply to.
+
+   TARGET is hex, an npub, or a NIP-05 name — the last resolved HERE and once, where a
+   failure is visible, rather than at every boot in an IGNORE-ERRORS."
+  (let ((pubkey (normalize-pubkey target)))
+    (cond
+      ((null pubkey)
+       (format *error-output* "~&@@ link: cannot resolve ~a to a pubkey~%" target) nil)
+      ((null bot)
+       (format *error-output* "~&@@ link: no nostr bot is running — nothing to send with~%") nil)
+      ((null *login-url-base*)
+       (format *error-output* "~&@@ link: no published client to link to (LOGIN_URL_BASE unset)~%") nil)
+      (t
+       (multiple-value-bind (token killed) (mint-login-token :ttl ttl :for pubkey)
+         (cond
+           ((null token)
+            (format *error-output* "~&@@ link: this session has no identity and cannot mint one~%") nil)
+           (t
+            (let ((url (format nil "~a#box=~a&code=~a" *login-url-base* (or (box-npub) "") token)))
+              (handler-case
+                  (progn
+                    (cl-nostr.pool:pool-publish
+                     (nostr-bot-pool bot)
+                     (cl-nostr.nip59:build-giftwrap
+                      (nostr-bot-keypair bot) pubkey
+                      (format nil "Your glass desktop is up (expires in ~a min):~%~%~a~@[~%~%~a~]"
+                              (max 1 (round ttl 60)) url
+                              (and (integerp killed) (plusp killed)
+                                   "This replaces any earlier link I sent you."))))
+                    (format *error-output* "~&@@ link: DM'd to ~a…~%" (subseq pubkey 0 8))
+                    (finish-output *error-output*)
+                    url)
+                (serious-condition (e)
+                  (format *error-output* "~&@@ link: could not send: ~a~%" e) nil))))))))))
+
 (defun nostr-bot-report (&optional (bot *session-nostr-bot*))
   (if (null bot)
       "nostr bot: not running"
@@ -2304,6 +2345,14 @@ with no identity rather than serving as nobody.  Returns (values SERVICE BOT)."
                   (length *nostr-allow*))
           (when b (format *error-output* "@@ nostr dm bot on ~{~a~^, ~}~%" (nostr-bot-relays b)))
           (finish-output *error-output*)
+          ;; ...and if this session was started FOR somebody, tell them it is up.
+          ;; GLASS_LINK_TO is that somebody: a box asked to serve one identity should not
+          ;; also require a human to run a script before that identity can get in.  Here
+          ;; rather than in a launcher because this is where the bot exists — the thing
+          ;; that can actually send it.
+          (let ((who (sb-ext:posix-getenv "GLASS_LINK_TO")))
+            (when (and b who (plusp (length who)))
+              (ignore-errors (send-login-link who :bot b))))
           (values srv b)))
     (serious-condition (e)
       (ignore-errors
