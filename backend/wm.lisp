@@ -847,29 +847,47 @@
     (unless (wm-composite-scroll port fb box seat)
       (wm-composite-whole port fb box seat))))
 
+(defparameter *wm-session-label-size* 34
+  "Point size of the desktop's own name.  Large enough to read without looking for it.")
+
+(defparameter *wm-session-label-alpha* 0.38d0
+  "How present that name is.  Faint on purpose: a desktop should say which one it is
+   without competing with anything actually on it.")
+
 (defparameter *wm-session-label-p* t
   "Whether the desktop writes its own name in the corner.  On, because the moment there
    is more than one of these the screen itself is the only thing that says which one you
    are looking at — a VNC window and an SDL window look identical.")
 
 (defun wm-draw-session-name (fb)
-  "Write GLASS:*DESKTOP-NAME* small in FB's lower-left.
+  "Write GLASS:*DESKTOP-NAME* large and faint in FB's lower-left.
+
+   BIG AND TRANSLUCENT rather than small and solid.  It is a label on a screen, not a
+   caption: at a glance it should answer `which desktop is this' from across a room,
+   and it must not read as something to click.  Faint gets both — the eye finds it when
+   it is looking and slides off it when it is not — where small-and-solid was hard to
+   read AND looked like content.
 
    A shadow under it because a wallpaper can be any colour: one dark pixel offset costs
-   nothing and keeps the name legible on a light picture, where plain grey text would
-   disappear exactly when somebody is trying to read it."
+   nothing and keeps it legible on a light picture, where faint grey would disappear
+   exactly when somebody is trying to read it.  The shadow is fainter still, or it
+   becomes an outline."
   (when (and *wm-session-label-p*
              (stringp glass:*desktop-name*)
              (plusp (length glass:*desktop-name*)))
     (ignore-errors
-     (let* ((size 12)
-            (x 16)
-            (y (- (glass:fb-height fb) 26)))
+     (let* ((size *wm-session-label-size*)
+            (x (round size 2))
+            ;; Bottom-left, clear of the edge by half a line, and it follows the
+            ;; framebuffer's height so a resized screen keeps it in the corner.
+            (y (- (glass:fb-height fb) size (round size 2))))
        (when (plusp y)
-         (glass:fb-text fb (1+ x) (1+ y) glass:*desktop-name*
-                        :size size :color (glass:rgb 0 0 0))
+         (glass:fb-text fb (+ x 2) (+ y 2) glass:*desktop-name*
+                        :size size :color (glass:rgb 0 0 0)
+                        :alpha (* *wm-session-label-alpha* 0.6d0))
          (glass:fb-text fb x y glass:*desktop-name*
-                        :size size :color (glass:rgb 210 210 210)))))))
+                        :size size :color (glass:rgb 255 255 255)
+                        :alpha *wm-session-label-alpha*))))))
 
 (defun wm-composite-whole (port fb box &optional seat)
   "Rebuild region BOX (NIL = the whole screen) from the bottom up: desktop, McCLIM

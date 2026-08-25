@@ -50,9 +50,15 @@
   "Composite an 8-bit sRGB FG channel over DST at coverage A (ia = 1-A), linear."
   (scribe:linear->srgb (+ (* ia (scribe:srgb->linear dst8)) (* a (scribe:srgb->linear fg8)))))
 
-(defun fb-text (fb x y string &key (size 13) (color +black+) (font (default-font)))
+(defun fb-text (fb x y string &key (size 13) (color +black+) (font (default-font))
+                                   (alpha 1d0))
   "Draw STRING onto FB with its top-left near (X,Y), at SIZE px, in COLOR
-   (0xRRGGBB), anti-aliased + gamma-correct.  Returns the ending pen x."
+   (0xRRGGBB), anti-aliased + gamma-correct.  Returns the ending pen x.
+
+   ALPHA (0..1) scales the whole run's opacity.  It costs nothing to have: the glyph
+   coverage is already an alpha and already blended per pixel, so this multiplies the
+   number that was there rather than adding a compositing path.  1.0 is what every
+   caller had before and is bit-identical to it."
   (let* ((upem (scribe:font-units-per-em font))
          (baseline (+ y (round (* (scribe:font-ascent font) size) upem)))
          (fr (ldb (byte 8 16) color)) (fg (ldb (byte 8 8) color)) (fbb (ldb (byte 8 0) color))
@@ -73,7 +79,7 @@
                         (let ((c (aref cov (+ (* gy w) gx))) (fx (+ ox gx)))
                           (when (and (> c 0d0) (< -1 fx fw))
                             (let* ((idx (+ frow fx)) (dst (aref px idx))
-                                   (a (min 1d0 c)) (ia (- 1d0 a)))
+                                   (a (min 1d0 (* alpha c))) (ia (- 1d0 a)))
                               (setf (aref px idx)
                                     (logior (ash (%over (ldb (byte 8 16) dst) fr a ia) 16)
                                             (ash (%over (ldb (byte 8 8) dst) fg a ia) 8)
