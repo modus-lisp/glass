@@ -966,6 +966,19 @@ its bytes would land in the middle of a rect."
                             (rc-cursor client) (and (member +pseudo-cursor+ encs) t)
                             (rc-copyrect client) (and (member +enc-copyrect+ encs) t)
                             (rc-trle client) (and (member +enc-trle+ encs) t)))
+                    ;; ANNOUNCE WITHOUT BEING ASKED.  The size rect rides a
+                    ;; FramebufferUpdate, which the sender only builds when a request is
+                    ;; parked — so a client that never requests pixels never learns it may
+                    ;; ask for a size.  That is not hypothetical: the video-primary gateway
+                    ;; deliberately swallows FramebufferUpdateRequests (the screen arrives
+                    ;; as VP8 instead), so it swallows the very message that would have
+                    ;; triggered this.  Park one ourselves; SEND-UPDATE answers it with the
+                    ;; announcement and nothing else.
+                    (when (rc-eds client)
+                      (sb-thread:with-mutex ((rc-lock client))
+                        (unless (rc-want client)
+                          (setf (rc-want client)
+                                (list 1 0 0 (fb-width fb) (fb-height fb))))))
                     (format *trace-output* "~&glass: client encodings — chosen=~a TRLE=~:[no~;YES~] CopyRect=~:[no~;YES~] (~d offered)~%"
                             (rc-enc client) (rc-trle client) (rc-copyrect client) n)
                     (force-output *trace-output*)))
