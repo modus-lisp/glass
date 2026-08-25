@@ -463,7 +463,19 @@
                                   :on-key     on-key
                                   :install-injector (seat-primary-p seat)
                                   :on-pointer (lambda (b x y) (glass-on-pointer port b x y seat))
-                                  :on-resize  (lambda (w h) (glass-on-resize port w h seat))
+                                  ;; A CLIENT ASKING FOR A SIZE (SetDesktopSize) is asking about the
+                                  ;; screen it is looking at, which in WM mode is THIS SEAT'S — so the
+                                  ;; browser window that asked becomes the desktop's size, instead of a
+                                  ;; letterbox around somebody else's.
+                                  ;;
+                                  ;; Not in WM mode there is no desktop, only an application filling the
+                                  ;; framebuffer, and the thing to resize is its sheet.  GLASS-ON-RESIZE
+                                  ;; is still right for that, and its docstring has been describing this
+                                  ;; split since before there was anything to resize.
+                                  :on-resize  (lambda (w h)
+                                                (if (glass-port-wm-p port)
+                                                    (resize-seat-screen seat w h)
+                                                    (glass-on-resize port w h seat)))
                                   :wake       (seat-wake seat)
                                   ;; Nobody is watching this screen any more: this seat has
                                   ;; no hands, so it must not go on holding the McCLIM token

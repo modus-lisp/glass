@@ -141,6 +141,44 @@
                         (fb-size (clim-glass:seat-wallpaper *seat*)))))
         (error (e) (skip "second seat" (princ-to-string e))))))
 
+(head "and a CLIENT can ask for it, which is the path a browser uses")
+;; noVNC sends SetDesktopSize when its container resizes; glass turns that into a resize
+;; of the seat the client is looking at.  This is the whole chain minus the browser: a
+;; real transport, a real handshake, a real message 251.
+(let ((sock (format nil "/tmp/seat-resize-gate-~d.rfb" (sb-posix:getpid))))
+  (handler-case
+      (progn
+        (clim-glass:open-seat-transport *seat* :kind :rfb-unix :path sock)
+        (sleep 1)
+        (let ((s (nth-value 1 (glass:open-connection :host (format nil "unix:~a" sock))))
+              (nl (code-char 10)))
+          (flet ((rd (n) (let ((b (make-array n :element-type '(unsigned-byte 8))))
+                           (read-sequence b s) b))
+                 (wr (v) (write-sequence (coerce v '(vector (unsigned-byte 8))) s)
+                   (finish-output s)))
+            (rd 12)
+            (wr (map 'list #'char-code (format nil "RFB 003.008~c" nl)))
+            (let ((n (aref (rd 1) 0))) (rd n) (wr (list 1)) (rd 4))
+            (wr (list 1))
+            (rd 4) (rd 16)
+            (let ((l (rd 4)))
+              (rd (+ (* 16777216 (aref l 0)) (* 65536 (aref l 1)) (* 256 (aref l 2)) (aref l 3))))
+            ;; SetEncodings advertising the desktop-size pseudo-encodings
+            (wr (list 2 0 0 1 255 255 255 33))
+            (let ((w 1024) (h 640))
+              (wr (append (list 251 0 (ldb (byte 8 8) w) (ldb (byte 8 0) w)
+                                (ldb (byte 8 8) h) (ldb (byte 8 0) h) 1 0)
+                          (list 0 0 0 1 0 0 0 0
+                                (ldb (byte 8 8) w) (ldb (byte 8 0) w)
+                                (ldb (byte 8 8) h) (ldb (byte 8 0) h) 0 0 0 0))))
+            (sleep 1.5)
+            (ok "SetDesktopSize from a client resizes THIS SEAT"
+                (equal (fb-size (clim-glass:attach-seat-local *seat*)) '(1024 640))
+                (format nil "~a" (fb-size (clim-glass:attach-seat-local *seat*))))
+            (ignore-errors (close s)))))
+    (error (e) (skip "client-driven resize" (princ-to-string e))))
+  (ignore-errors (delete-file sock)))
+
 (format t "~%~d passed, ~d failed, ~d skipped~%~%=> ~:[FAIL~;PASS~]~%"
         *pass* *fail* *skip* (zerop *fail*))
 (finish-output)
