@@ -163,8 +163,17 @@
             (rd 4) (rd 16)
             (let ((l (rd 4)))
               (rd (+ (* 16777216 (aref l 0)) (* 65536 (aref l 1)) (* 256 (aref l 2)) (aref l 3))))
-            ;; SetEncodings advertising the desktop-size pseudo-encodings
-            (wr (list 2 0 0 1 255 255 255 33))
+            ;; SetEncodings advertising ExtendedDesktopSize (-308), as noVNC does
+            (wr (list 2 0 0 1 #xFF #xFF #xFE #xCC))
+            ;; ...and the server must ANSWER with one, unprompted, or noVNC never enables
+            ;; its resize path and never sends the message this gate is about to send.
+            (wr (list 3 0 0 0 0 0 4 0 2 88))          ; FramebufferUpdateRequest
+            (let* ((hdr (rd 4)) (r (rd 12))
+                   (enc (+ (* 16777216 (aref r 8)) (* 65536 (aref r 9))
+                           (* 256 (aref r 10)) (aref r 11))))
+              (declare (ignore hdr))
+              (ok "the server offers ExtendedDesktopSize before being asked"
+                  (= enc #xFFFFFECC) (format nil "#x~8,'0X" enc)))
             (let ((w 1024) (h 640))
               (wr (append (list 251 0 (ldb (byte 8 8) w) (ldb (byte 8 0) w)
                                 (ldb (byte 8 8) h) (ldb (byte 8 0) h) 1 0)

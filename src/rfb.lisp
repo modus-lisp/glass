@@ -560,6 +560,31 @@
   (w-u16 s 0) (w-u16 s 0) (w-u16 s w) (w-u16 s h) (w-u32 s +pseudo-desktop-size+)
   (force-output s))
 
+(defun send-extended-desktop-size (s w h &key (reason 0) (result 0))
+  "The same news as SEND-DESKTOP-SIZE, in the form that also grants PERMISSION to ask.
+
+   A client only sends SetDesktopSize once it has SEEN an ExtendedDesktopSize rect —
+   noVNC gates its whole resize path on having received one.  So a server that supports
+   resizing and never sends this is a server nobody ever asks: the client scales a
+   picture of the wrong-shaped desktop instead, which is exactly what a phone looking at
+   a 1280x800 seat used to get.
+
+   REASON 0 is `the server did this', 1 is `because you asked'.  RESULT 0 is success —
+   the pair is how a refusal is reported, and refusing is a thing a caller may want to
+   do (a seat with a fixed physical screen, say), so both are parameters rather than
+   constants.
+
+   One screen, id 1, at the origin: glass's framebuffer is the whole screen, and a
+   multi-monitor layout is a different feature rather than a detail of this one."
+  (w-u8 s 0) (w-u8 s 0) (w-u16 s 1)
+  (w-u16 s reason) (w-u16 s result) (w-u16 s w) (w-u16 s h)
+  (w-u32 s +pseudo-extended-desktop-size+)
+  (w-u8 s 1) (w-u8 s 0) (w-u8 s 0) (w-u8 s 0)          ; one screen, 3 bytes padding
+  (w-u32 s 1)                                          ; screen id
+  (w-u16 s 0) (w-u16 s 0) (w-u16 s w) (w-u16 s h)      ; x, y, w, h
+  (w-u32 s 0)                                          ; flags
+  (force-output s))
+
 (defun snap-matches-p (snap fb)
   (= (length snap) (* (fb-width fb) (fb-height fb))))
 
@@ -684,6 +709,8 @@ its bytes would land in the middle of a rect."
 ;;; (polling ~60 Hz).  ONLY the sender writes pixels to the socket.
 (defstruct (rfb-client (:conc-name rc-))
   (enc +enc-raw+) dss cursor cursor-sent copyrect trle
+  eds                           ; client offered ExtendedDesktopSize (-308) specifically
+  eds-announced                 ; ...and we have sent it one, which is what unlocks resizing
   (fmt nil)                     ; client pixel format (a PXFMT), or NIL = our native 32bpp
   (snap-box (list nil)) (zs (cram:make-zstream))
   last-size                     ; (cons w h) — fb size last announced to this client
@@ -705,9 +732,18 @@ its bytes would land in the middle of a rect."
     (let ((ls (rc-last-size client)))                                ; resize takes priority
       (when (rc-dss client)
         (with-fb-locked (fb)
-          (when (or (/= (fb-width fb) (car ls)) (/= (fb-height fb) (cdr ls)))
-            (send-desktop-size s (fb-width fb) (fb-height fb))
-            (setf (car ls) (fb-width fb) (cdr ls) (fb-height fb) (car (rc-snap-box client)) nil)
+          ;; ANNOUNCE ONCE even when the size has not changed.  LAST-SIZE starts at the
+          ;; current size, so a client that connects and never sees a resize would never
+          ;; be sent one of these — and for an ExtendedDesktopSize client that is the
+          ;; difference between being able to ask for a size and not.
+          (when (or (and (rc-eds client) (not (rc-eds-announced client)))
+                    (/= (fb-width fb) (car ls)) (/= (fb-height fb) (cdr ls)))
+            (if (rc-eds client)
+                (send-extended-desktop-size s (fb-width fb) (fb-height fb))
+                (send-desktop-size s (fb-width fb) (fb-height fb)))
+            (setf (car ls) (fb-width fb) (cdr ls) (fb-height fb)
+                  (rc-eds-announced client) t
+                  (car (rc-snap-box client)) nil)
             (return-from send-update t)))))
     (let ((snap-box (rc-snap-box client)) (enc (rc-enc client)) (zs (rc-zs client))
           (trle (rc-trle client)) (fmt (rc-fmt client))
@@ -926,6 +962,7 @@ its bytes would land in the middle of a rect."
                       (setf (rc-enc client) (choose-encoding encs)
                             (rc-dss client) (or (member +pseudo-desktop-size+ encs)
                                                 (member +pseudo-extended-desktop-size+ encs))
+                            (rc-eds client) (and (member +pseudo-extended-desktop-size+ encs) t)
                             (rc-cursor client) (and (member +pseudo-cursor+ encs) t)
                             (rc-copyrect client) (and (member +enc-copyrect+ encs) t)
                             (rc-trle client) (and (member +enc-trle+ encs) t)))
