@@ -616,6 +616,11 @@
                   (values wire screen allowed)))
               (wm-copy-tally :empty)))))))               ; clipped to nothing / a null move
 
+(defvar *wm-surface-lock-skips* 0
+  "Frames in which a surface was skipped because its framebuffer was busy.  Zero on a
+   healthy desktop; climbing means something holds a surface's lock long enough to
+   matter, which is worth knowing before it becomes a freeze.")
+
 (defun wm-draw-surface (surf fb &optional port seat)
   "Draw SURF's decorated window into SEAT's screen framebuffer FB, at the position SEAT
    holds it.  Given a PORT, also collect SURF's scroll CopyRect hint for this composite
@@ -630,7 +635,17 @@
          (sx (seat-window-x seat surf)) (sy (seat-window-y seat surf)))
     (wm-frame fb sx sy cw ch (wm-surface-deco* surf cw)
               (lambda ()
-                (glass:with-fb-locked (sfb)
+                ;; THE COMPOSITOR MUST NOT BLOCK HERE.  It already holds the SEAT's framebuffer
+                ;; lock — that is what it is drawing into — and this reaches for a SURFACE's.  A
+                ;; thread walking those two the other way round deadlocks the pair, and the one
+                ;; that loses is the thread painting the screen: the whole desktop stops, gateway
+                ;; included.  Not a hypothesis — it is what a resize with the browser open did.
+                ;;
+                ;; Declining to wait turns that into a surface one frame stale, which the next
+                ;; composite corrects.  It does not repair the lock ORDER; it removes the
+                ;; compositor from the cycle.
+                (glass:with-fb-locked-or (sfb :seconds 0.05)
+                    (progn (incf *wm-surface-lock-skips*) nil)
                   (when port
                     (when-let ((c (ignore-errors (wm-surface-screen-copy port surf fb seat))))
                       (let* ((seat (port-seat port seat))

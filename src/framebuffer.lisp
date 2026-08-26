@@ -155,6 +155,34 @@
               ;; recursive: fb-resize (which locks) may be called inside a held
               ;; with-fb-locked (e.g. a terminal re-grids under its render lock).
               `(sb-thread:with-recursive-lock ((fb-lock ,fb)) ,@body))
+
+#+sb-thread
+(defmacro with-fb-locked-or ((fb &key (seconds 0.05)) give-up &body body)
+  "BODY under FB's lock, or GIVE-UP if it cannot be had within SECONDS.
+
+   FOR A CALLER THAT MUST NOT BLOCK.  The compositor holds one framebuffer's lock while
+   it reaches for another's, and a thread that walks those two in the other order is a
+   deadlock — one that froze an entire desktop, because the thread that blocks here is
+   the one drawing the screen.
+
+   This does not fix an inversion; it makes the compositor decline to participate in
+   one.  The worst case becomes a surface that is one frame stale instead of a session
+   that never paints again, and staleness is self-correcting: the next composite tries
+   again."
+  (let ((g (gensym "FB")))
+    `(let ((,g ,fb))
+       ;; WITH-FB-LOCKED is recursive and callers rely on that, so a thread may well
+       ;; already hold this one.  GRAB-MUTEX is not recursive: asking for a mutex we own
+       ;; would block on ourselves, which is the exact failure this macro exists to
+       ;; avoid, arrived at from the other side.
+       (if (sb-thread:holding-mutex-p (fb-lock ,g))
+           (progn ,@body)
+           (if (sb-thread:grab-mutex (fb-lock ,g) :timeout ,seconds)
+               (unwind-protect (progn ,@body) (sb-thread:release-mutex (fb-lock ,g)))
+               ,give-up)))))
+
+#-sb-thread (defmacro with-fb-locked-or ((fb &key seconds) give-up &body body)
+              (declare (ignore fb seconds give-up)) `(progn ,@body))
 #-sb-thread (defmacro with-fb-locked ((fb) &body body)
               (declare (ignore fb)) `(progn ,@body))
 
