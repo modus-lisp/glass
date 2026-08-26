@@ -23,8 +23,9 @@
 ;;; where sb-thread is absent (e.g. modus, which will supply its own concurrency
 ;;; model).  Everything else in this file — and in the text primitive — is pure
 ;;; Common Lisp with no FFI, so the drawing path drops onto any CL.
-#+sb-thread (defun %fb-make-lock () (sb-thread:make-mutex :name "framebuffer"))
-#-sb-thread (defun %fb-make-lock () nil)
+#+sb-thread (defun %fb-make-lock (&optional (name "framebuffer"))
+              (sb-thread:make-mutex :name name))
+#-sb-thread (defun %fb-make-lock (&optional name) (declare (ignore name)) nil)
 
 ;; Short critical section around the (damage copy frameno) frame triple — NOT the pixel
 ;; FB-LOCK, which the sender holds for a whole (long) encode.  Guards FB-MARK-FRAME's
@@ -41,7 +42,7 @@
   ;; Guards the (width height pixels) triple against a RESIZE racing a reader.
   ;; Per-pixel content races are benign (a stale read is re-sent next update);
   ;; only the array swap needs protecting, so readers grab this only to snapshot.
-  (lock (%fb-make-lock))
+  (lock (%fb-make-lock "fb-pixels"))
   ;; Content version: a writer bumps it via FB-TOUCH so a reader (the RFB sender)
   ;; can cheaply tell "nothing changed since I last looked" and skip a full diff.
   (generation 0)
@@ -56,7 +57,11 @@
   (damage nil)                          ; accumulated (x0 y0 x1 y1), or :FULL, since last take
   (copy nil)                            ; composed move: (src-x src-y dst-x dst-y w h) -> CopyRect
   (mark-time 0 :type fixnum)            ; when the oldest unsent change was marked (backlog clock)
-  (frame-lock (%fb-make-lock)))         ; guards the (damage copy frameno) triple
+  ;; NAMED APART, because a deadlock report is only as useful as the names in it.  Every
+  ;; framebuffer has TWO of these and both used to be called "framebuffer", so a cycle
+  ;; between them read as "framebuffer waited for framebuffer" — true, unhelpful, and
+  ;; ambiguous about whether the two were different framebuffers or the two locks of one.
+  (frame-lock (%fb-make-lock "fb-frame")))   ; guards the (damage copy frameno) triple
 
 (defun fb-touch (fb)
   "Mark FB's contents as changed (bumps its generation).  Writers call this after
