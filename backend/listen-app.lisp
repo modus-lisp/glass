@@ -137,6 +137,23 @@ being written by the ticker.  So it says where to click."
        (setf (clim:gadget-value gadget :invoke-callback nil) nil
              (app-note frame) "Nothing to type into — no viewer is attached to this session."))
       (t
+       ;; GIVE THE KEYBOARD BACK BEFORE THE WORDS START.  Turning dictation on means clicking a
+       ;; button in this window, which focuses this window — so without this the words go into
+       ;; the box that started them, and dictating anywhere else means knowing you have to click
+       ;; the other window first.  Listen is a control, not a target.
+       ;;
+       ;; By name and best-effort: the backend is not this file's dependency, and a session with
+       ;; nothing to go back to should still start dictating rather than refuse.  The keyboard
+       ;; then stays here, which is the old behaviour and is what a desktop with one window
+       ;; open means anyway.
+       (let ((back (and (find-package "CLIM-GLASS")
+                        (find-symbol "SEAT-FOCUS-BACK" "CLIM-GLASS")))
+             (port (and (find-package "CLIM-GLASS")
+                        (find-symbol "FIND-GLASS-PORT" "CLIM-GLASS")))
+             (pseat (and (find-package "CLIM-GLASS")
+                         (find-symbol "PORT-SEAT" "CLIM-GLASS"))))
+         (when (and back port pseat (fboundp back) (fboundp port) (fboundp pseat))
+           (ignore-errors (funcall back (funcall pseat (funcall port))))))
        (glass:start-listening)
        (glass:start-dictation)
        (setf (app-note frame)

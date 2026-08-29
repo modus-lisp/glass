@@ -663,6 +663,36 @@ cannot drift apart."
            (ignore-errors (sb-bsd-sockets:socket-close sock)))))
       fallback))
 
+(defun seat-focus (seat surf)
+  "Give SEAT's keyboard to SURF (or to McCLIM when NIL), remembering what had it.
+
+   Every focus change goes through here so that SEAT-PREV-FOCUS means one thing.  Focusing
+   what is already focused is not a change and does not shift the history — otherwise clicking
+   twice in the same window would make that window its own predecessor, and giving the
+   keyboard back would give it to where it already is."
+  (let ((old (seat-focus-surface seat)))
+    (unless (eq old surf)
+      (setf (seat-prev-focus seat) old
+            (seat-focus-surface seat) surf)))
+  surf)
+
+(defun seat-focus-back (seat)
+  "Give the keyboard back to whatever had it before the current window took it.
+
+   For a CONTROL that is not a target: pressing a button in a window necessarily focuses that
+   window, and dictation started from Listen would otherwise type into Listen.  Returns what it
+   focused, or NIL when there is nothing to go back to — which is honest rather than a failure,
+   and leaves the keyboard where it is."
+  (let ((prev (seat-prev-focus seat)))
+    ;; A window that has since closed is not somewhere to send keys.  Asked as "is it still one
+    ;; of the port's surfaces", because that is the WM's own answer: a closed surface keeps its
+    ;; framebuffer object and every slot it had, so anything read off the surface itself still
+    ;; looks alive.  Only the list it was removed from knows.
+    (when (and prev (or (not (wm-surface-p prev))
+                        (member prev (glass-port-surfaces (seat-port seat)))))
+      (seat-focus seat prev)
+      prev)))
+
 (defun attach-seat-local (seat)
   "Everything a viewer IN THIS IMAGE needs to show SEAT and put hands on it, with no wire
    between them.  Returns (values FB ON-KEY ON-POINTER ON-RESIZE WAKE) — the same five

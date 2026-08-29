@@ -288,6 +288,17 @@
    (px       :initform 0   :accessor seat-px)          ; pointer position
    (py       :initform 0   :accessor seat-py)
    (focus-surface :initform nil :accessor seat-focus-surface)  ; surface holding THIS keyboard
+   ;; WHAT HAD THE KEYBOARD BEFORE, for the one caller that needs to give it back.
+   ;;
+   ;; Dictation is that caller and the reason this exists.  Turning it on means clicking a
+   ;; button in the Listen window, which focuses the Listen window — so the words went into the
+   ;; box that started them, every time, and the way to dictate anywhere else was to know that
+   ;; you had to go and click the other window first.  A control surface is not a target: it
+   ;; should hand the keyboard back to whatever you were working in.
+   ;;
+   ;; A single step of history and not a stack, because that is the whole of what "give it
+   ;; back" needs and a stack would raise a question nobody has an answer for — how far back.
+   (prev-focus :initform nil :accessor seat-prev-focus)
    (grab-sheet    :initform nil :accessor seat-grab-sheet)     ; McCLIM sheet grabbing the pointer
    ;; What THIS person last copied.  Per-seat, not per-transport and not per-session: all of
    ;; one seat's transports (a VNC viewer and a WebRTC channel onto the same screen) share

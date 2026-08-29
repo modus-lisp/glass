@@ -1889,18 +1889,18 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
              ((eq region :winmenu)                           ; title-bar wedge: the Window Menu
               (when down
                 (wm-raise port obj seat)
-                (when (wm-surface-p obj) (setf (seat-focus-surface seat) obj))
+                (when (wm-surface-p obj) (seat-focus seat obj))
                 (wm-open-window-menu port obj cx cy seat mask) (composite-seat seat)))
              ((eq region :resize)                            ; bottom-right corner: start a resize
               (when down
                 (wm-raise port obj seat)
-                (when (wm-surface-p obj) (setf (seat-focus-surface seat) obj))
+                (when (wm-surface-p obj) (seat-focus seat obj))
                 (setf (seat-drag seat) (list obj :resize x y cw ch))
                 (composite-seat seat)))
              ((eq region :title)                             ; title bar: start a move
               (when down
                 (wm-raise port obj seat)
-                (when (wm-surface-p obj) (setf (seat-focus-surface seat) obj))
+                (when (wm-surface-p obj) (seat-focus seat obj))
                 (setf (seat-drag seat)
                       (list obj :move (- x (wm-pos-x obj seat)) (- y (wm-pos-y obj seat))))
                 (composite-seat seat)))
@@ -1914,7 +1914,7 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
               (composite-seat seat))
              ((wm-surface-p obj)                             ; content of a surface window
               (when down
-                (setf (seat-focus-surface seat) obj)
+                (seat-focus seat obj)
                 ;; Raise only if it is not already the frontmost window — the same guard
                 ;; the McCLIM branch below has, and for a bigger reason.  DOWN is true of
                 ;; every motion event with a button held, so a drag or a text selection
@@ -1945,7 +1945,7 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
               ;; manager (this seat may still raise and move the window on its own screen)
               ;; but not McCLIM.
               (let ((may (clim-token-claim port seat :press (logtest mask 7))))
-              (when down (setf (seat-focus-surface seat) nil))   ; keyboard back to CLIM
+              (when down (seat-focus seat nil))   ; keyboard back to CLIM
               ;; Raise unless it is already the frontmost window — which now means
               ;; frontmost of ALL windows, not merely of the McCLIM ones.  Against the
               ;; old mirrors-only test, clicking a McCLIM window that sat under a
@@ -1977,7 +1977,7 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
   (setf (glass-port-cascade port) (mod (+ (glass-port-cascade port) 28) 200))
   (push surf (glass-port-surfaces port))
   (setf (window-own-z surf) (incf (glass-port-zclock port)))
-  (setf (seat-focus-surface (port-seat port (or seat *wm-spawn-seat*))) surf)
+  (seat-focus (port-seat port (or seat *wm-spawn-seat*)) surf)
   surf)
 
 (defun add-surface (port make-fn &key (title "surface") (width 800) (height 600))
