@@ -1319,12 +1319,12 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
          (cons "Refresh" (lambda () (composite-seat (port-seat port seat))))
          (cons "Quit"    (lambda () (wm-close port obj))))))
 
-(defun wm-open-window-menu (port obj cx cy &optional seat)
+(defun wm-open-window-menu (port obj cx cy &optional seat (mask 0))
   "Pop the Window Menu just below OBJ's title bar (at content top-left CX,CY)."
   (let ((seat (port-seat port seat))
         (menu (make-wm-menu :hover -1 :title "Window"
                             :items (wm-window-menu-items port obj seat))))
-    (setf (seat-menu seat) (wm-place-menu menu seat cx cy))))
+    (setf (seat-menu seat) (%seed-menu-mask (wm-place-menu menu seat cx cy) mask))))
 
 ;;; ---- workspace root menu ----------------------------------------------------
 
@@ -1396,6 +1396,24 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
                 (if (< i (length (wm-menu-items menu))) i :title))))
         :outside)))
 
+(defun %seed-menu-mask (menu mask)
+  "Tell a freshly opened MENU what the buttons were doing when it opened, and return it.
+
+   WITHOUT THIS A MENU IS BORN NOT KNOWING.  LAST-MASK starts at 0, so the first event a
+   menu opened by a press ever sees — a motion with that same button still held — looks like
+   a button going from up to down, i.e. a brand new press.  Outside the menu that means
+   dismiss, and the still-held button then re-opens the root menu at the pointer: the exact
+   flicker the previous commit removed, surviving in the one gesture that could still
+   produce a false edge.
+
+   It hides near the edges of the screen, which is what makes it easy to miss.  A menu is
+   clamped into its seat's bounds, so opening one near the right or bottom edge places it
+   away from the pointer — and then the pointer is ALREADY outside on that first held event.
+   Open one in the middle and the title strip is under the cursor, so the false press lands
+   on the menu and does nothing at all."
+  (setf (wm-menu-last-mask menu) mask)
+  menu)
+
 (defun wm-place-menu (menu seat x y)
   "Render MENU and position it on SEAT's screen, top-left near (X,Y) but kept in that
    seat's bounds — a menu clamps to the screen it opened on, which is why this needs a
@@ -1405,7 +1423,7 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
         (wm-menu-y menu) (max 0 (min y (- (seat-screen-h seat) (glass:fb-height (wm-menu-fb menu))))))
   menu)
 
-(defun wm-open-menu (port x y &optional seat)
+(defun wm-open-menu (port x y &optional seat (mask 0))
   "Open the workspace root menu at (X,Y): the port's items, plus whatever the SESSION
    itself can offer from the workspace — today, speaking the clipboard, and deciding
    whether this seat is on a plain VNC port.  Those are appended here rather than
@@ -1422,7 +1440,7 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
                                             ;; which is a question about the seat whose
                                             ;; menu this is and not about the session
                                             (wm-vnc-menu-items port seat)))))
-    (setf (seat-menu seat) (wm-place-menu menu seat x y))))
+    (setf (seat-menu seat) (%seed-menu-mask (wm-place-menu menu seat x y) mask))))
 
 ;;; ---- the selection menu (right-click ON the thing you selected) --------------
 ;;;
@@ -1699,7 +1717,7 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
           (list (cons "Serve this seat over VNC…"
                       (lambda () (wm-start-vnc port seat))))))))
 
-(defun wm-open-selection-menu (port surf x y &optional seat)
+(defun wm-open-selection-menu (port surf x y &optional seat (mask 0))
   "Open the selection menu over SURF at (X,Y), or return NIL if there is nothing to
    offer — a NIL return is the caller's signal to let the press through to the app."
   (when-let* ((text (wm-surface-live-selection surf))
@@ -1708,7 +1726,7 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
               ;; said to that person — the selection was theirs
               (items (wm-selection-menu-items text seat)))
     (let ((menu (make-wm-menu :x x :y y :hover -1 :title "Selection" :items items)))
-      (setf (seat-menu seat) (wm-place-menu menu seat x y)))))
+      (setf (seat-menu seat) (%seed-menu-mask (wm-place-menu menu seat x y) mask)))))
 
 (defun wm-open-submenu (parent idx action seat)
   "Open ACTION's submenu as PARENT's child, to the right of PARENT's item IDX."
@@ -1739,13 +1757,18 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
    chain and the dismiss all recomposite THAT seat.  Another seat never sees this menu
    and its screen is not touched by any of it."
   (let* ((seat (port-seat port seat))
-         (left (logtest mask 1))
          (was-mask (wm-menu-last-mask root))
-         (was-left (logtest was-mask 1))
-         ;; THE RELEASE EDGE, which is what actually chooses an item.  See below.
-         (release (and was-left (not left)))
-         ;; ...and the PRESS edge: buttons that are down now and were not before.  A button
-         ;; held down across a drag is not a press, however many events it appears in.
+         ;; WHICHEVER BUTTON OPENED IT.  A root menu opens on left OR right — (LOGTEST MASK
+         ;; 5) — and selecting only ever watched the left one, so a right-press-drag-release
+         ;; highlighted its way down the menu and then chose nothing at all: the menu simply
+         ;; stayed open, having visibly followed the pointer the whole way.  The gesture is
+         ;; the same gesture whichever button starts it, so the edges are read over both.
+         (menu-buttons 5)                                    ; left | right
+         (held (logtest mask menu-buttons))
+         ;; buttons that WERE down and are now up — the edge that chooses an item
+         (release (logtest (logandc2 was-mask mask) menu-buttons))
+         ;; ...and the ones newly down.  A button held across a drag is not a press,
+         ;; however many events it appears in.
          (pressed (logandc2 mask was-mask))
          (chain (wm-menu-chain root))
          (menu (find-if (lambda (m) (not (eq :outside (wm-menu-index m x y)))) (reverse chain)))
@@ -1802,7 +1825,7 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
               ;; because the menu is placed with its title strip under the pointer.
               (cond
                 ((wm-submenu-p action)                          ; keep it open, don't dismiss
-                 (when (and (or left release) (not (wm-menu-child menu)))
+                 (when (and (or held release) (not (wm-menu-child menu)))
                    (wm-open-submenu menu idx action seat) (composite-seat seat)))
                 (release                                        ; leaf: run + dismiss the tree
                  (setf (seat-menu seat) nil) (composite-seat seat)
@@ -1861,13 +1884,13 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
              (clim-token-claim port seat))
            (cond
              ((and (null obj) (logtest mask 5))              ; press on workspace: root menu
-              (wm-open-menu port x y seat) (composite-seat seat))
+              (wm-open-menu port x y seat mask) (composite-seat seat))
              ((null obj))                                    ; workspace: ignore
              ((eq region :winmenu)                           ; title-bar wedge: the Window Menu
               (when down
                 (wm-raise port obj seat)
                 (when (wm-surface-p obj) (setf (seat-focus-surface seat) obj))
-                (wm-open-window-menu port obj cx cy seat) (composite-seat seat)))
+                (wm-open-window-menu port obj cx cy seat mask) (composite-seat seat)))
              ((eq region :resize)                            ; bottom-right corner: start a resize
               (when down
                 (wm-raise port obj seat)
@@ -1887,7 +1910,7 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
              ;; press goes to the app below exactly as it always did — button 3 is the
              ;; application's until there is something of the session's to say about it.
              ((and (wm-surface-p obj) (logtest mask 4)
-                   (wm-open-selection-menu port obj x y seat))
+                   (wm-open-selection-menu port obj x y seat mask))
               (composite-seat seat))
              ((wm-surface-p obj)                             ; content of a surface window
               (when down

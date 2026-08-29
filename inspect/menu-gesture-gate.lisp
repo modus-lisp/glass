@@ -179,6 +179,46 @@
     (sleep 0.2)
     (ok "...and a fresh press outside closes it" (null (clim-glass::seat-menu seat)))))
 
+
+(format t "~&== the gesture works from whichever button opened the menu ==~%")
+;; A root menu opens on left OR right — (LOGTEST MASK 5) — and selecting watched only the
+;; left.  So a right-press-drag-release highlighted its way down the menu, following the
+;; pointer exactly as it should, and then chose nothing: the menu just stayed open.  Every
+;; visible part of the interaction worked, which is why it reads as "it broke" rather than
+;; as a missing feature, and why it needs a test naming the button.
+(let ((p (clim-glass:make-wm-session :width 1200 :height 800)))
+  (clim-glass:start-wm-session p '())
+  (sb-thread:make-thread (lambda () (clim-glass:run-wm-loop p)) :name "r")
+  (sleep 1.5)
+  (let* ((seat (clim-glass:port-seat p))
+         (items (loop for i from 0 below 5
+                      collect (cons (format nil "item ~d" i)
+                                    (let ((i i)) (lambda () (push i *ran*)))))))
+    (setf (clim-glass::glass-port-menu-items p) items)
+    (dolist (btn '(1 4))
+      (setf *ran* '())
+      (clim-glass::wm-on-pointer p btn 300 200 seat)
+      (sleep 0.2)
+      (let ((m (clim-glass::seat-menu seat)))
+        (ok (format nil "button ~d opens the root menu" btn) (not (null m)))
+        (when m
+          (let* ((ih (clim-glass::with-seat-scale (seat) (clim-glass::menu-itemh)))
+                 (th (clim-glass::with-seat-scale (seat) (clim-glass::menu-titleh)))
+                 (mx (+ (clim-glass::wm-menu-x m) 30))
+                 (py (+ (clim-glass::wm-menu-y m) th (* 2 ih) (floor ih 2))))
+            (clim-glass::wm-on-pointer p btn mx py seat)      ; drag, that button held
+            (sleep 0.1)
+            (ok (format nil "...hover follows a button-~d drag" btn)
+                (= 2 (clim-glass::wm-menu-hover m))
+                (format nil "hover ~a" (clim-glass::wm-menu-hover m)))
+            (ok (format nil "...nothing ran while button ~d was held" btn) (null *ran*)
+                (format nil "ran ~s" *ran*))
+            (clim-glass::wm-on-pointer p 0 mx py seat)        ; release it
+            (sleep 0.3)
+            (ok (format nil "...and releasing button ~d chooses that item" btn)
+                (equal *ran* '(2)) (format nil "ran ~s" *ran*))
+            (ok (format nil "...and dismisses" btn) (null (clim-glass::seat-menu seat)))))))))
+
 (format t "~&~d passed, ~d failed~%=> ~:[FAIL~;PASS~]~%" *pass* *fail* (zerop *fail*))
 
 (finish-output)
