@@ -123,6 +123,45 @@
           (and s1 s2 (< 1.7 (/ (third s2) (float (third s1))) 2.3))
           (format nil "1x ~ax~a vs 2x ~ax~a" (second s1) (third s1) (second s2) (third s2))))))
 
+
+(format t "~&== the window-menu wedge is clickable where it is drawn ==~%")
+;; The bug this is for, reported as \"the click region is the top left corner of where it
+;; should be\": the button was DRAWN inset by 4*scale and sized from the bar, and HIT-TESTED
+;; at a fixed 4..18.  Those agree at 1x by construction and nowhere else, so at 2x the live
+;; quarter of the button was its top-left corner — which feels like a bad mouse rather than
+;; a bug, and is why it survived a screenshot.  One function now answers both, and the test
+;; probes the CENTRE of what the renderer drew, plus a point just past its edge so that
+;; passing cannot mean \"the region got bigger than the button\".
+(let ((p (clim-glass:make-wm-session :width 1400 :height 900)))
+  (clim-glass:start-wm-session p '())
+  (sb-thread:make-thread (lambda () (clim-glass:run-wm-loop p)) :name "w")
+  (sleep 1.5)
+  (let ((seat (clim-glass:port-seat p)))
+    (dolist (sc '(1 3/2 2))
+      (setf (clim-glass:seat-scale seat) sc)
+      (let ((surf (clim-glass::wm-add-terminal p :cols 40 :rows 10)))
+        (sleep 0.8)
+        (clim-glass::with-seat-scale (seat)
+          (multiple-value-bind (bx by bs) (clim-glass::wm-menu-button-box)
+            (let* ((cx (clim-glass::seat-window-x seat surf))
+                   (cy (clim-glass::seat-window-y seat surf))
+                   (ty (- cy (clim-glass:wm-titleh)))
+                   ;; the CENTRE of the button as the renderer draws it
+                   (px (+ cx bx (floor bs 2)))
+                   (py (+ ty by (floor bs 2))))
+              (multiple-value-bind (obj what) (clim-glass::wm-hit p px py seat)
+                (declare (ignore obj))
+                (ok (format nil "at ~a x, the centre of the drawn wedge is :winmenu" sc)
+                    (eq what :winmenu)
+                    (format nil "button ~a,~a size ~a -> ~s" bx by bs what)))
+              ;; and a point just outside it must NOT be
+              (multiple-value-bind (obj what) (clim-glass::wm-hit p (+ cx bx bs 3) py seat)
+                (declare (ignore obj))
+                (ok (format nil "...and just past its right edge is not" sc)
+                    (not (eq what :winmenu)) (format nil "~s" what))))))
+        (ignore-errors (clim-glass::wm-close-window p surf seat))
+        (sleep 0.3)))))
+
 (format t "~&~d passed, ~d failed~%=> ~:[FAIL~;PASS~]~%" *pass* *fail* (zerop *fail*))
 (finish-output)
 (sb-ext:exit :code (if (plusp *fail*) 1 0))

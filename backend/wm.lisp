@@ -62,6 +62,19 @@
    who are NOT driving, so the person actually using the application sees the desktop
    they have always seen.")
 
+(defun wm-menu-button-box ()
+  "The window-menu wedge's (X Y SIZE) inside a title bar, at the current density.
+
+   ONE DEFINITION, read by the renderer and by the hit test, because they had drifted:
+   the button was drawn inset by 4*scale and sized from the bar, and hit-tested at a fixed
+   4..18.  At 1x those agree by construction; at 2x the clickable area was the top-left
+   quarter of the button you can see, which is the sort of thing that feels like a bad
+   mouse rather than a bug.  Neither side gets to do this arithmetic on its own any more."
+  (let* ((h (wm-titleh))
+         (pad (max 2 (round (* 4 *wm-scale*))))
+         (size (max 4 (- h (* 2 pad)))))
+    (values pad pad size)))
+
 (defun wm-render-titlebar (title width &optional (bg +wm-title-bg+))
   "A glass framebuffer of an OPEN LOOK title bar WIDTH px wide — drawn entirely
    with glass primitives + scribe text (no McCLIM).
@@ -73,11 +86,11 @@
    hand, for one size.  So the sum is written down instead, and every density gets it
    right including the fractional ones where no single constant could."
   (let* ((h (wm-titleh))
-         (pad (max 2 (round (* 4 *wm-scale*))))                ; the bevel's inset
          (tb (glass:make-framebuffer (max 1 width) h bg)))
     (glass:fb-hline tb 0 (1- h) width (glass:rgb 120 120 120))                  ; bottom shadow line
-    ;; menu button box: raised bevel + abbreviated-menu wedge
-    (let* ((bs (max 4 (- h (* 2 pad)))) (bx pad) (by pad))
+    ;; menu button box: raised bevel + abbreviated-menu wedge, placed by the one function
+    ;; the hit test also asks — see WM-MENU-BUTTON-BOX.
+    (multiple-value-bind (bx by bs) (wm-menu-button-box)
       (glass:fb-rect tb bx by bs bs (glass:rgb 188 188 188))
       (glass:fb-hline tb bx by bs glass:+white+)                                ; top light
       (glass:fb-vline tb bx by bs glass:+white+)                               ; left light
@@ -925,13 +938,17 @@
              (stringp glass:*desktop-name*)
              (plusp (length glass:*desktop-name*)))
     (ignore-errors
-     (let* ((size *wm-session-label-size*)
+     ;; Scaled like everything else: 34 device pixels is a comfortable label at 1x and a
+     ;; caption at 2x.  Its offsets already derive from SIZE, so scaling the one number
+     ;; carries the corner inset and the shadow with it.
+     (let* ((size (max 1 (round (* *wm-session-label-size* *wm-scale*))))
             (x (round size 2))
             ;; Bottom-left, clear of the edge by half a line, and it follows the
             ;; framebuffer's height so a resized screen keeps it in the corner.
             (y (- (glass:fb-height fb) size (round size 2))))
        (when (plusp y)
-         (glass:fb-text fb (+ x 2) (+ y 2) glass:*desktop-name*
+         (glass:fb-text fb (+ x (max 1 (round (* 2 *wm-scale*))))
+                        (+ y (max 1 (round (* 2 *wm-scale*)))) glass:*desktop-name*
                         :size size :color (glass:rgb 0 0 0)
                         :alpha (* *wm-session-label-alpha* 0.6d0))
          (glass:fb-text fb x y glass:*desktop-name*
@@ -962,8 +979,12 @@
            (if (glass-mirror-managed w) (wm-draw-window w fb seat) (blit-mirror w fb seat)))))
     (when-let ((b (and (seat-drag-wire seat) (seat-drag-wire-box seat))))   ; wireframe outline
       (destructuring-bind (x y w h) b
-        (glass:fb-frame fb x y w h glass:+white+ 2)             ; white + inner black = visible on any bg
-        (glass:fb-frame fb (1+ x) (1+ y) (max 0 (- w 2)) (max 0 (- h 2)) glass:+black+ 1)))
+        ;; The stroke scales: a two-pixel outline is a confident line at 1x and a hairline
+        ;; at 2x, and this one exists to be seen against whatever is behind it.
+        (let* ((t2 (max 2 (round (* 2 *wm-scale*)))) (t1 (max 1 (round *wm-scale*))))
+          (glass:fb-frame fb x y w h glass:+white+ t2)          ; white + inner black = visible on any bg
+          (glass:fb-frame fb (+ x t1) (+ y t1) (max 0 (- w (* 2 t1))) (max 0 (- h (* 2 t1)))
+                          glass:+black+ t1))))
     (when-let ((menu (seat-menu seat)))                         ; root menu (+ submenu chain) on top
       (dolist (m (wm-menu-chain menu))
         (blit-fb (wm-menu-fb m) (wm-menu-x m) (wm-menu-y m) fb)))))
@@ -1154,14 +1175,18 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
    Unmanaged mirrors are skipped, as they always were: a CLIM pull-down gets its events
    through the grab-sheet path, not through the WM's hit test."
   (flet ((test (cx cy cw ch obj)
-           (let ((ty (- cy (wm-titleh))) (rz 16))
+           (multiple-value-bind (bx by bs) (wm-menu-button-box)
+           (let ((ty (- cy (wm-titleh)))
+                 ;; the grab corner is a TARGET, so it scales with everything else: 16
+                 ;; device pixels is a comfortable corner at 1x and a nuisance at 2x.
+                 (rz (max 6 (round (* 16 *wm-scale*)))))
              (cond
-               ((and (<= (+ cx 4) x (+ cx 18)) (<= (+ ty 4) y (+ ty 18)))           ; wedge = Window Menu
+               ((and (<= (+ cx bx) x (+ cx bx bs)) (<= (+ ty by) y (+ ty by bs)))   ; wedge = Window Menu
                 (list obj :winmenu cx cy cw ch))
                ((and (<= (- (+ cx cw) rz) x (+ cx cw 1)) (<= (- (+ cy ch) rz) y (+ cy ch 1)))  ; resize corner
                 (list obj :resize cx cy cw ch))
                ((and (<= cx x (+ cx cw)) (<= cy y (+ cy ch))) (list obj :content cx cy cw ch))
-               ((and (<= cx x (+ cx cw)) (<= ty y cy)) (list obj :title cx cy cw ch))))))
+               ((and (<= cx x (+ cx cw)) (<= ty y cy)) (list obj :title cx cy cw ch)))))))
     (dolist (w (wm-stacking-order port seat))
       (let ((hit (cond
                    ((wm-surface-p w)
@@ -1560,8 +1585,16 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
 
 (defun wm-render-vnc-window (fb lines)
   "Draw LINES (from WM-VNC-WINDOW-LINES) onto FB."
-  (let ((font (glass:default-font)) (bold (glass:default-font t))
-        (w (glass:fb-width fb)) (y 14))
+  ;; Every offset and step here is in DESIGN pixels put through SC, for the same reason the
+  ;; title bar centres by arithmetic: the text already scaled (WM-SIZE) and the leading did
+  ;; not, so at 2x the lines sat on top of each other while the margins stayed hairline.
+  ;; Wrapping measures at the scaled size too — a limit in device pixels compared against
+  ;; text measured at 1x wraps in the wrong place, which is the failure that looks like a
+  ;; layout bug and is really a units bug.
+  (flet ((sc (n) (max 1 (round (* n *wm-scale*)))))
+   (let ((font (glass:default-font)) (bold (glass:default-font t))
+         (w (glass:fb-width fb)) (y (funcall #'sc 14))
+         (x (funcall #'sc 16)) (bx (funcall #'sc 110)) (marg (funcall #'sc 32)))
     (glass:fb-fill fb (glass:rgb 248 248 245))
     (flet ((wrap (text size limit)
              ;; A note is a sentence, not a label; it wraps rather than running off the
@@ -1581,23 +1614,23 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
       (dolist (line lines fb)
         (destructuring-bind (kind a &optional b) line
           (ecase kind
-            (:head (glass:fb-text fb 16 y a :size (wm-size 15) :color (glass:rgb 20 20 20) :font bold)
-                   (glass:fb-hline fb 16 (+ y 22) (- w 32) (glass:rgb 200 200 195))
-                   (incf y 32))
-            (:field (glass:fb-text fb 16 y a :size (wm-size 13) :color (glass:rgb 100 100 100) :font font)
-                    (glass:fb-text fb 110 y b :size (wm-size 13) :color (glass:rgb 20 20 20) :font bold)
-                    (incf y 22))
-            (:secret (glass:fb-text fb 16 (+ y 8) a :size (wm-size 13) :color (glass:rgb 100 100 100) :font font)
-                     (glass:fb-text fb 110 y b :size (wm-size 26) :color (glass:rgb 20 60 120) :font bold)
-                     (incf y 38))
-            (:note (dolist (l (wrap a 12 (- w 32)))
-                     (glass:fb-text fb 16 y l :size (wm-size 12) :color (glass:rgb 110 110 110) :font font)
-                     (incf y 16))
-                   (incf y 4))
-            (:warn (dolist (l (wrap a 12 (- w 32)))
-                     (glass:fb-text fb 16 y l :size (wm-size 12) :color (glass:rgb 150 60 20) :font font)
-                     (incf y 16))
-                   (incf y 4))))))))
+            (:head (glass:fb-text fb x y a :size (wm-size 15) :color (glass:rgb 20 20 20) :font bold)
+                   (glass:fb-hline fb x (+ y (sc 22)) (- w marg) (glass:rgb 200 200 195))
+                   (incf y (sc 32)))
+            (:field (glass:fb-text fb x y a :size (wm-size 13) :color (glass:rgb 100 100 100) :font font)
+                    (glass:fb-text fb bx y b :size (wm-size 13) :color (glass:rgb 20 20 20) :font bold)
+                    (incf y (sc 22)))
+            (:secret (glass:fb-text fb x (+ y (sc 8)) a :size (wm-size 13) :color (glass:rgb 100 100 100) :font font)
+                     (glass:fb-text fb bx y b :size (wm-size 26) :color (glass:rgb 20 60 120) :font bold)
+                     (incf y (sc 38)))
+            (:note (dolist (l (wrap a (wm-size 12) (- w marg)))
+                     (glass:fb-text fb x y l :size (wm-size 12) :color (glass:rgb 110 110 110) :font font)
+                     (incf y (sc 16)))
+                   (incf y (sc 4)))
+            (:warn (dolist (l (wrap a (wm-size 12) (- w marg)))
+                     (glass:fb-text fb x y l :size (wm-size 12) :color (glass:rgb 150 60 20) :font font)
+                     (incf y (sc 16)))
+                   (incf y (sc 4))))))))))
 
 (defun wm-show-vnc-window (port lines &optional (title "VNC"))
   "Put LINES on the screen as an ordinary WM window — a surface with no input, drawn
