@@ -113,6 +113,72 @@
         (ok "letting go off the menu runs nothing" (null *ran*)
             (format nil "ran ~s" (reverse *ran*)))
         (ok "...and dismisses it" (null (clim-glass::seat-menu seat)))))))
+
+(format t "~&== held and dragged outside, a menu sits still ==~%")
+;; THE SECOND EDGE BUG, and the same shape as the first.  Dismissing asked whether a button
+;; was down rather than whether one had just gone down — so every motion event outside the
+;; menu, mid-drag, dismissed it; and the still-held button then reached the ordinary pointer
+;; path, which opens the root menu.  Dismiss, re-open at the new point, once per motion
+;; event: the menu flickered and slid along under the cursor.  Two correct-looking
+;; behaviours fighting each other.
+;;
+;; Held and moved outside is a gesture in progress that has not said anything yet, so the
+;; right answer is to do nothing at all except stop highlighting.
+(setf *ran* '())
+(let ((p (clim-glass:make-wm-session :width 1200 :height 800)))
+  (clim-glass:start-wm-session p '())
+  (sb-thread:make-thread (lambda () (clim-glass:run-wm-loop p)) :name "s")
+  (sleep 1.5)
+  (let* ((seat (clim-glass:port-seat p))
+         (items (loop for i from 0 below 5
+                      collect (cons (format nil "item ~d" i)
+                                    (let ((i i)) (lambda () (push i *ran*)))))))
+    (setf (clim-glass::glass-port-menu-items p) items)
+    (clim-glass::wm-open-menu p 100 100 seat)
+    (let* ((menu (clim-glass::seat-menu seat))
+           (mx0 (clim-glass::wm-menu-x menu)) (my0 (clim-glass::wm-menu-y menu))
+           (ih (clim-glass::with-seat-scale (seat) (clim-glass::menu-itemh)))
+           (th (clim-glass::with-seat-scale (seat) (clim-glass::menu-titleh))))
+      ;; press on item 1, then drag well outside, several events, button HELD
+      (clim-glass::wm-on-pointer p 1 (+ mx0 30) (+ my0 th ih (floor ih 2)) seat)
+      (dolist (pt '((900 300) (905 320) (910 340) (915 360)))
+        (clim-glass::wm-on-pointer p 1 (first pt) (second pt) seat) (sleep 0.05))
+      (let ((m (clim-glass::seat-menu seat)))
+        (ok "held and dragged outside, the menu is still open" (not (null m)))
+        (ok "...and has not moved"
+            (and m (= mx0 (clim-glass::wm-menu-x m)) (= my0 (clim-glass::wm-menu-y m)))
+            (format nil "was ~a,~a now ~a,~a" mx0 my0
+                    (and m (clim-glass::wm-menu-x m)) (and m (clim-glass::wm-menu-y m))))
+        (ok "...and nothing is highlighted"
+            (and m (= -1 (clim-glass::wm-menu-hover m)))
+            (format nil "hover ~a" (and m (clim-glass::wm-menu-hover m))))
+        (ok "...and nothing has run" (null *ran*) (format nil "ran ~s" *ran*)))
+      ;; come back in over item 3 -- still held -- then release there
+      (clim-glass::wm-on-pointer p 1 (+ mx0 30) (+ my0 th (* 3 ih) (floor ih 2)) seat)
+      (sleep 0.1)
+      (ok "coming back in highlights again"
+          (= 3 (clim-glass::wm-menu-hover (clim-glass::seat-menu seat)))
+          (format nil "hover ~a" (clim-glass::wm-menu-hover (clim-glass::seat-menu seat))))
+      (clim-glass::wm-on-pointer p 0 (+ mx0 30) (+ my0 th (* 3 ih) (floor ih 2)) seat)
+      (sleep 0.3)
+      (ok "...and releasing there runs exactly that item" (equal *ran* '(3))
+          (format nil "ran ~s" *ran*)))))
+
+(format t "~&== a fresh click outside still dismisses ==~%")
+;; Kept honest: the fix above makes dismissal edge-triggered, so this is the case that
+;; would break if the edge were computed wrongly in the other direction.
+(let ((p (clim-glass:make-wm-session :width 1200 :height 800)))
+  (clim-glass:start-wm-session p '())
+  (sb-thread:make-thread (lambda () (clim-glass:run-wm-loop p)) :name "x")
+  (sleep 1.5)
+  (let ((seat (clim-glass:port-seat p)))
+    (clim-glass::wm-open-menu p 100 100 seat)
+    (ok "the menu is open" (not (null (clim-glass::seat-menu seat))))
+    (clim-glass::wm-on-pointer p 0 900 700 seat)      ; move out, no button
+    (clim-glass::wm-on-pointer p 1 900 700 seat)      ; a NEW press out there
+    (sleep 0.2)
+    (ok "...and a fresh press outside closes it" (null (clim-glass::seat-menu seat)))))
+
 (format t "~&~d passed, ~d failed~%=> ~:[FAIL~;PASS~]~%" *pass* *fail* (zerop *fail*))
 
 (finish-output)

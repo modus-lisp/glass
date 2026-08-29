@@ -1740,20 +1740,44 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
    and its screen is not touched by any of it."
   (let* ((seat (port-seat port seat))
          (left (logtest mask 1))
-         (was-left (logtest (wm-menu-last-mask root) 1))
+         (was-mask (wm-menu-last-mask root))
+         (was-left (logtest was-mask 1))
          ;; THE RELEASE EDGE, which is what actually chooses an item.  See below.
          (release (and was-left (not left)))
+         ;; ...and the PRESS edge: buttons that are down now and were not before.  A button
+         ;; held down across a drag is not a press, however many events it appears in.
+         (pressed (logandc2 mask was-mask))
          (chain (wm-menu-chain root))
-         (menu (find-if (lambda (m) (not (eq :outside (wm-menu-index m x y)))) (reverse chain))))
+         (menu (find-if (lambda (m) (not (eq :outside (wm-menu-index m x y)))) (reverse chain)))
+         ;; the deepest menu still showing a highlight, for clearing it when the pointer
+         ;; leaves the tree entirely
+         (menu-with-hover (or (find-if (lambda (m) (/= -1 (wm-menu-hover m))) (reverse chain))
+                              root)))
     (setf (wm-menu-last-mask root) mask)
     (cond
       ((null menu)                                              ; off every menu
-       ;; A press outside dismisses, as it always did; so does letting go outside, which is
-       ;; how a press-drag-release gesture says "never mind" — the pointer left the menu
-       ;; and the button came up somewhere that is not an item.
-       (when (or (logtest mask 5) release)
+       ;; A NEW press outside dismisses; so does letting go outside, which is how a
+       ;; press-drag-release gesture says "never mind".
+       ;;
+       ;; The edge is the point, and reading the state instead was a second bug of exactly
+       ;; the shape the release fix cured.  While the button is held, every motion event
+       ;; outside the menu satisfied "a button is down", so the menu was dismissed — and
+       ;; then the still-held button reached the ordinary pointer path, which opens the root
+       ;; menu.  Dismiss, re-open at the new point, per motion event: the menu appeared to
+       ;; flicker and slide along under the cursor.  Two correct-looking behaviours,
+       ;; fighting.
+       ;;
+       ;; Held and moved outside is not an event at all.  It is a gesture in progress that
+       ;; has not yet said anything, and the menu should sit still and wait.
+       (when (or (logtest pressed 5) release)
          (setf (seat-menu seat) nil) (composite-seat seat)
-         (clim-token-settle port seat)))       ; the menu pinned the token; it is gone
+         (clim-token-settle port seat))       ; the menu pinned the token; it is gone
+       ;; Nothing is under the pointer, so nothing should look chosen.  Only when it
+       ;; changes: this runs on every motion event outside an open menu.
+       (when (and (seat-menu seat) (/= -1 (wm-menu-hover menu-with-hover)))
+         (setf (wm-menu-hover menu-with-hover) -1)
+         (wm-menu-render menu-with-hover)
+         (composite-seat seat)))
       (t
        (let ((idx (wm-menu-index menu x y)))
          (cond
