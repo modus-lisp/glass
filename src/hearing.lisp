@@ -66,12 +66,32 @@ worked: the models were downloaded, the path was right, the environment carried 
 one thing that never happened was anybody looking.  A launcher can still SETF this directly
 and that keeps working; the difference is that not doing so is no longer a trap.")
 
+(defun %as-directory (path)
+  "PATH as a pathname that NAMES A DIRECTORY, whatever the string looked like.
+
+   A directory written without a trailing slash — which is how anyone types one, and how
+   every shell completes one — parses with its last component as a FILE NAME.  Merging
+   \"encoder-*.graph\" onto that then searches the PARENT: --ears=.../zipformer-en-2023-06-26
+   went looking in .../models/ and reported no encoder there, which is true and about the
+   wrong directory.  The message even prints the path you gave, so it reads as the models
+   being absent from a directory you can see them in.
+
+   The knowledge that this string names a directory lives here, where it was typed as one."
+  (let ((p (pathname path)))
+    (if (or (pathname-name p) (pathname-type p))
+        (make-pathname :directory (append (or (pathname-directory p) '(:relative))
+                                          (list (file-namestring p)))
+                       :name nil :type nil :defaults p)
+        p)))
+
 (defun hearing-models ()
-  "Where the ear's models are: the variable if a launcher set one, else GLASS_EARS now.
-An empty string counts as unset, since that is what an unset docker -e looks like."
-  (or *hearing-models*
-      (let ((e (sb-ext:posix-getenv "GLASS_EARS")))
-        (and e (plusp (length e)) e))))
+  "Where the ear's models are, as a directory pathname: the variable if a launcher set one,
+else GLASS_EARS now.  An empty string counts as unset, since that is what an unset
+docker -e looks like."
+  (let ((raw (or *hearing-models*
+                 (let ((e (sb-ext:posix-getenv "GLASS_EARS")))
+                   (and e (plusp (length e)) e)))))
+    (and raw (%as-directory raw))))
 
 (defparameter *hearing-rate* 16000
   "The rate the recognizer is fed at.  Not a preference: it is the rate the model's filterbank

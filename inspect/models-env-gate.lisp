@@ -62,8 +62,12 @@
   (ok "...and no voice" (null (glass:speech-voice)))
   (sb-posix:setenv "GLASS_EARS" models 1)
   (sb-posix:setenv "GLASS_VOICE" voice 1)
-  (ok "GLASS_EARS set AFTER load is seen" (equal models (glass:hearing-models))
-      (glass:hearing-models))
+  ;; NAMESTRING, and the trailing slash is expected: HEARING-MODELS answers a DIRECTORY
+  ;; pathname now, which is the fix for the bug below.  SPEECH-VOICE still answers a string,
+  ;; because a voice is a file and a file is what was typed.
+  (ok "GLASS_EARS set AFTER load is seen"
+      (search models (namestring (glass:hearing-models)))
+      (namestring (glass:hearing-models)))
   (ok "GLASS_VOICE set AFTER load is seen" (equal voice (glass:speech-voice)))
   ;; an empty variable is what an unset docker -e looks like
   (sb-posix:setenv "GLASS_EARS" "" 1)
@@ -71,7 +75,8 @@
   ;; a launcher setting the symbol still wins
   (setf glass:*hearing-models* models)
   (ok "a launcher's symbol still wins over the environment"
-      (equal models (glass:hearing-models)))
+      (search models (namestring (glass:hearing-models)))
+      (namestring (glass:hearing-models)))
   ;; and the app agrees
   (sb-posix:setenv "GLASS_EARS" models 1)
   (setf glass:*hearing-models* nil)
@@ -83,6 +88,35 @@
   (let ((state (funcall (find-symbol "%STATE" "GLASS-SPEAK"))))
     (ok "...and Speak sees its voice too"
         (not (string= "No voice installed" state)) state)))
+
+(format t "~&== a directory typed without a trailing slash is still a directory ==~%")
+;; THE BUG: --ears=.../zipformer-en-2023-06-26 loaded nothing, and said "no encoder-*.graph
+;; in .../zipformer-en-2023-06-26" — naming the directory the files are plainly in.  A path
+;; without a trailing slash parses with its last component as a FILE NAME, so merging
+;; "encoder-*.graph" onto it searches the PARENT.  The message was true about a directory
+;; nobody had asked about, which is the most misleading kind of true.
+;;
+;; Nobody types the trailing slash and no shell completes one, so the failing form is the
+;; ordinary one and the working form is the accident.
+(let ((bare (format nil "~a/.stave/models/zipformer-en-2023-06-26"
+                    (sb-ext:posix-getenv "HOME"))))
+  (setf glass:*hearing-models* nil)
+  (sb-posix:setenv "GLASS_EARS" bare 1)
+  (let ((d (glass:hearing-models)))
+    (ok "no trailing slash still names a directory"
+        (and (null (pathname-name d)) (null (pathname-type d)))
+        (format nil "~a" d))
+    (ok "...and the last component is kept, not dropped to the parent"
+        (search "zipformer-en-2023-06-26" (namestring d))
+        (namestring d))
+    (ok "...so the encoder is found where it actually is"
+        (probe-file (merge-pathnames "encoder-epoch-99-avg-1-chunk-16-left-128.graph" d))))
+  ;; and the form that always worked still does
+  (setf glass:*hearing-models* nil)
+  (sb-posix:setenv "GLASS_EARS" (concatenate 'string bare "/") 1)
+  (ok "a trailing slash is unchanged"
+      (search "zipformer-en-2023-06-26" (namestring (glass:hearing-models)))))
+
 (format t "~&=> ~:[FAIL~;PASS~]~%" (zerop *fail*))
 
 (finish-output)
