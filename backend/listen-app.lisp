@@ -83,7 +83,7 @@ START-LISTENING returns before a word is heard — the model is read on the ear'
 this callback does not block the window on the one operation here that takes a minute.  It is
 idempotent and session-wide: pressing it twice, or in two windows, is one ear."
   (let ((frame (clim:pane-frame gadget)))
-    (cond ((null glass:*hearing-models*)
+    (cond ((null (glass:hearing-models))
            (setf (app-note frame)
                  "No ear installed — set GLASS_EARS to a directory of stave graphs."))
           (t (setf (app-note frame) nil)
@@ -123,7 +123,7 @@ being written by the ticker.  So it says where to click."
       ((not value)
        (glass:stop-dictation)
        (setf (app-note frame) nil))
-      ((null glass:*hearing-models*)
+      ((null (glass:hearing-models))
        (setf (clim:gadget-value gadget :invoke-callback nil) nil
              (app-note frame) "No ear installed — set GLASS_EARS to a directory of stave graphs."))
       ((null glass:*key-injector*)
@@ -146,7 +146,7 @@ what puts a sink on the mixer and reads a quarter of a gigabyte of weights."
 
 (defun %state ()
   "The headline: what a glance should tell you."
-  (cond ((null glass:*hearing-models*) "No ear installed")
+  (cond ((null (glass:hearing-models)) "No ear installed")
         ((null (%ear)) "Idle")
         ((not (glass:listening-p (%ear))) "Stopped")
         ((not (glass:hearing-ready-p (%ear))) "Loading model...")
@@ -161,7 +161,7 @@ what puts a sink on the mixer and reads a quarter of a gigabyte of weights."
 
 (defun %detail (frame)
   (or (app-note frame)
-      (if glass:*hearing-models*
+      (if (glass:hearing-models)
           (glass:hearing-report (%ear))
           "set GLASS_EARS (or glass:*hearing-models*) to a directory of stave graphs")))
 
@@ -196,7 +196,7 @@ not going to be clipped anyway; what is gained is a pane that does not ask the l
     (setf (app-shown frame) status)
     (clim:draw-text* stream state 4 16
                      :text-style (ui-bold 14)
-                     :ink (cond ((null glass:*hearing-models*) clim:+dark-red+)
+                     :ink (cond ((null (glass:hearing-models)) clim:+dark-red+)
                                 ((glass:dictating-p) (clim:make-rgb-color 0.75 0.35 0.0))
                                 ((string= state "Hearing...") clim:+dark-green+)
                                 (t clim:+black+)))

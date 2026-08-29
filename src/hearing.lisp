@@ -50,13 +50,28 @@
 
 (in-package #:glass)
 
-(defvar *hearing-models* (sb-ext:posix-getenv "GLASS_EARS")
-  "Directory holding stave's three .graph files and tokens.txt; GLASS_EARS by default.  NIL
-means the desktop has no ear installed, and LISTEN says so rather than guessing at a path.
+(defvar *hearing-models* nil
+  "Directory holding stave's three .graph files and tokens.txt, or NIL to ask GLASS_EARS.
+Read it through HEARING-MODELS, which is what every caller here does.
 
-DEFVAR and not DEFPARAMETER, for the reason given at *SPEECH-VOICE*: a launcher fills this in
-after load, and a hot-load of this file used to reset it, so the desktop lost its ear to a
-recompile and the Listen window said `no ear installed' with the models still on disk.")
+NIL BY DEFAULT, AND THE ENVIRONMENT CONSULTED AT USE.  This used to initialise from
+GLASS_EARS, which is correct in a freshly loaded image and silently wrong in the one the
+desktop actually runs in: a DEFVAR's init form runs when the file is LOADED, that happens
+while the core is being built, and resuming a saved core does not run it again.  So the
+value was whatever the environment said at BUILD time — nothing — and every GLASS_EARS set
+afterwards, by a launcher or by docker -e, changed a variable nobody would read again.
+
+The symptom was Listen saying \"No ear installed\" beside a --ears flag that had plainly
+worked: the models were downloaded, the path was right, the environment carried it, and the
+one thing that never happened was anybody looking.  A launcher can still SETF this directly
+and that keeps working; the difference is that not doing so is no longer a trap.")
+
+(defun hearing-models ()
+  "Where the ear's models are: the variable if a launcher set one, else GLASS_EARS now.
+An empty string counts as unset, since that is what an unset docker -e looks like."
+  (or *hearing-models*
+      (let ((e (sb-ext:posix-getenv "GLASS_EARS")))
+        (and e (plusp (length e)) e))))
 
 (defparameter *hearing-rate* 16000
   "The rate the recognizer is fed at.  Not a preference: it is the rate the model's filterbank
@@ -157,7 +172,7 @@ so loading stave into a running desktop is enough to give it an ear — no resta
 gigabyte of weights takes a moment; doing it lazily keeps a desktop that never listens from
 paying for an ear."
   (or (ear-rec ear)
-      (let ((dir (or *hearing-models*
+      (let ((dir (or (hearing-models)
                      (error "glass hearing: no recognizer — set GLASS_EARS or ~
                              glass:*hearing-models* to a directory of stave graphs"))))
         (setf (ear-loading ear) t)

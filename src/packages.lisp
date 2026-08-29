@@ -91,13 +91,13 @@
    #:headset-primary-p
    ;; the voice (the :glass/speech system; chord-backed) — one speaker on the session mix
    #:speak #:hush #:speaking-p #:make-speaker #:session-speaker #:stop-speaker #:speech-report
-   #:speaker #:speaker-p #:*session-speaker* #:*speech-voice* #:*speech-gain* #:*speech-gap-ms*
+   #:speaker #:speaker-p #:*session-speaker* #:*speech-voice* #:speech-voice #:*speech-gain* #:*speech-gap-ms*
    ;; the ear (the :glass/hearing system; stave-backed) — one sink on the same mix
    #:start-listening #:stop-listening #:listening-p #:make-ears #:ears #:ears-p
    #:ear-mix #:ear-mic-stream #:ear-rec #:ear-listening-to
    #:hearing-text #:hearing-partial #:hearing-heard #:hearing-clear #:hearing-level
    #:hearing-ready-p #:hearing-listen #:hearing-unlisten
-   #:hearing-report #:*session-ears* #:*hearing-models* #:*hearing-rate* #:*hearing-threshold*
+   #:hearing-report #:*session-ears* #:*hearing-models* #:hearing-models #:*hearing-rate* #:*hearing-threshold*
    #:*hearing-gap-seconds* #:*hearing-max-seconds* #:*hearing-preroll-seconds*
    #:*hearing-prefer-mic*
    ;; dictation (the :glass/dictation system) — the ear as a keyboard: finished utterances typed

@@ -97,13 +97,13 @@ not be what gives a desktop a voice (and a source on its mixer)."
 
 (defun %state ()
   "The headline: what a glance should tell you."
-  (cond ((null glass:*speech-voice*) "No voice installed")
+  (cond ((null (glass:speech-voice)) "No voice installed")
         ((and (%speaker) (glass:speaking-p (%speaker))) "Speaking...")
         (t "Ready")))
 
 (defun %detail (frame)
   (or (app-note frame)
-      (if glass:*speech-voice*
+      (if (glass:speech-voice)
           (glass:speech-report (%speaker))
           "set GLASS_VOICE (or glass:*speech-voice*) to a chord .graph")))
 
@@ -114,7 +114,7 @@ not be what gives a desktop a voice (and a source on its mixer)."
     (setf (app-shown frame) status)
     (clim:draw-text* stream (car status) 4 16
                      :text-style (ui-bold 14)
-                     :ink (cond ((null glass:*speech-voice*) clim:+dark-red+)
+                     :ink (cond ((null (glass:speech-voice)) clim:+dark-red+)
                                 ((string= (car status) "Speaking...") clim:+dark-green+)
                                 (t clim:+black+)))
     (clim:draw-text* stream (cdr status) 4 33

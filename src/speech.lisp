@@ -43,17 +43,25 @@
 
 (in-package #:glass)
 
-(defvar *speech-voice* (sb-ext:posix-getenv "GLASS_VOICE")
-  "Path to the chord .graph to speak with; GLASS_VOICE by default.  The voice's .bin and
-.config.json are expected beside it.  NIL means the desktop has no voice installed, and SPEAK
-says so rather than guessing at a path.
+(defvar *speech-voice* nil
+  "Path to the chord .graph to speak with, or NIL to ask GLASS_VOICE.  Read it through
+SPEECH-VOICE, which is what every caller here does.  The voice's .bin and .config.json are
+expected beside it.
 
-DEFVAR and not DEFPARAMETER, which is the difference between a knob and a tunable: a launcher
-sets this AFTER loading us (desktop-5903.lisp does, because the path is the machine's and not the
-environment's), and DEFPARAMETER would quietly hand it back its default every time this file was
-hot-loaded.  The desktop would then report no voice installed while the voice sat on disk where
-it always was — a failure that reads as the feature being broken rather than a variable being
-reset.  Nothing here ever wants a reload to change a running desktop's deployment.")
+NIL BY DEFAULT, AND THE ENVIRONMENT CONSULTED AT USE — see *HEARING-MODELS* for the whole
+argument.  Briefly: a DEFVAR's init form runs at LOAD time, which for this image is when the
+core was built, and resuming a core does not run it again.  Initialising from GLASS_VOICE
+therefore captured the build environment and ignored the run one.
+
+This one happened to work, which is worse than failing: kiln's --voice writes the symbol
+directly rather than exporting a variable, so the path that people use was fine while the
+documented environment variable quietly was not.")
+
+(defun speech-voice ()
+  "The voice to speak with: the variable if a launcher set one, else GLASS_VOICE now."
+  (or *speech-voice*
+      (let ((e (sb-ext:posix-getenv "GLASS_VOICE")))
+        (and e (plusp (length e)) e))))
 
 (defparameter *speech-gap-ms* 220
   "Silence inserted between sentences.  Each is synthesized on its own, so without this they
@@ -100,7 +108,7 @@ that loading chord into a running desktop is enough to give it a voice — no re
   "The loaded voice, loading it on first use.  Loading reads 60 MB and takes a moment; doing it
 lazily keeps a desktop that never speaks from paying for a voice."
   (or (spk-voice spk)
-      (let ((path (or *speech-voice*
+      (let ((path (or (speech-voice)
                       (error "glass speech: no voice — set GLASS_VOICE or glass:*speech-voice* ~
                               to a chord .graph"))))
         (setf (spk-voice spk) (funcall (%chord "LOAD-VOICE") path)))))
