@@ -24,11 +24,23 @@
 (defparameter +menu-bg+ (glass:rgb 208 208 208) "Menu background grey.")
 (defparameter +menu-title-bg+ (glass:rgb 188 188 188) "Menu title strip.")
 (defparameter +menu-hi+ (glass:rgb 61 122 138) "Highlighted item (teal).")
-(defconstant +menu-itemh+ 20 "Height of one menu item (px).")
-(defconstant +menu-titleh+ 20 "Height of the menu title strip (px).")
+(defconstant +menu-itemh-1x+ 20 "Height of one menu item, in DESIGN pixels (1x).")
+(defconstant +menu-titleh-1x+ 20 "Height of the menu title strip, in DESIGN pixels (1x).")
+(declaim (inline menu-itemh menu-titleh))
+(defun menu-itemh () (max 1 (round (* +menu-itemh-1x+ *wm-scale*))))
+(defun menu-titleh () (max 1 (round (* +menu-titleh-1x+ *wm-scale*))))
 
 (defstruct wm-menu
-  (x 0) (y 0) (hover -1) (title "Workspace") items fb (child nil))
+  (x 0) (y 0) (hover -1) (title "Workspace") items fb (child nil)
+  ;; THE DENSITY THIS MENU'S FB WAS DRAWN AT, kept beside the pixels rather than looked up.
+  ;; WM-MENU-INDEX divides a click's offset by the item height to get a row, so it must use
+  ;; the height the rows were actually DRAWN at — and it takes no seat, so without this it
+  ;; is correct only when a caller happened to bind *WM-SCALE* first.  It did, in the one
+  ;; path that mattered, which is the worst version of a bug like this: right in production
+  ;; and wrong for anyone who calls it directly, with the failure being a click that
+  ;; highlights one row and opens another.  Storing it makes the framebuffer and the
+  ;; arithmetic that reads it inseparable.
+  (scale 1))
 
 (defun wm-submenu-p (action) (and (consp action) (eq (car action) :submenu)))
 (defun wm-item-action (item) (cdr item))
@@ -1287,43 +1299,70 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
 ;;; ---- workspace root menu ----------------------------------------------------
 
 (defun wm-menu-width (menu)
-  (let ((w (+ 24 (glass:text-width (wm-menu-title menu) :size (wm-size 12) :font (glass:default-font t)))))
-    (dolist (it (wm-menu-items menu) (max 108 w))
-      (let ((pad (if (wm-submenu-p (wm-item-action it)) 46 28)))     ; room for the ▸ arrow
+  (let ((w (+ (round (* 24 *wm-scale*))
+              (glass:text-width (wm-menu-title menu) :size (wm-size 12) :font (glass:default-font t)))))
+    (dolist (it (wm-menu-items menu) (max (round (* 108 *wm-scale*)) w))
+      (let ((pad (round (* (if (wm-submenu-p (wm-item-action it)) 46 28) *wm-scale*))))  ; ▸ room
         (setf w (max w (+ pad (glass:text-width (car it) :size (wm-size 12) :font (glass:default-font t)))))))))
 
 (defun wm-submenu-arrow (fb x y color)
-  "A small right-pointing triangle (▸) marking a submenu item, top-left at (X,Y)."
-  (dotimes (k 5) (glass:fb-vline fb (+ x k) (+ y k) (max 1 (- 9 (* 2 k))) color)))
+  "A small right-pointing triangle (▸) marking a submenu item, top-left at (X,Y).
+   Sized from the density, so it stays the same mark rather than becoming a speck."
+  (let* ((half (max 2 (round (* 4 *wm-scale*))))
+         (hgt  (1+ (* 2 half))))
+    (dotimes (k (1+ half))
+      (glass:fb-vline fb (+ x k) (+ y k) (max 1 (- hgt (* 2 k))) color))))
 
 (defun wm-menu-render (menu)
-  "(Re)build the menu's framebuffer, drawing the current hover highlight."
+  "(Re)build the menu's framebuffer, drawing the current hover highlight.
+
+   Reads *WM-SCALE*, and every caller binds it from the seat the menu belongs to — a menu
+   IS one seat's (SEAT-MENU), so there is always one to ask.  Rendered at 1x inside a 2x
+   desktop it is legible but half-size, which is what a menu that missed the binding looks
+   like: not broken, just visibly not part of the same desktop.
+
+   Text rows are centred by arithmetic rather than by an offset, for the reason
+   WM-RENDER-TITLEBAR gives: 3 was one size's answer to a centring sum, not a position."
   (let* ((n (length (wm-menu-items menu)))
          (w (wm-menu-width menu))
-         (h (+ +menu-titleh+ (* n +menu-itemh+)))
+         (ih (menu-itemh)) (th (menu-titleh))
+         (size (wm-size 12))
+         (h (+ th (* n ih)))
          (fb (glass:make-framebuffer w h +menu-bg+))
-         (font (glass:default-font t)))
-    (glass:fb-rect fb 0 0 w +menu-titleh+ +menu-title-bg+)                 ; title strip
-    (glass:fb-text fb 8 3 (wm-menu-title menu) :size (wm-size 12) :color glass:+black+ :font font)
-    (glass:fb-hline fb 0 (1- +menu-titleh+) w (glass:rgb 120 120 120))
+         (font (glass:default-font t))
+         (padx (round (* 8 *wm-scale*)))
+         (itemx (round (* 14 *wm-scale*))))
+    (setf (wm-menu-scale menu) *wm-scale*)          ; the fb and its metrics travel together
+    (glass:fb-rect fb 0 0 w th +menu-title-bg+)                            ; title strip
+    (glass:fb-text fb padx (max 0 (floor (- th size) 2)) (wm-menu-title menu)
+                   :size size :color glass:+black+ :font font)
+    (glass:fb-hline fb 0 (1- th) w (glass:rgb 120 120 120))
     (loop for it in (wm-menu-items menu) for i from 0
-          for yy = (+ +menu-titleh+ (* i +menu-itemh+))
+          for yy = (+ th (* i ih))
           for hot = (= i (wm-menu-hover menu))
           for ink = (if hot glass:+white+ glass:+black+)
-          do (when hot (glass:fb-rect fb 1 yy (- w 2) +menu-itemh+ +menu-hi+))
-             (glass:fb-text fb 14 (+ yy 3) (car it) :size (wm-size 12) :color ink :font font)
+          do (when hot (glass:fb-rect fb 1 yy (- w 2) ih +menu-hi+))
+             (glass:fb-text fb itemx (+ yy (max 0 (floor (- ih size) 2))) (car it)
+                            :size size :color ink :font font)
              (when (wm-submenu-p (wm-item-action it))
-               (wm-submenu-arrow fb (- w 13) (+ yy 6) ink)))
-    (glass:fb-frame fb 0 0 w h glass:+black+ 1)
+               (wm-submenu-arrow fb (- w (round (* 13 *wm-scale*)))
+                                 (+ yy (floor (- ih (round (* 9 *wm-scale*))) 2)) ink)))
+    (glass:fb-frame fb 0 0 w h glass:+black+ (wm-border))
     (setf (wm-menu-fb menu) fb)))
 
 (defun wm-menu-index (menu x y)
-  "For screen (X,Y): an item index, :title over the title strip, or :outside."
-  (let* ((mx (wm-menu-x menu)) (my (wm-menu-y menu)) (fb (wm-menu-fb menu)))
+  "For screen (X,Y): an item index, :title over the title strip, or :outside.
+
+   Measured at the density the menu was RENDERED at, taken from the menu itself rather than
+   from the ambient binding — see WM-MENU-SCALE.  A row is found by dividing by the item
+   height, so reading a different height than the one the rows were drawn at picks a
+   different row: at 2x with 1x metrics, the middle of row 1 indexes as row 4."
+  (let* ((*wm-scale* (wm-menu-scale menu))
+         (mx (wm-menu-x menu)) (my (wm-menu-y menu)) (fb (wm-menu-fb menu)))
     (if (and (<= mx x (+ mx (glass:fb-width fb) -1)) (<= my y (+ my (glass:fb-height fb) -1)))
         (let ((yl (- y my)))
-          (if (< yl +menu-titleh+) :title
-              (let ((i (floor (- yl +menu-titleh+) +menu-itemh+)))
+          (if (< yl (menu-titleh)) :title
+              (let ((i (floor (- yl (menu-titleh)) (menu-itemh))))
                 (if (< i (length (wm-menu-items menu))) i :title))))
         :outside)))
 
@@ -1331,7 +1370,7 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
   "Render MENU and position it on SEAT's screen, top-left near (X,Y) but kept in that
    seat's bounds — a menu clamps to the screen it opened on, which is why this needs a
    seat and not a port: the two screens are different sizes."
-  (wm-menu-render menu)
+  (with-seat-scale (seat) (wm-menu-render menu))
   (setf (wm-menu-x menu) (max 0 (min x (- (seat-screen-w seat) (glass:fb-width (wm-menu-fb menu)))))
         (wm-menu-y menu) (max 0 (min y (- (seat-screen-h seat) (glass:fb-height (wm-menu-fb menu))))))
   menu)
@@ -1637,13 +1676,23 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
   "Open ACTION's submenu as PARENT's child, to the right of PARENT's item IDX."
   (let ((sub (make-wm-menu :hover -1 :title (car (nth idx (wm-menu-items parent)))
                            :items (cdr action))))                ; (:submenu ITEM...) -> ITEMs
-    (wm-menu-render sub)
+    (with-seat-scale (seat) (wm-menu-render sub))
     (setf (wm-menu-child parent)
           (wm-place-menu sub seat
                          (+ (wm-menu-x parent) (glass:fb-width (wm-menu-fb parent)) -2)
-                         (+ (wm-menu-y parent) +menu-titleh+ (* idx +menu-itemh+) -1)))))
+                         (+ (wm-menu-y parent) (menu-titleh) (* idx (menu-itemh)) -1)))))
 
 (defun wm-menu-pointer (port root mask x y &optional seat)
+  "Route a pointer event to the open menu chain, at that seat's density.
+
+   Binds for BOTH halves at once, which is the point of wrapping rather than sprinkling:
+   this function re-renders menus (hover) and hit-tests them (WM-MENU-INDEX, which divides
+   by the item height).  A hover drawn at 2x and indexed at 1x would highlight one row and
+   act on another — the menu equivalent of the title-bar drift, and just as silent."
+  (with-seat-scale ((port-seat port seat))
+    (%wm-menu-pointer port root mask x y seat)))
+
+(defun %wm-menu-pointer (port root mask x y &optional seat)
   "Route a pointer event to the open menu tree ROOT (a menu + its submenu chain).
    Hover opens/closes submenus; a left-press on a leaf runs it and dismisses all;
    a click off every menu dismisses.

@@ -79,6 +79,50 @@
                 (format nil "box ~a, probe (~a,~a) -> ~s" box tx ty what))))
         (ignore-errors (clim-glass::wm-close-window p surf seat))
         (sleep 0.3)))))
+
+(format t "~&== pop-up menus scale, and a click finds the row it highlighted ==~%")
+;; The menu is the case that showed why binding at CALL SITES is not enough.  It rendered
+;; through paths that bound the density and was INDEXED through one that did not, so at 2x
+;; the middle of row 1 came back as row 4: the highlight follows the pointer and the click
+;; opens something else.  A menu now carries the scale its framebuffer was drawn at, so the
+;; pixels and the arithmetic that reads them cannot come apart.
+(defvar *pass* 0) (defvar *fail* 0)
+(defun ok (n g &optional d)
+  (if g (progn (incf *pass*) (format t "  [pass] ~a~@[ — ~a~]~%" n d))
+      (progn (incf *fail*) (format t "  [FAIL] ~a~@[ — ~a~]~%" n d))))
+(let ((p (clim-glass:make-wm-session :width 1400 :height 900)))
+  (clim-glass:start-wm-session p '())
+  (sb-thread:make-thread (lambda () (clim-glass:run-wm-loop p)) :name "m")
+  (sleep 1.5)
+  (let ((seat (clim-glass:port-seat p)) (sizes '()))
+    (dolist (sc '(1 3/2 2))
+      (setf (clim-glass:seat-scale seat) sc)
+      ;; open the root menu the way a click does
+      (clim-glass::wm-open-menu p 200 200 seat)
+      (sleep 0.5)
+      (let* ((menu (clim-glass::seat-menu seat))
+             (fb (and menu (clim-glass::wm-menu-fb menu))))
+        (if (null fb)
+            (ok (format nil "menu opens at ~a x" sc) nil "no menu framebuffer")
+            (let ((w (glass:fb-width fb)) (h (glass:fb-height fb)))
+              (push (list sc w h) sizes)
+              (ok (format nil "menu opens at ~a x" sc) t (format nil "~ax~a" w h))
+              ;; hit-testing must find the row the render drew
+              (let* ((ih (clim-glass::with-seat-scale (seat) (clim-glass::menu-itemh)))
+                     (th (clim-glass::with-seat-scale (seat) (clim-glass::menu-titleh)))
+                     (mx (clim-glass::wm-menu-x menu)) (my (clim-glass::wm-menu-y menu))
+                     ;; the middle of item 1
+                     (probe-y (+ my th ih (floor ih 2)))
+                     (idx (clim-glass::wm-menu-index menu (+ mx 20) probe-y)))
+                (ok (format nil "...and row 1 hit-tests as row 1 at ~a x" sc)
+                    (eql idx 1) (format nil "index ~s" idx))))))
+      (setf (clim-glass::seat-menu seat) nil)
+      (sleep 0.3))
+    (let ((s1 (assoc 1 sizes)) (s2 (assoc 2 sizes)))
+      (ok "a 2x menu is about twice a 1x menu"
+          (and s1 s2 (< 1.7 (/ (third s2) (float (third s1))) 2.3))
+          (format nil "1x ~ax~a vs 2x ~ax~a" (second s1) (third s1) (second s2) (third s2))))))
+
 (format t "~&~d passed, ~d failed~%=> ~:[FAIL~;PASS~]~%" *pass* *fail* (zerop *fail*))
 (finish-output)
 (sb-ext:exit :code (if (plusp *fail*) 1 0))
