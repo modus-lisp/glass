@@ -252,6 +252,27 @@
    (fb       :initarg :fb       :initform nil     :accessor seat-fb)
    (screen-w :initarg :screen-w :initform 1000    :accessor seat-screen-w)
    (screen-h :initarg :screen-h :initform 720     :accessor seat-screen-h)
+   ;; HOW BIG A PIXEL MEANS, which is a different question from how many there are.
+   ;;
+   ;; On the SEAT and not on the session, for the reason the wallpaper below already gives:
+   ;; two people watching one session from a phone at 3x and a laptop at 2x want the same
+   ;; desktop and different pixels, and a session-wide answer would make one of them wrong
+   ;; depending on who connected first.
+   ;;
+   ;; Not on the framebuffer either.  A framebuffer is a rectangle of real pixels — a good
+   ;; definition that should not acquire a second kind of pixel.  SCREEN-W and SCREEN-H stay
+   ;; device pixels and every drawing primitive keeps taking them; this says only what a
+   ;; LAYOUT number is multiplied by before it becomes one.
+   ;;
+   ;; Rational rather than integer: 3/2 is a scale real displays use, and rounding it away
+   ;; at the door would make fractional scaling unreachable later rather than merely
+   ;; unimplemented.  1 means what it has always meant, so nothing moves until a viewer that
+   ;; knows its own density says otherwise.
+   ;;
+   ;; Text is the first and cheapest consumer (SEAT-PPEM): scribe rasterises from outlines
+   ;; at whatever ppem it is handed, so scaling that number makes glyphs sharper rather than
+   ;; bigger and blurrier.  docs/density-and-colour.md has the rest.
+   (scale    :initarg :scale    :initform 1       :accessor seat-scale)
    ;; The wallpaper is per-seat because it is rasterised AT THE SCREEN SIZE: a phone
    ;; seat and a desktop seat looking at the same session want the same image and not
    ;; the same pixels.  The PATH is the session's taste; these are one seat's pixels.
@@ -312,6 +333,37 @@
   (:documentation "One person's screen, hands, and arrangement of a shared session."))
 
 ;;; ---- the two questions that used to be one --------------------------------
+
+
+;;; ---- density, applied ---------------------------------------------------------
+;;; One function, so that "multiply by the scale" is written once and rounded once.
+;;; Every layout number that becomes device pixels should come through something like
+;;; this rather than doing the arithmetic at the call site, because the rounding is the
+;;; part that goes subtly wrong when it is spread out — a title bar rounded up and its
+;;; contents rounded down is a one-pixel seam that nobody can find later.
+
+(defun seat-ppem (seat ppem)
+  "PPEM in device pixels for SEAT: the requested size scaled by the seat's density.
+
+Text is where density pays first and most visibly.  scribe:RASTERIZE-GLYPH scales the
+outline by ppem/upem out of font units and grid-fits at the target size, so a doubled ppem
+is a genuine re-rasterisation — sharper, not bigger.  That is the whole reason this is
+cheap here and expensive in systems that ship bitmaps.
+
+NIL SEAT is answered rather than refused: plenty of callers make a terminal before any seat
+is in hand, and a font size is not the place to start signalling about it."
+  (let ((s (if seat (seat-scale seat) 1)))
+    (max 1 (round (* ppem s)))))
+
+(defun seat-metric (seat n)
+  "A layout constant N in device pixels for SEAT — a title-bar height, an inset, a cascade
+step.  The companion to SEAT-PPEM, and deliberately the same shape, so that converting the
+rest of the window manager later is a substitution and not a redesign.
+
+Named METRIC and not PX because SEAT-PX is already this seat's pointer x, which is the kind
+of collision that is obvious once and invisible afterwards."
+  (let ((s (if seat (seat-scale seat) 1)))
+    (max 1 (round (* n s)))))
 
 (defun seat-home-p (seat)
   "Is SEAT the HOME seat — the one that inherits the resources a session has exactly one

@@ -115,7 +115,8 @@
    point does, in one place, so `(wm-hit port x y)' still means what it always did."
   (or seat (glass-port-default-seat port)))
 
-(defun add-seat (port &key name (port-num 5900) (width 1000) (height 720) primary fb)
+(defun add-seat (port &key name (port-num 5900) (width 1000) (height 720) primary fb
+                           (scale 1))
   "Attach a new SEAT to PORT: a screen of its own at WIDTH x HEIGHT, its own hands, and
    an empty set of views (so it sees the session's windows exactly where they stand).
    The FIRST seat is the HOME seat: it inherits the things a session has exactly one of
@@ -135,6 +136,10 @@
          (seat (make-instance 'seat :name (or name (format nil "seat-~d" port-num))
                                     :port port :primary primary :port-num port-num
                                     :screen-w width :screen-h height
+                                    ;; Device pixels above; what one MEANS here.  1 is the old
+                                    ;; behaviour exactly, and a viewer that knows its own density
+                                    ;; passes something else.  See docs/density-and-colour.md.
+                                    :scale scale
                                     :fb fb
                                     ;; The first seat IS the session's selection, so a
                                     ;; one-seat desktop keeps having exactly one and

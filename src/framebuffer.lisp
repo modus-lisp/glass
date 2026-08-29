@@ -4,12 +4,55 @@
 ;;;; array — the same value the RFB pixel format advertises, so serving a rect is
 ;;;; just writing the pixels out little-endian.  All drawing is clipped to the
 ;;;; framebuffer bounds, so callers never have to bounds-check.
+;;;;
+;;;; AND THEY ARE sRGB, which until now was true and unwritten.  See
+;;;; +PIXEL-COLOUR-SPACE+ below: the numbers meant something specific all along, and
+;;;; the only cost of never saying so is that nothing can reason about it.
 
 (in-package #:glass)
 
+;;; ---- what a pixel MEANS -----------------------------------------------------
+;;; Distinct from what a pixel IS, which the header above describes.  Every channel
+;;; here is sRGB: 8 bits, non-linear, the IEC 61966-2-1 transfer curve, Rec.709
+;;; primaries, D65 white.  That is what a browser assumes of an untagged image, what
+;;; RFB clients assume of a framebuffer, and what these numbers have always been —
+;;; the change is only that it is now stated.
+;;;
+;;; It is stated because a colour space you have not named cannot be converted FROM.
+;;; A wider one (10-bit, Rec.2020, PQ) is four layers of work away — see
+;;; docs/density-and-colour.md — and none of that work can even be described while
+;;; the current space is an assumption living in nobody's head in particular.
+;;;
+;;; NOT a promise that anything is colour-managed.  Nothing converts, and nothing
+;;; should start converting on the strength of this constant existing; it records
+;;; what is true so that a future second answer has a first one to differ from.
+;;;
+;;; The distinction that matters most is already made elsewhere and deliberately:
+;;; gesso composites coverage in LINEAR light (via scribe) while blitting images in
+;;; device space, because those are genuinely different operations on these values.
+;;; That is the hard half of colour management and it predates this note.
+
+(defconstant +pixel-colour-space+ :srgb
+  "The colour space of every pixel in a FRAMEBUFFER: sRGB, 8 bits per channel,
+non-linear, Rec.709 primaries, D65 white.
+
+Recorded rather than enforced.  Read it when code needs to state an assumption it is
+already making — an encoder describing its output, an image decoder deciding whether
+to convert — and do not read it as a claim that any conversion happens.")
+
 (declaim (inline rgb))
 (defun rgb (r g b)
-  "An X8R8G8B8 pixel from 8-bit R, G, B."
+  "An X8R8G8B8 pixel from 8-bit sRGB R, G, B.
+
+The channels are sRGB-encoded, NOT linear light: 128 is the middle of the encoding and
+about 21% of the light.  Anything averaging or interpolating these values — a blend, a
+gradient, a downscale — is wrong in the dark unless it converts first, which is why
+gesso does its coverage blending in linear space and says so.  See
++PIXEL-COLOUR-SPACE+.
+
+Keep constructing pixels through here rather than packing the integer by hand: it is
+the one place the representation is decided, and the only reason a future widening
+would not have to visit every call site in the tree."
   (logior (ash (logand r #xff) 16) (ash (logand g #xff) 8) (logand b #xff)))
 
 (defconstant +black+ #x000000)

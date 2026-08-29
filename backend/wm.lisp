@@ -1817,8 +1817,14 @@
                          :copy-p copy-p :close-fn close-fn :resize-fn resize-fn)))))
 
 (defun wm-add-terminal (port &key (cols 80) (rows 24) (ppem 14))
-  "Create a terminal (shell in a pty) and add it as a WM surface window."
-  (let* ((tm (glass-term:make-terminal :cols cols :rows rows :ppem ppem))
+  "Create a terminal (shell in a pty) and add it as a WM surface window.
+
+   PPEM is scaled by the density of the seat that asked for the window — the FIRST place
+   glass consults SEAT-SCALE, and the cheapest.  scribe rasterises glyphs from outlines at
+   whatever ppem it is handed, so on a 2x seat this is a sharper terminal rather than a
+   bigger one; on a 1x seat the arithmetic is the identity and nothing moves."
+  (let* ((ppem (seat-ppem (port-seat port *wm-spawn-seat*) ppem))
+         (tm (glass-term:make-terminal :cols cols :rows rows :ppem ppem))
          (c (glass-port-cascade port)))
     (glass-term:start-pump tm)
     (wm-add-surface* port
@@ -1831,8 +1837,12 @@
                        :close-fn (lambda () (glass-term:kill-terminal tm))))))
 
 (defun wm-add-tabterm (port &key (cols 80) (rows 24) (ppem 14))
-  "A tabbed terminal (several shells, a tab bar) as a WM surface window."
-  (let ((tt (glass-term:make-tabbed-terminal :cols cols :rows rows :ppem ppem))
+  "A tabbed terminal (several shells, a tab bar) as a WM surface window.
+
+   Density-scaled the same way as WM-ADD-TERMINAL; see there."
+  (let ((tt (glass-term:make-tabbed-terminal
+             :cols cols :rows rows
+             :ppem (seat-ppem (port-seat port *wm-spawn-seat*) ppem)))
         (c (glass-port-cascade port)))
     (wm-add-surface* port
       (make-wm-surface :fb (glass-term:tabterm-fb tt)
@@ -2371,7 +2381,7 @@
 
 (defun add-wm-seat (port &key port-num (width 1000) (height 720) name background
                               (background-mode :cover) (audio t) (serve t)
-                              (address :default)
+                              (address :default) (scale 1)
                               (kind *seat-transport-kind*) path)
   "Attach a SECOND (third, …) person to a running desktop: a screen of their own at
    WIDTH x HEIGHT serving on PORT-NUM, with their own pointer, keyboard, focus, menu,
@@ -2404,7 +2414,8 @@
 
    Returns the seat."
   (check-type port-num (integer 1 65535))
-  (let ((seat (add-seat port :name (or name (format nil "seat-~d" port-num))
+  (let ((seat (add-seat port :scale scale
+                             :name (or name (format nil "seat-~d" port-num))
                              :port-num port-num :width width :height height
                              :fb (glass:make-framebuffer width height +wm-teal+))))
     ;; A seat added to a session that already has a wallpaper gets that wallpaper, cut

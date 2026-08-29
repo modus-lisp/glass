@@ -16,6 +16,7 @@
    #:fb-clip #:with-fb-clip #:with-fb-locked-or #:fb-frameno #:fb-damage #:fb-copy #:fb-mark-frame #:fb-take-frame #:fb-take-copy
    #:fb-put #:fb-get #:fb-fill #:fb-rect #:fb-hline #:fb-vline #:fb-frame #:fb-blit #:fb-move-rect
    #:rgb #:+black+ #:+white+ #:+red+ #:+green+ #:+blue+
+   #:+pixel-colour-space+
    ;; text (the :glass/text system; scribe-backed)
    #:fb-text #:text-width #:load-font #:default-font
    ;; server: (serve fb port &key on-key on-pointer on-resize name once wake)

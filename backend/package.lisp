@@ -10,6 +10,7 @@
            #:run-wm                      ; a session, AND its home seat exposed on a wire
            #:run-session                 ; …just the session: nothing listens
            #:make-wm-session #:start-wm-session #:run-wm-loop   ; the three RUN-WM is made of
+           #:seat-scale #:seat-ppem #:seat-metric  ; pixel density: see docs/density-and-colour.md
            #:register-app                ; register an external app in the root menu
            #:add-surface                 ; launch any external glass-surface app as a window
            ;; a seat is what you connect to; a transport is what carries it
