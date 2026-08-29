@@ -264,8 +264,37 @@
 (defmethod window-own-z ((m glass-mirror)) (wm-window-z m))
 (defmethod (setf window-own-z) (v (m glass-mirror)) (setf (wm-window-z m) v))
 
-(defconstant +wm-titleh+ 22 "OPEN LOOK title-bar height (px).")
-(defconstant +wm-border+ 1  "Window border thickness (px).")
+(defconstant +wm-titleh-1x+ 22 "OPEN LOOK title-bar height, in DESIGN pixels (1x).")
+(defconstant +wm-border-1x+ 1  "Window border thickness, in DESIGN pixels (1x).")
+
+(defvar *wm-scale* 1
+  "The density of the seat currently being drawn for, hit-tested against, or placed into.
+
+WHY A DYNAMIC VARIABLE and not an argument.  Chrome geometry is consumed in two places that
+must agree exactly — the compositor that DRAWS a title bar and the hit test that decides a
+click landed on one.  If those ever disagree by a factor, windows draw in one place and drag
+from another, which is the single worst way this could go wrong.  Threading a seat through
+both would mean changing the signature of everything between, including WM-FRAME and
+WM-RENDER-TITLEBAR which take neither a seat nor a port and have no business learning about
+them.  So the seat binds it once, at each entry point that knows which seat it is acting
+for, and everything below reads the same number by construction.
+
+The seat still OWNS the density — see SEAT-SCALE.  This is only how it is carried into code
+that cannot be handed it.  1 is the value when nobody has bound it, which is exactly the
+behaviour every desktop had before density existed.")
+
+(declaim (inline wm-titleh wm-border))
+(defun wm-titleh () (max 1 (round (* +wm-titleh-1x+ *wm-scale*))))
+(defun wm-border () (max 1 (round (* +wm-border-1x+ *wm-scale*))))
+
+(defmacro with-seat-scale ((seat) &body body)
+  "Run BODY with *WM-SCALE* bound to SEAT's density.  Every entry point that knows which
+seat it is working for should use this, and the ones that do are why drawing and hit-testing
+cannot drift apart."
+  (let ((s (gensym "SEAT")))
+    `(let* ((,s ,seat)
+            (*wm-scale* (if ,s (seat-scale ,s) *wm-scale*)))
+       ,@body)))
 
 (defmethod realize-mirror ((port glass-port) (sheet climi::mirrored-sheet-mixin))
   (let ((mirror (make-instance 'glass-mirror)))
@@ -294,7 +323,7 @@
           ;; 0,0); only the on-screen mirror position shifts.  glass-mirror-x/y is then
           ;; read back from McCLIM's region in set-mirror-geometry (below).
           (setf (sheet-transformation sheet)
-                (make-translation-transformation (+ 40 c) (+ 40 c +wm-titleh+))
+                (make-translation-transformation (+ 40 c) (+ 40 c (wm-titleh)))
                 (glass-port-cascade port) (mod (+ c 28) 200)))))
     (climi::update-mirror-geometry sheet)          ; creates the render image (via set-mirror-geometry)
     (dispatch-repaint sheet climi::+everywhere+)
@@ -895,6 +924,18 @@
                       (setf (aref dpx (+ frow fx)) (logand (aref arr iy ix) #x00ffffff)))))))))))))
 
 (defun composite-seat (seat &optional damage copy)
+  "Redraw one seat's screen at that seat's density.
+
+The only thing this adds to %COMPOSITE-SEAT is the *WM-SCALE* binding, and it is a
+separate function so that the binding cannot be forgotten: every caller in the tree already
+calls COMPOSITE-SEAT, so every existing draw picks up the right density without being
+edited.  Drawing and hit-testing agreeing is the property that matters most here (see
+*WM-SCALE*), and it is bought by binding at the two entry points rather than by trusting
+every call site to pass a number."
+  (with-seat-scale (seat)
+    (%composite-seat seat damage copy)))
+
+(defun %composite-seat (seat &optional damage copy)
   "Redraw ONE SEAT's screen.  DAMAGE = (x y w h) IN THAT SEAT'S SCREEN COORDINATES
    confines the redraw (and the RFB sender's diff) to that rectangle — the compositor
    already knows what changed, so an idle move/blink doesn't rebuild + re-diff the

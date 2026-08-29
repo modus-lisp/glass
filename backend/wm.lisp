@@ -53,10 +53,10 @@
 (defun wm-render-titlebar (title width &optional (bg +wm-title-bg+))
   "A glass framebuffer of an OPEN LOOK title bar WIDTH px wide — drawn entirely
    with glass primitives + scribe text (no McCLIM)."
-  (let ((tb (glass:make-framebuffer (max 1 width) +wm-titleh+ bg)))
-    (glass:fb-hline tb 0 (1- +wm-titleh+) width (glass:rgb 120 120 120))       ; bottom shadow line
+  (let ((tb (glass:make-framebuffer (max 1 width) (wm-titleh) bg)))
+    (glass:fb-hline tb 0 (1- (wm-titleh)) width (glass:rgb 120 120 120))       ; bottom shadow line
     ;; menu button box: raised bevel + abbreviated-menu wedge
-    (let* ((bs (- +wm-titleh+ 8)) (bx 4) (by 4))
+    (let* ((bs (- (wm-titleh) 8)) (bx 4) (by 4))
       (glass:fb-rect tb bx by bs bs (glass:rgb 188 188 188))
       (glass:fb-hline tb bx by bs glass:+white+)                                ; top light
       (glass:fb-vline tb bx by bs glass:+white+)                               ; left light
@@ -66,7 +66,7 @@
         (dotimes (i 4) (glass:fb-hline tb (- cx (- 3 i)) (+ cy i) (max 1 (- 7 (* 2 i))) glass:+black+))))
     ;; centred bold title, anti-aliased via scribe
     (let ((tw (glass:text-width title :size 12 :font (glass:default-font t))))
-      (glass:fb-text tb (max (+ +wm-titleh+ 6) (floor (- width tw) 2)) 3 title
+      (glass:fb-text tb (max (+ (wm-titleh) 6) (floor (- width tw) 2)) 3 title
                      :size 12 :color glass:+black+ :font (glass:default-font t)))
     tb))
 
@@ -250,11 +250,11 @@
 (defun wm-frame (fb cx cy cw ch deco content-fn)
   "Draw a decorated window: DECO title bar above the content at (cx,cy) size
    (cw,ch), the content via CONTENT-FN, then a border + corner marks."
-  (let* ((ty (- cy +wm-titleh+)) (wx (- cx +wm-border+)) (wy (- ty +wm-border+))
-         (ww (+ cw (* 2 +wm-border+))) (wh (+ +wm-titleh+ ch (* 2 +wm-border+))))
+  (let* ((ty (- cy (wm-titleh))) (wx (- cx (wm-border))) (wy (- ty (wm-border)))
+         (ww (+ cw (* 2 (wm-border)))) (wh (+ (wm-titleh) ch (* 2 (wm-border)))))
     (blit-fb deco cx ty fb)
     (funcall content-fn)
-    (glass:fb-frame fb wx wy ww wh glass:+black+ +wm-border+)
+    (glass:fb-frame fb wx wy ww wh glass:+black+ (wm-border))
     (wm-corners fb wx wy ww wh)))
 
 (defun wm-draw-window (mirror fb &optional seat)
@@ -953,8 +953,8 @@
             (multiple-value-bind (w h) (image-wh img)
               (values (seat-draw-x seat obj) (seat-draw-y seat obj) w h))))
     (when cx
-      (list (- cx +wm-border+) (- cy +wm-titleh+ +wm-border+)
-            (+ cw (* 2 +wm-border+)) (+ +wm-titleh+ ch (* 2 +wm-border+))))))
+      (list (- cx (wm-border)) (- cy (wm-titleh) (wm-border))
+            (+ cw (* 2 (wm-border))) (+ (wm-titleh) ch (* 2 (wm-border)))))))
 
 (defun wm-window-box-at (obj cx cy)
   "The decorated (x y w h) OBJ WOULD occupy if its content were at (CX,CY) — for the
@@ -966,8 +966,8 @@
           (when-let ((img (mcclim-render::image-mirror-image obj)))
             (image-wh img)))
     (when cw
-      (list (- cx +wm-border+) (- cy +wm-titleh+ +wm-border+)
-            (+ cw (* 2 +wm-border+)) (+ +wm-titleh+ ch (* 2 +wm-border+))))))
+      (list (- cx (wm-border)) (- cy (wm-titleh) (wm-border))
+            (+ cw (* 2 (wm-border))) (+ (wm-titleh) ch (* 2 (wm-border)))))))
 
 ;;; ---- adaptive drag: opaque when the link keeps up, wireframe when it can't -----
 ;;; Moving a window OPAQUELY re-encodes it each frame — cheap on a client that can
@@ -1092,6 +1092,14 @@
       (clim-sheet-goto port obj (seat-window-x seat obj) (seat-window-y seat obj)))))
 
 (defun wm-hit (port x y &optional seat)
+  "What is at (X,Y) on SEAT's screen — the chrome half of the pair that must agree with
+the compositor.  See *WM-SCALE*: a hit test that used 1x chrome against a 2x drawing would
+put every title bar somewhere other than where it is shown, so the density is bound here
+for the same reason and in the same way COMPOSITE-SEAT binds it."
+  (with-seat-scale ((port-seat port seat))
+    (%wm-hit port x y seat)))
+
+(defun %wm-hit (port x y &optional seat)
   "Topmost window whose decoration or content contains (X,Y) ON SEAT'S SCREEN: (values obj REGION cx cy
    cw ch), REGION one of :winmenu (title-bar menu button) / :resize (bottom-right corner
    grab) / :title / :content; NIL over the workspace.
@@ -1104,7 +1112,7 @@
    Unmanaged mirrors are skipped, as they always were: a CLIM pull-down gets its events
    through the grab-sheet path, not through the WM's hit test."
   (flet ((test (cx cy cw ch obj)
-           (let ((ty (- cy +wm-titleh+)) (rz 16))
+           (let ((ty (- cy (wm-titleh))) (rz 16))
              (cond
                ((and (<= (+ cx 4) x (+ cx 18)) (<= (+ ty 4) y (+ ty 18)))           ; wedge = Window Menu
                 (list obj :winmenu cx cy cw ch))
@@ -1121,7 +1129,7 @@
                     (when-let ((image (mcclim-render::image-mirror-image w)))
                       (multiple-value-bind (cw ch) (image-wh image)
                         (test (seat-window-x seat w) (seat-window-y seat w) cw ch w)))))))
-        (when hit (return-from wm-hit (values-list hit)))))))
+        (when hit (return-from %wm-hit (values-list hit)))))))
 
 (defun wm-raise (port obj &optional seat)
   "Move OBJ to the front of SEAT's stacking order, whichever kind of window it is,
@@ -1221,10 +1229,10 @@
             (setf (wm-surface-saved-geom obj)
                   (list (seat-window-x seat obj) (seat-window-y seat obj)
                         (glass:fb-width (wm-surface-fb obj)) (glass:fb-height (wm-surface-fb obj))))
-            (seat-move-window seat obj +wm-border+ (+ +wm-titleh+ +wm-border+))
+            (seat-move-window seat obj (wm-border) (+ (wm-titleh) (wm-border)))
             (funcall (wm-surface-resize-fn obj)
-                     (- (seat-screen-w seat) (* 2 +wm-border+))
-                     (- (seat-screen-h seat) +wm-titleh+ (* 2 +wm-border+)))))
+                     (- (seat-screen-w seat) (* 2 (wm-border)))
+                     (- (seat-screen-h seat) (wm-titleh) (* 2 (wm-border))))))
       ;; the size changed for everybody, so everybody repaints
       (composite-all port))))
 
@@ -1812,7 +1820,7 @@
     (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn resize-fn)
         (funcall make-fn fb)
       (wm-add-surface* port
-        (make-wm-surface :fb fb :x (+ 40 c) :y (+ 40 c +wm-titleh+) :title title
+        (make-wm-surface :fb fb :x (+ 40 c) :y (+ 40 c (wm-titleh)) :title title
                          :on-key on-key :on-pointer on-pointer :dirty-p dirty-p
                          :copy-p copy-p :close-fn close-fn :resize-fn resize-fn)))))
 
@@ -1829,7 +1837,7 @@
     (glass-term:start-pump tm)
     (wm-add-surface* port
       (make-wm-surface :fb (glass-term:terminal-fb tm)
-                       :x (+ 40 c) :y (+ 40 c +wm-titleh+) :title "terminal"
+                       :x (+ 40 c) :y (+ 40 c (wm-titleh)) :title "terminal"
                        :on-key (lambda (down k) (glass-term:on-key tm down k))
                        :on-pointer (lambda (mask lx ly) (glass-term:on-mouse tm mask lx ly))
                        :dirty-p (lambda () (glass-term:terminal-take-dirty tm))
@@ -1846,7 +1854,7 @@
         (c (glass-port-cascade port)))
     (wm-add-surface* port
       (make-wm-surface :fb (glass-term:tabterm-fb tt)
-                       :x (+ 40 c) :y (+ 40 c +wm-titleh+) :title "terminal"
+                       :x (+ 40 c) :y (+ 40 c (wm-titleh)) :title "terminal"
                        :on-key (lambda (down k) (glass-term:tabterm-on-key tt down k))
                        :on-pointer (lambda (mask lx ly) (glass-term:tabterm-on-mouse tt mask lx ly))
                        :dirty-p (lambda () (glass-term:tabterm-take-dirty tt))
@@ -1898,7 +1906,7 @@
            (app (funcall attach-b url fb)))
       (prog1
           (wm-add-surface* port
-            (make-wm-surface :fb fb :x (+ 40 c) :y (+ 40 c +wm-titleh+)
+            (make-wm-surface :fb fb :x (+ 40 c) :y (+ 40 c (wm-titleh))
                              :title "browser"
                              ;; What this window has highlighted at the moment somebody
                              ;; asks — loom reads its live page selection, the same state
@@ -1997,7 +2005,7 @@
                                      (round (+ (* b a) (* bg (- 255 a))) 255)))))))))
       (let ((c (glass-port-cascade port)))
         (wm-add-surface* port
-          (make-wm-surface :fb fb :x (+ 40 c) :y (+ 40 c +wm-titleh+)
+          (make-wm-surface :fb fb :x (+ 40 c) :y (+ 40 c (wm-titleh))
                            :title (file-namestring path)
                            :dirty-p (constantly nil)))))))     ; static: never needs recompositing
 
@@ -2109,7 +2117,10 @@
    its keyboard goes to the seat that picked it off the menu."
   (if (functionp action)
       (funcall action)
-      (let ((*wm-spawn-seat* (port-seat port seat)))
+      (let* ((*wm-spawn-seat* (port-seat port seat))
+             ;; ...and its density, so a window placed by this seat is placed with the
+             ;; same chrome the compositor will draw around it.
+             (*wm-scale* (if *wm-spawn-seat* (seat-scale *wm-spawn-seat*) *wm-scale*)))
         (wm-spawn-spec port action)
         (composite-all port))))
 
