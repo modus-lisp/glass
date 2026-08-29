@@ -197,6 +197,19 @@
 ;;; are the ones a DEFSTRUCT would have made, so nothing else changes.
 (defclass wm-surface ()
   ((fb        :initarg :fb        :initform nil        :accessor wm-surface-fb)
+   ;; HOW MUCH BIGGER THIS WINDOW IS THAN ITS CONTENT.
+   ;;
+   ;; An application that draws at a fixed number of pixels per character is drawing for one
+   ;; density; on a screen with twice as many pixels it comes out half the size.  That is not
+   ;; a bug in the application and there is nothing it can do about it without being told —
+   ;; so the WM magnifies what it drew, which is what every desktop does for a program that
+   ;; does not ask about density, and the only thing that can be done without its cooperation.
+   ;;
+   ;; 1 means the content is already in device pixels and nothing is scaled: a terminal makes
+   ;; its own framebuffer at the ppem it was given (SEAT-PPEM), so it is sharp at any density
+   ;; and must not also be magnified.  The distinction is exactly "does this thing take a size
+   ;; in pixels and mean it".
+   (content-scale :initarg :content-scale :initform 1 :accessor wm-surface-content-scale)
    (x         :initarg :x         :initform 60         :accessor wm-surface-x)
    (y         :initarg :y         :initform 60         :accessor wm-surface-y)
    (title     :initarg :title     :initform "window"   :accessor wm-surface-title)
@@ -683,7 +696,11 @@
    between them would leave the hint one translation behind the pixels it names.  Only
    one CopyRect can ride an RFB update, so if two windows scroll at once the larger
    block wins and the other simply rides the diff."
-  (let* ((sfb (wm-surface-fb surf)) (cw (glass:fb-width sfb)) (ch (glass:fb-height sfb))
+  (let* ((sfb (wm-surface-fb surf))
+         (cs (wm-surface-content-scale surf))
+         ;; THE WINDOW IS THE CONTENT MAGNIFIED, so every size below is the DRAWN one and
+         ;; the frame, the title bar and the damage all agree without knowing about it.
+         (cw (round (* (glass:fb-width sfb) cs))) (ch (round (* (glass:fb-height sfb) cs)))
          (sx (seat-window-x seat surf)) (sy (seat-window-y seat surf)))
     (wm-frame fb sx sy cw ch (wm-surface-deco* surf cw)
               (lambda ()
@@ -705,7 +722,12 @@
                         (when (or (null cur)
                                   (> (* (fifth c) (sixth c)) (* (fifth cur) (sixth cur))))
                           (setf (seat-frame-copy seat) c)))))
-                  (blit-fb sfb sx sy fb))))))
+                  (if (= cs 1)
+                      (blit-fb sfb sx sy fb)
+                      ;; No CopyRect for a magnified surface: the hint above describes a translation in
+                      ;; the SOURCE's pixels, and at a scale those are not the screen's — sending it would
+                      ;; move the wrong number of rows.
+                      (glass:fb-blit-scaled fb sfb sx sy cs)))))))
 
 (defun %svg-path-p (path)
   (let ((s (string-downcase (princ-to-string path))))
@@ -1016,7 +1038,8 @@
   (multiple-value-bind (cx cy cw ch)
       (if (wm-surface-p obj)
           (values (seat-draw-x seat obj) (seat-draw-y seat obj)
-                  (glass:fb-width (wm-surface-fb obj)) (glass:fb-height (wm-surface-fb obj)))
+                  (round (* (glass:fb-width (wm-surface-fb obj)) (wm-surface-content-scale obj)))
+                  (round (* (glass:fb-height (wm-surface-fb obj)) (wm-surface-content-scale obj))))
           (when-let ((img (mcclim-render::image-mirror-image obj)))
             (multiple-value-bind (w h) (image-wh img)
               (values (seat-draw-x seat obj) (seat-draw-y seat obj) w h))))
@@ -1030,7 +1053,8 @@
    Seat-free: the caller has already decided the position it is asking about."
   (multiple-value-bind (cw ch)
       (if (wm-surface-p obj)
-          (values (glass:fb-width (wm-surface-fb obj)) (glass:fb-height (wm-surface-fb obj)))
+          (values (round (* (glass:fb-width (wm-surface-fb obj)) (wm-surface-content-scale obj)))
+                  (round (* (glass:fb-height (wm-surface-fb obj)) (wm-surface-content-scale obj))))
           (when-let ((img (mcclim-render::image-mirror-image obj)))
             (image-wh img)))
     (when cw
@@ -1196,7 +1220,8 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
       (let ((hit (cond
                    ((wm-surface-p w)
                     (test (seat-window-x seat w) (seat-window-y seat w)
-                          (glass:fb-width (wm-surface-fb w)) (glass:fb-height (wm-surface-fb w)) w))
+                          (round (* (glass:fb-width (wm-surface-fb w)) (wm-surface-content-scale w)))
+                          (round (* (glass:fb-height (wm-surface-fb w)) (wm-surface-content-scale w))) w))
                    ((glass-mirror-managed w)
                     (when-let ((image (mcclim-render::image-mirror-image w)))
                       (multiple-value-bind (cw ch) (image-wh image)
@@ -1300,7 +1325,8 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
           (progn                                                             ; Full Size
             (setf (wm-surface-saved-geom obj)
                   (list (seat-window-x seat obj) (seat-window-y seat obj)
-                        (glass:fb-width (wm-surface-fb obj)) (glass:fb-height (wm-surface-fb obj))))
+                        (round (* (glass:fb-width (wm-surface-fb obj)) (wm-surface-content-scale obj)))
+                  (round (* (glass:fb-height (wm-surface-fb obj)) (wm-surface-content-scale obj)))))
             (seat-move-window seat obj (wm-border) (+ (wm-titleh) (wm-border)))
             (funcall (wm-surface-resize-fn obj)
                      (- (seat-screen-w seat) (* 2 (wm-border)))
@@ -1963,7 +1989,15 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
                 (unless (eq obj (wm-topmost port seat))
                   (wm-raise port obj seat) (composite-seat seat)))
               (when (wm-surface-on-pointer obj)
-                (funcall (wm-surface-on-pointer obj) mask (- x cx) (- y cy))))
+                ;; INTO THE CONTENT'S OWN PIXELS.  The window is the content magnified, so a
+                ;; position on the screen is CONTENT-SCALE times the position in the thing that
+                ;; drew it — the same conversion glass-sdl does between window points and the
+                ;; framebuffer, and wrong in the same way if it is skipped: the pointer drifts
+                ;; further from the cursor the further into the window it goes.  Identity at 1,
+                ;; which is every surface that sizes itself in device pixels.
+                (let ((cs (wm-surface-content-scale obj)))
+                  (funcall (wm-surface-on-pointer obj) mask
+                           (floor (- x cx) cs) (floor (- y cy) cs)))))
              (t                                              ; content of a McCLIM window
               ;; ASKED FIRST, before the raise: this is the gesture that takes the McCLIM
               ;; token, and WM-RAISE just below hands CLIM's keyboard focus to the window
@@ -2012,7 +2046,8 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
   (seat-focus (port-seat port (or seat *wm-spawn-seat*)) surf)
   surf)
 
-(defun add-surface (port make-fn &key (title "surface") (width 800) (height 600))
+(defun add-surface (port make-fn &key (title "surface") (width 800) (height 600)
+                                      (content-scale :assume-unaware))
   "GENERIC, app-agnostic surface launcher — the public extension point for hosting
    ANY external glass-surface app as a decorated WM window.  Makes a fresh WIDTH x
    HEIGHT framebuffer, calls MAKE-FN on it to build the app over that fb; MAKE-FN
@@ -2028,12 +2063,28 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
    extra return values rather than extra arguments because MAKE-FN is what builds
    the app: it is the only thing that knows whether the app HAS a translation to
    report, and it does not know that until it has made it."
-  (let* ((fb (glass:make-framebuffer width height (glass:rgb 255 255 255)))
+  ;; ASSUME THE APP DOES NOT KNOW ABOUT DENSITY, because nearly none do.  WIDTH and HEIGHT are
+  ;; the app's own pixels — it draws into a framebuffer that size and means it — and the WM
+  ;; magnifies the result, so the window comes out the size it would have been on an ordinary
+  ;; screen instead of half of it.  That is what a browser and a file manager looking tiny on a
+  ;; Retina panel actually is: nothing wrong in either of them, and nothing they can do about
+  ;; it without being told.
+  ;;
+  ;; :ASSUME-UNAWARE rather than a number, so the default is a STATEMENT about the app rather
+  ;; than a guess at a display.  A caller that draws in device pixels passes 1 and is left
+  ;; alone; a terminal does exactly that, sizing its glyphs by SEAT-PPEM, and is sharp at any
+  ;; density precisely because nothing magnifies it.
+  (let* ((cs (if (eq content-scale :assume-unaware)
+                 (let ((seat (port-seat port *wm-spawn-seat*)))
+                   (if seat (seat-scale seat) 1))
+                 content-scale))
+         (fb (glass:make-framebuffer width height (glass:rgb 255 255 255)))
          (c (glass-port-cascade port)))
     (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn resize-fn)
         (funcall make-fn fb)
       (wm-add-surface* port
         (make-wm-surface :fb fb :x (+ 40 c) :y (+ 40 c (wm-titleh)) :title title
+                         :content-scale cs
                          :on-key on-key :on-pointer on-pointer :dirty-p dirty-p
                          :copy-p copy-p :close-fn close-fn :resize-fn resize-fn)))))
 
@@ -2050,6 +2101,9 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
     (glass-term:start-pump tm)
     (wm-add-surface* port
       (make-wm-surface :fb (glass-term:terminal-fb tm)
+                       ;; NOT magnified: a terminal makes its glyphs at SEAT-PPEM, so it is already
+                       ;; in device pixels and sharp — magnifying it would blur text that is right.
+                       :content-scale 1
                        :x (+ 40 c) :y (+ 40 c (wm-titleh)) :title "terminal"
                        :on-key (lambda (down k) (glass-term:on-key tm down k))
                        :on-pointer (lambda (mask lx ly) (glass-term:on-mouse tm mask lx ly))
@@ -2067,6 +2121,9 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
         (c (glass-port-cascade port)))
     (wm-add-surface* port
       (make-wm-surface :fb (glass-term:tabterm-fb tt)
+                       ;; NOT magnified: a terminal makes its glyphs at SEAT-PPEM, so it is already
+                       ;; in device pixels and sharp — magnifying it would blur text that is right.
+                       :content-scale 1
                        :x (+ 40 c) :y (+ 40 c (wm-titleh)) :title "terminal"
                        :on-key (lambda (down k) (glass-term:tabterm-on-key tt down k))
                        :on-pointer (lambda (mask lx ly) (glass-term:tabterm-on-mouse tt mask lx ly))
@@ -2120,6 +2177,10 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
       (prog1
           (wm-add-surface* port
             (make-wm-surface :fb fb :x (+ 40 c) :y (+ 40 c (wm-titleh))
+                             ;; loom draws in its own pixels like everything else — see
+                             ;; ADD-SURFACE on why the default is to assume that.
+                             :content-scale (let ((seat (port-seat port *wm-spawn-seat*)))
+                                              (if seat (seat-scale seat) 1))
                              :title "browser"
                              ;; What this window has highlighted at the moment somebody
                              ;; asks — loom reads its live page selection, the same state

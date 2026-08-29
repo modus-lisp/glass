@@ -14,7 +14,7 @@
    #:make-framebuffer #:framebuffer #:framebuffer-p
    #:fb-width #:fb-height #:fb-pixels #:fb-resize #:with-fb-locked #:fb-generation #:fb-touch
    #:fb-clip #:with-fb-clip #:with-fb-locked-or #:fb-frameno #:fb-damage #:fb-copy #:fb-mark-frame #:fb-take-frame #:fb-take-copy
-   #:fb-put #:fb-get #:fb-fill #:fb-rect #:fb-hline #:fb-vline #:fb-frame #:fb-blit #:fb-move-rect
+   #:fb-put #:fb-get #:fb-fill #:fb-rect #:fb-hline #:fb-vline #:fb-frame #:fb-blit #:fb-blit-scaled #:fb-move-rect
    #:rgb #:+black+ #:+white+ #:+red+ #:+green+ #:+blue+
    #:+pixel-colour-space+
    ;; text (the :glass/text system; scribe-backed)

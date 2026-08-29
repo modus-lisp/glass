@@ -346,3 +346,32 @@ would not have to visit every call site in the tree."
   (dotimes (sy (fb-height src) dst)
     (dotimes (sx (fb-width src))
       (fb-put dst (+ dx sx) (+ dy sy) (fb-get src sx sy)))))
+
+(defun fb-blit-scaled (dst src dx dy scale)
+  "Copy SRC into DST at (DX,DY), magnified by SCALE (a positive rational).
+
+   FOR CONTENT THAT DOES NOT KNOW ABOUT DENSITY, which is nearly all of it.  An application
+   drawing at a fixed number of pixels per character is drawing for one density, and on a
+   screen with twice as many pixels it comes out half the size — a browser and a file manager
+   that are legible on one machine and tiny on another, with nothing wrong in either of them.
+   Magnifying their output is what every desktop does for such a program, and it is the only
+   thing that CAN be done without the program's cooperation.
+
+   NEAREST NEIGHBOUR, deliberately.  At an integer scale it is exact — every source pixel
+   becomes a square block and nothing is invented — which is what text drawn as pixels wants;
+   interpolating would blur glyph edges that were already sharp.  At a fractional scale it is
+   uneven rather than soft, and that is the honest trade for a magnifier whose input is not a
+   photograph.
+
+   Written as a walk over the DESTINATION so every destination pixel is written exactly once:
+   walking the source and painting blocks writes the overlaps repeatedly and leaves seams
+   wherever the block size lands between pixels."
+  (if (= scale 1)
+      (fb-blit dst src dx dy)
+      (let* ((sw (fb-width src)) (sh (fb-height src))
+             (dw (round (* sw scale))) (dh (round (* sh scale))))
+        (dotimes (y dh dst)
+          (let ((sy (min (1- sh) (floor (* y sh) dh))))
+            (dotimes (x dw)
+              (fb-put dst (+ dx x) (+ dy y)
+                      (fb-get src (min (1- sw) (floor (* x sw) dw)) sy))))))))
