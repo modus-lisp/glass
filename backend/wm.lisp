@@ -40,7 +40,12 @@
   ;; and wrong for anyone who calls it directly, with the failure being a click that
   ;; highlights one row and opens another.  Storing it makes the framebuffer and the
   ;; arithmetic that reads it inseparable.
-  (scale 1))
+  (scale 1)
+  ;; The button mask this tree last saw, kept so the handler can tell a button that is DOWN
+  ;; from one that has just been RELEASED.  A pointer event carries only the current state,
+  ;; so without a previous one there is no edge to detect — and "the left button is down" is
+  ;; true of every motion event in a drag, which is the bug this exists for.
+  (last-mask 0))
 
 (defun wm-submenu-p (action) (and (consp action) (eq (car action) :submenu)))
 (defun wm-item-action (item) (cdr item))
@@ -1735,11 +1740,18 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
    and its screen is not touched by any of it."
   (let* ((seat (port-seat port seat))
          (left (logtest mask 1))
+         (was-left (logtest (wm-menu-last-mask root) 1))
+         ;; THE RELEASE EDGE, which is what actually chooses an item.  See below.
+         (release (and was-left (not left)))
          (chain (wm-menu-chain root))
          (menu (find-if (lambda (m) (not (eq :outside (wm-menu-index m x y)))) (reverse chain))))
+    (setf (wm-menu-last-mask root) mask)
     (cond
       ((null menu)                                              ; off every menu
-       (when (logtest mask 5)
+       ;; A press outside dismisses, as it always did; so does letting go outside, which is
+       ;; how a press-drag-release gesture says "never mind" — the pointer left the menu
+       ;; and the button came up somewhere that is not an item.
+       (when (or (logtest mask 5) release)
          (setf (seat-menu seat) nil) (composite-seat seat)
          (clim-token-settle port seat)))       ; the menu pinned the token; it is gone
       (t
@@ -1753,15 +1765,25 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
                 (when (wm-submenu-p action) (wm-open-submenu menu idx action seat))
                 (wm-menu-render menu)
                 (composite-seat seat))
-              (when left
-                (cond
-                  ((wm-submenu-p action)                        ; keep it open, don't dismiss
-                   (unless (wm-menu-child menu)
-                     (wm-open-submenu menu idx action seat) (composite-seat seat)))
-                  (t                                            ; leaf: run + dismiss the whole tree
-                   (setf (seat-menu seat) nil) (composite-seat seat)
-                   (clim-token-settle port seat)                ; …and it no longer pins
-                   (when action (wm-menu-run port action seat)))))))
+              ;; ON THE RELEASE, NOT WHILE THE BUTTON IS DOWN.  A pointer event carries the
+              ;; current mask, so "the left button is down" is true of every motion event in
+              ;; a press-and-drag — and running the leaf on that meant dragging across the
+              ;; menu launched every item the cursor passed over, one after another.  What
+              ;; chooses an item is letting go on it.
+              ;;
+              ;; This is also what makes both menu idioms work from one rule.  Press, drag,
+              ;; release picks what you release on.  Click to open, move, click to choose
+              ;; also works: the second click's press only hovers, and its release runs the
+              ;; item under it.  A single click that opens the menu cannot choose anything,
+              ;; because the menu is placed with its title strip under the pointer.
+              (cond
+                ((wm-submenu-p action)                          ; keep it open, don't dismiss
+                 (when (and (or left release) (not (wm-menu-child menu)))
+                   (wm-open-submenu menu idx action seat) (composite-seat seat)))
+                (release                                        ; leaf: run + dismiss the tree
+                 (setf (seat-menu seat) nil) (composite-seat seat)
+                 (clim-token-settle port seat)                  ; …and it no longer pins
+                 (when action (wm-menu-run port action seat))))))
            (t                                                   ; over the title strip
             (unless (eql (wm-menu-hover menu) -1)
               (setf (wm-menu-hover menu) -1) (wm-menu-render menu) (composite-seat seat)))))))))
