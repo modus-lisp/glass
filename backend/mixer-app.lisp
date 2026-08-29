@@ -61,6 +61,12 @@
                             (if hears (ignore-errors (funcall hears mix s)) t)
                             s))))))
 
+(defun %muted-p (fn)
+  "Whether GLASS-SDL says that device is muted, or NIL when there is no local viewer at all —
+   the ordinary case for a desktop watched over a wire, and not a failure."
+  (let ((f (%fn fn "GLASS-SDL")))
+    (and f (ignore-errors (funcall f)))))
+
 (defun %session-level ()
   (let ((m (%mixer)) (f (%fn "MIXER-LEVEL")))
     (and m f (ignore-errors (funcall f m)))))
@@ -116,7 +122,17 @@
          (format stream "~&Session~%"))
        (format stream "~&  out  ")
        (%meter stream (%session-level))
-       (format stream "~a listener~:p~%~%" (length (%sinks)))
+       (format stream "~a listener~:p~a~%" (length (%sinks))
+               (if (%muted-p "SPEAKERS-MUTED-P") "   [muted]" ""))
+       ;; THE DEVICES THEMSELVES, when a viewer in this image owns them.  Muting belongs here
+       ;; rather than in Listen's Stop: stopping the ear is a much bigger hammer — it drops a
+       ;; quarter-gigabyte of weights and every consumer's source with it — and reaching for
+       ;; that when what you wanted was quiet is how a session ends up in a state nobody chose.
+       (when (%fn "MICROPHONE-MUTED-P" "GLASS-SDL")
+         (format stream "~&  mic  ")
+         (%meter stream nil)
+         (format stream "~a~%" (if (%muted-p "MICROPHONE-MUTED-P") "muted" "open")))
+       (format stream "~%")
 
        (clim:with-text-style (stream (ui-bold 14))
          (format stream "~&Sources~%"))

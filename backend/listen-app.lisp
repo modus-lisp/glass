@@ -128,14 +128,31 @@ on the next tick, which reads as a window that ignores its own button."
          (fport (and (find-package "CLIM-GLASS") (find-symbol "FIND-GLASS-PORT" "CLIM-GLASS")))
          (pseat (and (find-package "CLIM-GLASS") (find-symbol "PORT-SEAT" "CLIM-GLASS")))
          (title (and (find-package "CLIM-GLASS") (find-symbol "WM-SURFACE-TITLE" "CLIM-GLASS")))
+         (onkey (and (find-package "CLIM-GLASS") (find-symbol "WM-SURFACE-ON-KEY" "CLIM-GLASS")))
          (target (and back fport pseat (fboundp back) (fboundp fport) (fboundp pseat)
                       (ignore-errors (funcall back (funcall pseat (funcall fport)))))))
+    ;; AIMED, NOT MERELY HANDED BACK.  Restoring focus was right and was not enough: it happens
+    ;; ONCE, when the toggle is pressed, and anything that changes focus afterwards undoes it.
+    ;; The most natural thing to do after starting dictation is click on this window to watch
+    ;; the transcript — which focuses this window, and sends the rest of the words here.  That
+    ;; is the whole of why it failed "sometimes": it depended on whether you touched Listen
+    ;; after aiming, and touching Listen is what one does while dictating.
+    ;;
+    ;; So the target is REMEMBERED.  Dictation already supports an injector of its own
+    ;; (DICT-INJECTOR, which PASTE-TEXT prefers over the session's), so the words go to the
+    ;; window that was aimed at whatever the keyboard does afterwards.  Focus stays free for
+    ;; typing by hand; dictation stops competing for it.
+    (when (and target onkey (fboundp onkey))
+      (ignore-errors
+       (let ((fn (funcall onkey target)))
+         (when fn (glass:start-dictation :injector (lambda (down k) (funcall fn down k)))))))
     (setf (app-note frame)
           (cond ((and target title (fboundp title)
                       (ignore-errors (funcall title target)))
-                 (format nil "Typing into ~a." (ignore-errors (funcall title target))))
-                (target "Typing into the window you were last in.")
-                (t "Typing into whatever has focus — click a window to aim it.")))))
+                 (format nil "Typing into ~a — it stays aimed there."
+                         (ignore-errors (funcall title target))))
+                (target "Typing into the window you were last in — it stays aimed there.")
+                (t "Typing into whatever has focus — click a window, then Dictate, to aim it.")))))
 
 (defun on-dictate (gadget value)
   "Switch the desktop between watching what it hears and TYPING it.

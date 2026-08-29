@@ -1423,6 +1423,37 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
         (wm-menu-y menu) (max 0 (min y (- (seat-screen-h seat) (glass:fb-height (wm-menu-fb menu))))))
   menu)
 
+(defun wm-audio-menu-items ()
+  "Mute the speakers and the microphone, when a viewer in THIS IMAGE owns them.
+
+   IN THE CHROME, because that is where a mute belongs.  Muting from the Mixer window means
+   opening a window to go quiet, and the thing people reached for instead was Listen's Stop —
+   which is a far bigger hammer: it drops the ear, a quarter of a gigabyte of weights, and
+   every consumer's source with it.  Reaching for that when what you wanted was quiet is how a
+   session ends up in a state nobody chose.
+
+   Built at every open, like the clipboard and VNC items beside it, so the LABEL is the state:
+   the menu says \"Mute microphone\" exactly while the microphone is open.  A toggle whose label
+   does not move is a switch you have to test to read.
+
+   Empty when there is no local viewer — a desktop watched over a wire has no speakers here to
+   silence, and the entry would be a control for somebody else's room."
+  (flet ((sdl (name) (let ((s (and (find-package "GLASS-SDL")
+                                   (find-symbol name "GLASS-SDL"))))
+                       (and s (fboundp s) s))))
+    (let ((mic-muted-p (sdl "MICROPHONE-MUTED-P")) (mute-mic (sdl "MUTE-MICROPHONE"))
+          (spk-muted-p (sdl "SPEAKERS-MUTED-P"))   (mute-spk (sdl "MUTE-SPEAKERS")))
+      (remove nil
+              (list
+               (when (and mic-muted-p mute-mic)
+                 (let ((muted (ignore-errors (funcall mic-muted-p))))
+                   (cons (if muted "Unmute microphone" "Mute microphone")
+                         (lambda () (ignore-errors (funcall mute-mic (not muted)))))))
+               (when (and spk-muted-p mute-spk)
+                 (let ((muted (ignore-errors (funcall spk-muted-p))))
+                   (cons (if muted "Unmute speakers" "Mute speakers")
+                         (lambda () (ignore-errors (funcall mute-spk (not muted))))))))))))
+
 (defun wm-open-menu (port x y &optional seat (mask 0))
   "Open the workspace root menu at (X,Y): the port's items, plus whatever the SESSION
    itself can offer from the workspace — today, speaking the clipboard, and deciding
@@ -1436,6 +1467,7 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
          (menu (make-wm-menu :x x :y y :hover -1
                              :items (append (glass-port-menu-items port)
                                             (wm-clipboard-menu-items seat)
+                                            (wm-audio-menu-items)
                                             ;; …and whether THIS seat is on a VNC port,
                                             ;; which is a question about the seat whose
                                             ;; menu this is and not about the session
