@@ -127,10 +127,15 @@ being written by the ticker.  So it says where to click."
        (setf (clim:gadget-value gadget :invoke-callback nil) nil
              (app-note frame) "No ear installed — set GLASS_EARS to a directory of stave graphs."))
       ((null glass:*key-injector*)
-       ;; a desktop with no server has nothing to type into, and dictation would look like it
-       ;; worked while every word went nowhere
+       ;; Nobody is looking at this desktop, so there is no focus to type into and dictation
+       ;; would look like it worked while every word went nowhere.
+       ;;
+       ;; This used to say "no VNC server is running", which was a true statement about a
+       ;; transport and the wrong answer to the question — a welded desktop with a window open
+       ;; has a keyboard and no server, and was told to start one.  What is actually required is
+       ;; somebody attached, by any means.
        (setf (clim:gadget-value gadget :invoke-callback nil) nil
-             (app-note frame) "Nothing to type into — no VNC server is running on this session."))
+             (app-note frame) "Nothing to type into — no viewer is attached to this session."))
       (t
        (glass:start-listening)
        (glass:start-dictation)

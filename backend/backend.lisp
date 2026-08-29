@@ -685,6 +685,20 @@ cannot drift apart."
          (on-key (or (seat-injector seat)
                      (setf (seat-injector seat)
                            (lambda (down k) (glass-on-key port down k seat))))))
+    ;; ...AND IT BECOMES THE SESSION'S KEYBOARD, exactly as opening a transport does.  GLASS:SERVE
+    ;; installs its client :ON-KEY as *KEY-INJECTOR* and gives the reason: the only path that
+    ;; knows where focus IS, is the one a real keystroke takes.  That reason has nothing to do
+    ;; with sockets, and a viewer in this image takes the same path — but nobody installed it,
+    ;; so *KEY-INJECTOR* stayed NIL on a welded desktop and everything that types for you had
+    ;; nowhere to type.
+    ;;
+    ;; Dictation is where that showed: Listen refused with "no VNC server is running on this
+    ;; session", which was a true statement about a transport and the wrong answer to the
+    ;; question.  There was a keyboard the whole time; it was one line from being the session's.
+    ;;
+    ;; Last attachment wins, which is what SERVE does with a second client and means the same
+    ;; thing here: keys go where the most recent pair of eyes is looking.
+    (setf glass:*key-injector* on-key)
     (values (seat-fb seat)
             on-key
             (lambda (b x y) (glass-on-pointer port b x y seat))
