@@ -286,6 +286,12 @@ behaviour every desktop had before density existed.")
 (declaim (inline wm-titleh wm-border))
 (defun wm-titleh () (max 1 (round (* +wm-titleh-1x+ *wm-scale*))))
 (defun wm-border () (max 1 (round (* +wm-border-1x+ *wm-scale*))))
+(defun wm-size (n)
+  "A chrome TEXT size in device pixels at the current density.  Same shape as WM-TITLEH,
+separate name because a font size is not a box dimension and reads better at the call site.
+Without this the title bar grew and its label did not, which is a tall bar with small text
+in it — visibly worse than either honest choice."
+  (max 1 (round (* n *wm-scale*))))
 
 (defmacro with-seat-scale ((seat) &body body)
   "Run BODY with *WM-SCALE* bound to SEAT's density.  Every entry point that knows which

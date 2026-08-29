@@ -52,22 +52,44 @@
 
 (defun wm-render-titlebar (title width &optional (bg +wm-title-bg+))
   "A glass framebuffer of an OPEN LOOK title bar WIDTH px wide — drawn entirely
-   with glass primitives + scribe text (no McCLIM)."
-  (let ((tb (glass:make-framebuffer (max 1 width) (wm-titleh) bg)))
-    (glass:fb-hline tb 0 (1- (wm-titleh)) width (glass:rgb 120 120 120))       ; bottom shadow line
+   with glass primitives + scribe text (no McCLIM).
+
+   CENTRED BY ARITHMETIC, NOT BY A CONSTANT.  The title used to sit at y=3, which is
+   centred for a 22-pixel bar holding 12-pixel text and is the top of a 44-pixel bar
+   holding 24-pixel text.  Scaling that 3 would only move the wrongness around, because
+   the number was never a position — it was the answer to a centring sum done once, by
+   hand, for one size.  So the sum is written down instead, and every density gets it
+   right including the fractional ones where no single constant could."
+  (let* ((h (wm-titleh))
+         (pad (max 2 (round (* 4 *wm-scale*))))                ; the bevel's inset
+         (tb (glass:make-framebuffer (max 1 width) h bg)))
+    (glass:fb-hline tb 0 (1- h) width (glass:rgb 120 120 120))                  ; bottom shadow line
     ;; menu button box: raised bevel + abbreviated-menu wedge
-    (let* ((bs (- (wm-titleh) 8)) (bx 4) (by 4))
+    (let* ((bs (max 4 (- h (* 2 pad)))) (bx pad) (by pad))
       (glass:fb-rect tb bx by bs bs (glass:rgb 188 188 188))
       (glass:fb-hline tb bx by bs glass:+white+)                                ; top light
       (glass:fb-vline tb bx by bs glass:+white+)                               ; left light
       (glass:fb-hline tb bx (+ by bs -1) bs (glass:rgb 77 77 77))              ; bottom dark
       (glass:fb-vline tb (+ bx bs -1) by bs (glass:rgb 77 77 77))             ; right dark
-      (let ((cx (+ bx (floor bs 2))) (cy (+ by (floor bs 2) -2)))              ; downward wedge
-        (dotimes (i 4) (glass:fb-hline tb (- cx (- 3 i)) (+ cy i) (max 1 (- 7 (* 2 i))) glass:+black+))))
-    ;; centred bold title, anti-aliased via scribe
-    (let ((tw (glass:text-width title :size 12 :font (glass:default-font t))))
-      (glass:fb-text tb (max (+ (wm-titleh) 6) (floor (- width tw) 2)) 3 title
-                     :size 12 :color glass:+black+ :font (glass:default-font t)))
+      ;; the wedge, sized from the box rather than from 4 and 3 and 7 — same reasoning as
+      ;; the title: those were one size's answer, and a 2x box wants a 2x wedge.
+      (let* ((wh (max 2 (round (* 4 *wm-scale*))))            ; wedge height in rows
+             (ww (max 3 (1- (* 2 wh))))                       ; and its width at the top
+             (cx (+ bx (floor bs 2)))
+             (cy (+ by (floor (- bs wh) 2))))
+        (dotimes (i wh)
+          (glass:fb-hline tb (- cx (floor (- ww (* 2 i)) 2)) (+ cy i)
+                          (max 1 (- ww (* 2 i))) glass:+black+))))
+    ;; centred bold title, anti-aliased via scribe — centred in BOTH axes now
+    (let* ((size (wm-size 12))
+           (tw (glass:text-width title :size size :font (glass:default-font t)))
+           ;; scribe's y is the top of the em box, so the ink sits a little below it; the
+           ;; ascent is about 4/5 of the size, which is what makes the visual centre and
+           ;; the box centre differ.  Splitting the leftover space is close enough to right
+           ;; that it holds at every scale, which a hand-tuned offset did not.
+           (ty (max 0 (floor (- h size) 2))))
+      (glass:fb-text tb (max (+ h (round (* 6 *wm-scale*))) (floor (- width tw) 2)) ty title
+                     :size size :color glass:+black+ :font (glass:default-font t)))
     tb))
 
 (defun wm-deco (mirror cw &optional other)
@@ -945,6 +967,14 @@
    one position, session-wide, placed in the CLIM driver's arrangement — it is that
    position shifted onto this seat's copy of the window that opened it.  Damage and
    occlusion both come through here, so both follow the pixels rather than the slot."
+  ;; THE DENSITY COMES FROM THE SEAT, HERE, because this is where geometry is decided and
+  ;; it is asked from places that are not drawing.  PORT-DAMAGE-WINDOW asks it once per
+  ;; seat from WM-TICK, outside any binding, and got a 1x box for a 2x frame — so the top
+  ;; of every title bar was drawn and never marked dirty, and the stale pixels stayed.
+  ;; That is the smear: not a compositor bug, a bug in what the compositor was told had
+  ;; changed.  Binding at the choke point means damage, occlusion and drawing cannot
+  ;; disagree, whatever route the caller took to get here.
+  (with-seat-scale (seat)
   (multiple-value-bind (cx cy cw ch)
       (if (wm-surface-p obj)
           (values (seat-draw-x seat obj) (seat-draw-y seat obj)
@@ -954,7 +984,7 @@
               (values (seat-draw-x seat obj) (seat-draw-y seat obj) w h))))
     (when cx
       (list (- cx (wm-border)) (- cy (wm-titleh) (wm-border))
-            (+ cw (* 2 (wm-border))) (+ (wm-titleh) ch (* 2 (wm-border)))))))
+            (+ cw (* 2 (wm-border))) (+ (wm-titleh) ch (* 2 (wm-border))))))))
 
 (defun wm-window-box-at (obj cx cy)
   "The decorated (x y w h) OBJ WOULD occupy if its content were at (CX,CY) — for the
@@ -1257,10 +1287,10 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
 ;;; ---- workspace root menu ----------------------------------------------------
 
 (defun wm-menu-width (menu)
-  (let ((w (+ 24 (glass:text-width (wm-menu-title menu) :size 12 :font (glass:default-font t)))))
+  (let ((w (+ 24 (glass:text-width (wm-menu-title menu) :size (wm-size 12) :font (glass:default-font t)))))
     (dolist (it (wm-menu-items menu) (max 108 w))
       (let ((pad (if (wm-submenu-p (wm-item-action it)) 46 28)))     ; room for the ▸ arrow
-        (setf w (max w (+ pad (glass:text-width (car it) :size 12 :font (glass:default-font t)))))))))
+        (setf w (max w (+ pad (glass:text-width (car it) :size (wm-size 12) :font (glass:default-font t)))))))))
 
 (defun wm-submenu-arrow (fb x y color)
   "A small right-pointing triangle (▸) marking a submenu item, top-left at (X,Y)."
@@ -1274,14 +1304,14 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
          (fb (glass:make-framebuffer w h +menu-bg+))
          (font (glass:default-font t)))
     (glass:fb-rect fb 0 0 w +menu-titleh+ +menu-title-bg+)                 ; title strip
-    (glass:fb-text fb 8 3 (wm-menu-title menu) :size 12 :color glass:+black+ :font font)
+    (glass:fb-text fb 8 3 (wm-menu-title menu) :size (wm-size 12) :color glass:+black+ :font font)
     (glass:fb-hline fb 0 (1- +menu-titleh+) w (glass:rgb 120 120 120))
     (loop for it in (wm-menu-items menu) for i from 0
           for yy = (+ +menu-titleh+ (* i +menu-itemh+))
           for hot = (= i (wm-menu-hover menu))
           for ink = (if hot glass:+white+ glass:+black+)
           do (when hot (glass:fb-rect fb 1 yy (- w 2) +menu-itemh+ +menu-hi+))
-             (glass:fb-text fb 14 (+ yy 3) (car it) :size 12 :color ink :font font)
+             (glass:fb-text fb 14 (+ yy 3) (car it) :size (wm-size 12) :color ink :font font)
              (when (wm-submenu-p (wm-item-action it))
                (wm-submenu-arrow fb (- w 13) (+ yy 6) ink)))
     (glass:fb-frame fb 0 0 w h glass:+black+ 1)
@@ -1512,21 +1542,21 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
       (dolist (line lines fb)
         (destructuring-bind (kind a &optional b) line
           (ecase kind
-            (:head (glass:fb-text fb 16 y a :size 15 :color (glass:rgb 20 20 20) :font bold)
+            (:head (glass:fb-text fb 16 y a :size (wm-size 15) :color (glass:rgb 20 20 20) :font bold)
                    (glass:fb-hline fb 16 (+ y 22) (- w 32) (glass:rgb 200 200 195))
                    (incf y 32))
-            (:field (glass:fb-text fb 16 y a :size 13 :color (glass:rgb 100 100 100) :font font)
-                    (glass:fb-text fb 110 y b :size 13 :color (glass:rgb 20 20 20) :font bold)
+            (:field (glass:fb-text fb 16 y a :size (wm-size 13) :color (glass:rgb 100 100 100) :font font)
+                    (glass:fb-text fb 110 y b :size (wm-size 13) :color (glass:rgb 20 20 20) :font bold)
                     (incf y 22))
-            (:secret (glass:fb-text fb 16 (+ y 8) a :size 13 :color (glass:rgb 100 100 100) :font font)
-                     (glass:fb-text fb 110 y b :size 26 :color (glass:rgb 20 60 120) :font bold)
+            (:secret (glass:fb-text fb 16 (+ y 8) a :size (wm-size 13) :color (glass:rgb 100 100 100) :font font)
+                     (glass:fb-text fb 110 y b :size (wm-size 26) :color (glass:rgb 20 60 120) :font bold)
                      (incf y 38))
             (:note (dolist (l (wrap a 12 (- w 32)))
-                     (glass:fb-text fb 16 y l :size 12 :color (glass:rgb 110 110 110) :font font)
+                     (glass:fb-text fb 16 y l :size (wm-size 12) :color (glass:rgb 110 110 110) :font font)
                      (incf y 16))
                    (incf y 4))
             (:warn (dolist (l (wrap a 12 (- w 32)))
-                     (glass:fb-text fb 16 y l :size 12 :color (glass:rgb 150 60 20) :font font)
+                     (glass:fb-text fb 16 y l :size (wm-size 12) :color (glass:rgb 150 60 20) :font font)
                      (incf y 16))
                    (incf y 4))))))))
 
@@ -2276,7 +2306,7 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
 ;;; a refused connection.
 
 (defun make-wm-session (&key (port 5900) (width 1000) (height 720) menu
-                             background (background-mode :cover))
+                             background (background-mode :cover) (scale 1))
   "Build a window-manager session and return its GLASS-PORT: WM mode on, a screen of
    WIDTH x HEIGHT for the home seat, a root menu, and a wallpaper if asked for.
 
@@ -2288,6 +2318,15 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
           (glass-port-screen-w p) width (glass-port-screen-h p) height
           (glass-port-fb p) (glass:make-framebuffer width height +wm-teal+)
           (glass-port-menu-items p) (or menu (wm-default-menu)))
+    ;; THE DENSITY, BEFORE ANY WINDOW EXISTS.  A viewer only learns its display's scale when
+    ;; it opens a window, by which time START-WM-SESSION has already spawned the session's
+    ;; apps at whatever ppem they were handed — a terminal booted at 1x, sharp chrome around
+    ;; small text, and no way to fix it short of re-rendering a window that already exists.
+    ;; Passing it in here means the first seat is born knowing, so everything spawned after
+    ;; is spawned at the right size.  GLASS-SDL:DISPLAY-SCALE is how a local viewer answers
+    ;; this without a session to look at.
+    (unless (eql scale 1)
+      (dolist (seat (glass-port-seats p)) (setf (seat-scale seat) scale)))
     (when background (wm-set-background p background :mode background-mode))
     p))
 
