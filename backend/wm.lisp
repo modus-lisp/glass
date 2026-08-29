@@ -2105,9 +2105,21 @@
 
 (defun wm-app-item (label pkg class-name &rest args)
   "A menu item launching McCLIM frame CLASS-NAME in PKG, or NIL if that package/
-   class isn't loaded (so the Apps menu only offers what's actually available)."
+   class isn't loaded (so the menu only offers what's actually available)."
   (let ((sym (and (find-package pkg) (find-symbol class-name pkg))))
     (and sym (find-class sym nil) (list* label sym args))))
+
+(defun wm-surface-item (label pkg fn-name &rest args)
+  "A menu item launching the glass-surface app FN-NAME in PKG — warren and anything
+   else that speaks the (values ON-KEY ON-POINTER DIRTY-P) contract — or NIL when that
+   package is not loaded.  The frame-class sibling of this is WM-APP-ITEM; both exist so
+   the menu can be written once and still only offer what the image actually has.
+
+   BY NAME, deliberately.  glass must not depend on loom, warren or spool: they depend on
+   glass.  Every first-party app is therefore discovered the same way an out-of-tree one
+   would be, which also means a menu entry cannot be the thing that breaks a build."
+  (let ((sym (and (find-package pkg) (find-symbol fn-name pkg))))
+    (and sym (fboundp sym) (list* label :surface sym :title label args))))
 
 (defun wm-sample-image ()
   "The path of glass's bundled sample image, if present."
@@ -2133,26 +2145,48 @@
   label)
 
 (defun wm-default-menu ()
-  "The default workspace root menu: generic Browse / Inspect / Debug / Terminal,
-   an Apps submenu of whatever McCLIM apps are loaded, plus any externally
-   REGISTER-APP'd items appended after.  Built at call time so app class symbols
-   only appear when their packages exist (and *extra-apps* is read live)."
+  "The workspace root menu: the applications this project wrote, in one flat list, plus
+   anything REGISTER-APP'd appended after.  Built at call time, so an entry appears only
+   when the image actually has the code behind it.
+
+   WHAT IS NOT HERE, AND WHY.  The menu used to lead with Inspect and Debug — Clouseau on
+   (LIST-ALL-PACKAGES), and a menu item whose entire function was to signal an error and
+   drop the desktop into a debugger.  Both are unreliable enough right now that offering
+   them from the root menu of a desktop is a trap: the second one deliberately breaks the
+   session that chose it, and a person clicking down a menu to see what a machine can do
+   has not consented to that.  They are three lines to restore for anyone debugging glass
+   itself, which is who they were ever for.
+
+   The McCLIM demos went for a different reason: Calculator, Gadget Demo, Listener and
+   Climacs are other people's applications, wired in when the menu needed contents to
+   prove the launcher worked.  It has plenty now, and this is a desktop with a point of
+   view rather than a McCLIM demo harness.  Nothing was deleted — WM-APP-ITEM still exists
+   and each is one line — they are simply not what this machine leads with.
+
+   ONE TERMINAL, the resizable one.  There were two, and the tabbed one has tabs but no
+   RESIZE-FN at all: glass-term has no tabterm resize entry point to wire up, so a tabbed
+   terminal is a window the WM cannot resize.  On a desktop whose whole screen now follows
+   the viewer, a window that cannot change size is the worse offer, and :TABTERM is still
+   there for anyone who wants tabs more than they want edges."
   (append
-   (list*
-    '("Browse"   :browse)                                 ; generic start page
-    '("Inspect"  :inspect (list-all-packages))            ; generic: the environment
-    '("Debug"    :debug (break "Workspace debugger"))     ; generic: enter the debugger
-    '("Terminal" :terminal)
-    (list
-     (list* "Apps" :submenu
-            (remove nil
-                    (list '("Tabbed Terminal" :tabterm)
-                          (wm-app-item "Calculator" '#:clim-demo.calculator "CALCULATOR-APP" :width 360 :height 320)
-                          (wm-app-item "Gadget Demo" '#:clim-demo "GADGET-TEST" :width 380 :height 320)
-                          (wm-app-item "Listener" '#:clim-listener "LISTENER" :width 720 :height 480)
-                          '("Editor (Climacs)" :edit)
-                          (let ((img (wm-sample-image))) (and img (list "Image Viewer" :image img)))
-                          '("Browse example.com" :browse "https://example.com"))))))
+   (remove nil
+           (list
+            ;; The things you reach for, first and unnested.  A submenu was worth it when
+            ;; half of these did not exist.
+            '("Terminal"  :terminal)
+            '("Browse"    :browse)                                  ; loom + weft
+            (wm-surface-item "Files" '#:warren "DESKTOP-SURFACE"    ; warren, a glass surface
+                             :width 1000 :height 640)
+            (wm-app-item "Podcasts" '#:spool.app "PODCASTS"         ; spool: feeds, cache, playback
+                         :width 980 :height 660 :title "Podcasts")
+            ;; chord and stave, as windows.  Each says what it needs when it has no model
+            ;; (GLASS_VOICE / GLASS_EARS), which is why they are offered unconditionally:
+            ;; the app explaining the absence beats the menu hiding the capability.
+            (wm-app-item "Speak" '#:glass-speak "SPEAK-BOX"
+                         :width 560 :height 320 :title "Speak")
+            (wm-app-item "Listen" '#:glass-listen "LISTEN-BOX"
+                         :width 560 :height 400 :title "Listen")
+            (let ((img (wm-sample-image))) (and img (list "Image Viewer" :image img)))))
    *extra-apps*))                                          ; external apps (empty unless registered)
 
 (defvar *wm-tick-round* 0 "Monotonic compositing-round counter for the WM tick loop.")
