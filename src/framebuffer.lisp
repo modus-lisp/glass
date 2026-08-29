@@ -365,7 +365,14 @@ would not have to visit every call site in the tree."
 
    Written as a walk over the DESTINATION so every destination pixel is written exactly once:
    walking the source and painting blocks writes the overlaps repeatedly and leaves seams
-   wherever the block size lands between pixels."
+   wherever the block size lands between pixels.
+
+   THE REFERENCE VERSION, NOT THE ONE THE COMPOSITOR USES.  This goes through FB-GET and
+   FB-PUT, which is a bounds check, a multiply and a generation bump per pixel: 68 ms for one
+   1000x640 window magnified to 2x, against 0.7 ms for the row-wise CLIM-GLASS::BLIT-FB-SCALED
+   that the WM actually calls.  Correct and obvious and a hundred times slower, which is the
+   right trade for a primitive that exists to say what the operation IS — and the wrong one
+   for a compositor, where it cost more than the frame budget and the desktop crawled."
   (if (= scale 1)
       (fb-blit dst src dx dy)
       (let* ((sw (fb-width src)) (sh (fb-height src))

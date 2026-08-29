@@ -174,6 +174,61 @@
               (replace dpx spx :start1 (+ drow dx0) :end1 (+ drow dx1)
                                :start2 (+ srow (- dx0 ox))))))))))
 
+(defun blit-fb-scaled (src ox oy dst scale)
+  "Copy SRC into DST at (OX,OY) magnified by SCALE, honouring DST's clip.
+
+   THE SAME SHAPE AS BLIT-FB AND FOR THE SAME REASON.  The first version of this went through
+   FB-GET and FB-PUT per pixel, which is a bounds check, a multiply and — because FB-PUT
+   touches the generation counter — a write to shared state, two and a half million times for
+   one magnified window.  The desktop crawled.  Nothing about magnifying is expensive; doing
+   it a pixel at a time through an interface built for drawing single pixels is.
+
+   So: the column map is computed ONCE per blit rather than per pixel, and each destination
+   row is built once and then REPLACEd for the rows that repeat it — at an integer scale that
+   is one row of work for SCALE rows of output, and the copies are memcpy.  The generation is
+   touched once at the end, which is what it means: this framebuffer changed."
+  (declare (optimize (speed 3) (safety 0)))
+  (let* ((sw (glass:fb-width src)) (sh (glass:fb-height src))
+         (spx (glass:fb-pixels src)) (dpx (glass:fb-pixels dst))
+         (dw (glass:fb-width dst)) (dh (glass:fb-height dst))
+         (ow (max 1 (round (* sw scale)))) (oh (max 1 (round (* sh scale))))
+         (clip (glass:fb-clip dst))
+         (cx0 (if clip (the fixnum (first clip)) 0)) (cy0 (if clip (the fixnum (second clip)) 0))
+         (cx1 (if clip (the fixnum (third clip)) dw)) (cy1 (if clip (the fixnum (fourth clip)) dh))
+         (dx0 (max 0 ox cx0)) (dx1 (min dw (+ ox ow) cx1)))
+    (declare (type (simple-array (unsigned-byte 32) (*)) spx dpx)
+             (fixnum sw sh dw dh ox oy ow oh cx0 cy0 cx1 cy1 dx0 dx1))
+    (when (< dx0 dx1)
+      ;; WHICH SOURCE COLUMN EACH DESTINATION COLUMN COMES FROM, once.  This is the whole of
+      ;; the arithmetic the per-pixel version repeated for every row.
+      (let ((cols (make-array (- dx1 dx0) :element-type 'fixnum))
+            (row  (make-array (- dx1 dx0) :element-type '(unsigned-byte 32)))
+            (last-sy -1))
+        (declare (type (simple-array fixnum (*)) cols)
+                 (type (simple-array (unsigned-byte 32) (*)) row)
+                 (fixnum last-sy))
+        (dotimes (i (- dx1 dx0))
+          (setf (aref cols i)
+                (min (1- sw) (the fixnum (floor (* (- (+ dx0 i) ox) sw) ow)))))
+        (dotimes (oy* oh)
+          (declare (fixnum oy*))
+          (let ((dy (+ oy oy*)))
+            (declare (fixnum dy))
+            (when (and (< -1 dy dh) (<= cy0 dy) (< dy cy1))
+              (let ((sy (min (1- sh) (the fixnum (floor (* oy* sh) oh)))))
+                (declare (fixnum sy))
+                ;; Rebuild the row only when the SOURCE row changes; at an integer scale that
+                ;; is once per SCALE output rows and the rest are memcpy.
+                (unless (= sy last-sy)
+                  (let ((srow (* sy sw)))
+                    (declare (fixnum srow))
+                    (dotimes (i (- dx1 dx0))
+                      (setf (aref row i) (aref spx (+ srow (aref cols i))))))
+                  (setf last-sy sy))
+                (replace dpx row :start1 (+ (* dy dw) dx0) :end1 (+ (* dy dw) dx1)))))))
+      (glass:fb-touch dst)))
+  dst)
+
 (defun wm-corners (fb x y w h)
   "OPEN LOOK L-shaped resize corner marks."
   (let ((n 7) (c glass:+black+))
@@ -727,7 +782,7 @@
                       ;; No CopyRect for a magnified surface: the hint above describes a translation in
                       ;; the SOURCE's pixels, and at a scale those are not the screen's — sending it would
                       ;; move the wrong number of rows.
-                      (glass:fb-blit-scaled fb sfb sx sy cs)))))))
+                      (blit-fb-scaled sfb sx sy fb cs)))))))
 
 (defun %svg-path-p (path)
   (let ((s (string-downcase (princ-to-string path))))
