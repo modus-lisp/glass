@@ -68,6 +68,18 @@ without them."
   :serial t
   :components ((:file "climacs-compat")))
 
+(asdf:defsystem "mcclim-glass/mixer"
+  :description "The session's audio as a window: every source by name, its level, its gain and
+whether the session can hear it.  The WebRTC client's two RMS meters generalised to the machine
+the mixer is on -- and diagnostic before it is a control, because a desktop that is silent
+because nothing is playing looks exactly like one that is silent because something is broken.
+
+OPTIONAL and separate from the backend, like its Speak and Listen siblings: a desktop without
+audio should still build, and this window should then say so rather than not existing."
+  :depends-on ("mcclim-glass")
+  :serial t
+  :components ((:file "mixer-app")))
+
 (asdf:defsystem "mcclim-glass/listen"
   :description "The window speak is the mirror of: press Listen and the box fills up with what
 the session is saying.  The desktop's ear (glass/hearing) behind a text box and three buttons, as
