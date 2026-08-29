@@ -10,7 +10,7 @@
            #:run-wm                      ; a session, AND its home seat exposed on a wire
            #:run-session                 ; …just the session: nothing listens
            #:make-wm-session #:start-wm-session #:run-wm-loop   ; the three RUN-WM is made of
-           #:seat-focus #:seat-focus-back #:seat-prev-focus
+           #:seat-focus #:seat-focus-back #:seat-prev-focus #:wm-surface-title
            #:seat-scale #:seat-ppem #:seat-metric  ; pixel density: see docs/density-and-colour.md
            #:*wm-scale* #:wm-titleh #:wm-border #:wm-size #:with-seat-scale
            #:register-app                ; register an external app in the root menu

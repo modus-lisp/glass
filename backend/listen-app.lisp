@@ -107,6 +107,36 @@ on the next tick, which reads as a window that ignores its own button."
           (app-written frame) ""
           (clim:gadget-value (clim:find-pane-named frame 'transcript)) "")))
 
+(defun %hand-the-keyboard-back (frame)
+  "Give the keyboard to whatever had it before this window took it, and SAY WHERE.
+
+   Turning dictation on means clicking a button in this window, which focuses this window — so
+   without this the words go into the box that started them.  CLIM-GLASS:SEAT-FOCUS-BACK is the
+   one step of history that undoes exactly that.
+
+   THE NOTE IS HALF THE POINT, and is here because the silent version was not enough.  Where
+   dictated words are going is invisible: they appear in this window's transcript either way,
+   because showing the transcript is what this window does, so \"it went to the wrong place\"
+   and \"it went to the right place\" look identical until you go and look at the other window.
+   Saying the target turns that into something you can read, and turns a report of \"it does not
+   work\" into one that says which window it typed into.
+
+   By name and best-effort: the backend is not this file's dependency, and a session with
+   nothing to go back to should still start dictating.  The keyboard then stays here, and it
+   says so — which is a true and useful thing to know rather than a silent no-op."
+  (let* ((back  (and (find-package "CLIM-GLASS") (find-symbol "SEAT-FOCUS-BACK" "CLIM-GLASS")))
+         (fport (and (find-package "CLIM-GLASS") (find-symbol "FIND-GLASS-PORT" "CLIM-GLASS")))
+         (pseat (and (find-package "CLIM-GLASS") (find-symbol "PORT-SEAT" "CLIM-GLASS")))
+         (title (and (find-package "CLIM-GLASS") (find-symbol "WM-SURFACE-TITLE" "CLIM-GLASS")))
+         (target (and back fport pseat (fboundp back) (fboundp fport) (fboundp pseat)
+                      (ignore-errors (funcall back (funcall pseat (funcall fport)))))))
+    (setf (app-note frame)
+          (cond ((and target title (fboundp title)
+                      (ignore-errors (funcall title target)))
+                 (format nil "Typing into ~a." (ignore-errors (funcall title target))))
+                (target "Typing into the window you were last in.")
+                (t "Typing into whatever has focus — click a window to aim it.")))))
+
 (defun on-dictate (gadget value)
   "Switch the desktop between watching what it hears and TYPING it.
 
@@ -146,14 +176,7 @@ being written by the ticker.  So it says where to click."
        ;; nothing to go back to should still start dictating rather than refuse.  The keyboard
        ;; then stays here, which is the old behaviour and is what a desktop with one window
        ;; open means anyway.
-       (let ((back (and (find-package "CLIM-GLASS")
-                        (find-symbol "SEAT-FOCUS-BACK" "CLIM-GLASS")))
-             (port (and (find-package "CLIM-GLASS")
-                        (find-symbol "FIND-GLASS-PORT" "CLIM-GLASS")))
-             (pseat (and (find-package "CLIM-GLASS")
-                         (find-symbol "PORT-SEAT" "CLIM-GLASS"))))
-         (when (and back port pseat (fboundp back) (fboundp port) (fboundp pseat))
-           (ignore-errors (funcall back (funcall pseat (funcall port))))))
+       (%hand-the-keyboard-back frame)
        (glass:start-listening)
        (glass:start-dictation)
        (setf (app-note frame)
