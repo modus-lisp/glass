@@ -572,6 +572,14 @@ as dictation does — see HEARING-LISTEN."
 Idempotent, and deliberately session-wide: two windows asking to listen share one ear rather
 than loading a second quarter-gigabyte of weights and putting a second sink on the mix."
   (sb-thread:with-mutex (*session-ears-lock*)
+    ;; ASK FOR A MICROPHONE HERE, once, because this is the moment somebody decided to
+    ;; listen.  Not in %PEER-MIC, which the pull loop calls per frame — a device open on that
+    ;; path is a device open per frame, and on the first version of this it was also an
+    ;; NSWindow touched from the pull thread, which macOS ends the process over.
+    ;;
+    ;; Best-effort and before the ear exists: a session with no way to open one carries on
+    ;; and listens to the mix, which is what it did before there was a provider at all.
+    (when (fboundp 'ensure-mic) (ignore-errors (ensure-mic)))
     (or *session-ears* (setf *session-ears* (make-ears :source source)))))
 
 (defun %stop-dictation-if-any ()

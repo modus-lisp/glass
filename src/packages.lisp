@@ -79,6 +79,7 @@
    #:mic-stream-port #:mic-stream-report #:*mic-stream-port* #:*mic-rate* #:*mic-live-seconds*
    #:*mic-gap-frames* #:session-mic #:*session-mic-stream* #:stream-mic #:mic-stream-current
    #:mic #:mic-p #:make-mic #:mic-push #:attach-mic #:detach-mic #:*session-mic*
+   #:*mic-provider* #:ensure-mic
    #:mic-next-frame #:mic-source #:mic-live-p #:mic-report #:mic-name #:mic-rate
    #:mic-frames #:mic-received #:mic-drops #:mic-underruns
    #:make-mic-sender #:mic-send #:mic-feed #:mic-sender-stop #:mic-sender-report

@@ -238,6 +238,28 @@ NIL is the ordinary state of a desktop nobody has dialed into and nobody is sitt
 caller is written so that NIL costs nothing: no error, no log line, and no microphone."
   *session-mic*)
 
+(defvar *mic-provider* nil
+  "A thunk that opens a microphone and attaches it, or NIL when nothing here can.
+
+   THE MICROPHONE IS NOT TAKEN UNTIL SOMETHING WANTS IT.  A capture device opened at boot is a
+   permission prompt nobody asked for and a recording light on for a desktop that is not
+   listening — a capability arriving because the program started, which is the thing every
+   other capability here is careful not to do.
+
+   So the producer registers the ability rather than exercising it, and ENSURE-MIC calls this
+   the first time an ear looks for a microphone and does not find one.  Set by whatever can
+   actually open a device — glass-sdl does — and left NIL in an image that cannot, where the
+   honest answer to \"is there a microphone\" stays no.")
+
+(defun ensure-mic ()
+  "The session's microphone, opening one if nothing has yet and something here can.
+
+   Called at the moment of first listening rather than at startup.  Idempotent, and cheap once
+   there is a microphone: the common case is a mic already attached and this is one read."
+  (or *session-mic*
+      (and *mic-provider* (ignore-errors (funcall *mic-provider*)))
+      *session-mic*))
+
 (defun attach-mic (mic)
   "Make MIC the session's microphone and return it.  Called by whatever produced it — the socket
 server when a peer connects, a local viewer when it opens a capture device.  Last one wins, which
