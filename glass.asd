@@ -127,6 +127,19 @@ is a bigger change inside the framebuffer session, and this needs none of it.)"
   :serial t
   :components ((:module "src" :serial t :components ((:file "audio-stream")))))
 
+(asdf:defsystem :glass/mic
+  :description "A microphone, as an object, with no wire under it.  The in-image half of audio IN,
+and the mirror of what MIXER-SUBSCRIBE already was for audio OUT: ATTACH-MIC gives the session one,
+MIC-PUSH feeds it, MIC-NEXT-FRAME reads it, and nothing in that requires a socket.
+
+Split out of glass/mic-stream, which defined the microphone inside its transport -- so the only way
+to have one was for something to dial in.  That was true while the only peer was a browser behind a
+gateway; a viewer in the desktop's own process has no connection to accept, and would have had to
+open a wire to itself for the object to exist."
+  :depends-on ("glass/fb" "reed")
+  :serial t
+  :components ((:module "src" :serial t :components ((:file "mic")))))
+
 (asdf:defsystem :glass/mic-stream
   :description "A peer's microphone over a socket, the other direction of :glass/audio-stream's
 relationship and on its own port beside it: the desktop listens, whatever holds the peer (the
@@ -139,7 +152,7 @@ desktop that cannot transcribe can still carry a microphone."
   :version "0.0.1"
   :author "ynniv"
   :license "MIT"
-  :depends-on ("glass" "glass/audio-stream")
+  :depends-on ("glass/mic" "glass" "glass/audio-stream")
   :serial t
   :components ((:module "src" :serial t :components ((:file "mic-stream")))))
 
@@ -184,7 +197,7 @@ dependency only of this system."
   :version "0.0.1"
   :author "ynniv"
   :license "MIT"
-  :depends-on ("glass/audio" "stave")
+  :depends-on ("glass/mic" "glass/audio" "stave")
   :serial t
   :components ((:module "src" :serial t :components ((:file "hearing")))))
 
