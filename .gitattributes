@@ -1,0 +1,14 @@
+# Lisp source is checked out with LF on every platform.
+#
+# NOT a tidiness preference.  FORMAT's line-continuation directive is a tilde followed
+# by a NEWLINE, and this codebase uses it heavily to keep long control strings
+# readable.  Where git converts to CRLF on checkout, that becomes tilde-CR, which is
+# not a directive at all -- so a Windows build fails at COMPILE-FILE with
+#
+#   error in FORMAT: Unknown directive (character: Return)
+#
+# pointing into a string that is perfectly correct in the repository.  The file is
+# fine; the checkout was not.
+*.lisp   text eol=lf
+*.asd    text eol=lf
+*.md     text eol=lf
