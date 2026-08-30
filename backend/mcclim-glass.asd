@@ -17,6 +17,7 @@
                (:file "message-port")
                (:file "wm")
                (:file "control")
+               (:file "introspect")     ; source-of / where-is, over the control wire
                (:file "compositor")))
 
 (asdf:defsystem "mcclim-glass/speak"
