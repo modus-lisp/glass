@@ -40,4 +40,6 @@ jobs:
           sbcl --non-interactive --eval '(ql:quickload (list :bordeaux-threads :chipz :cl-base64 :com.inuoe.jzon :ironclad :salza2 :usocket))'
       - name: Gate
         working-directory: glass
+        env:
+          CL_SOURCE_REGISTRY: '(:source-registry (:tree "${{ github.workspace }}/") (:exclude "vendor") (:exclude "deps") :inherit-configuration)'
         run: sbcl --dynamic-space-size 3072 --non-interactive --eval '(require :asdf)' --load inspect/audio-gate.lisp
