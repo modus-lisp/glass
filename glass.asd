@@ -45,7 +45,10 @@ give modus a remote display, developed and tested on SBCL first."
   :version "0.0.1"
   :author "ynniv"
   :license "MIT"
-  :depends-on ("glass/fb" "glass/clipboard" "sb-bsd-sockets" "sb-posix" "cram")
+  ;; cl-transport carries the listeners now (src/listeners.lisp there), so :glass
+  ;; depends on it rather than owning sockets.  sb-posix stays for what is left in
+  ;; nostr.lisp; glass/fb still declares none, which is the point of glass/fb.
+  :depends-on ("glass/fb" "glass/clipboard" "cl-transport" "sb-bsd-sockets" "sb-posix" "cram")
   :serial t
   :components
   ((:module "src"
@@ -55,7 +58,8 @@ give modus a remote display, developed and tested on SBCL first."
      ;; socket before rfb: a wire is a TCP port OR a socket file only its owner can open,
      ;; and RFB is a stream protocol that cannot tell which it got.  sb-posix is here for
      ;; chmod/stat/unlink on the socket file — the access control IS the file mode.
-     (:file "socket")
+     ;; socket.lisp moved to cl-transport/src/listeners.lisp; this borrows it back
+     (:file "transports")
      (:file "rfb")
      (:file "zrle")))))
 

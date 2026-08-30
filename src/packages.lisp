@@ -22,17 +22,17 @@
    ;; server: (serve fb port &key on-key on-pointer on-resize name once wake)
    ;; naming things people say out loud (wordlist.lisp)
    #:word-name #:*wordlist*
-   #:serve #:serve-one #:*desktop-name* #:tcp-listen #:close-listener #:make-wake #:wake-signal
-   ;; transports (src/socket.lisp) — a port anybody on the box can reach, or a socket file
-   ;; only its owner can open.  Siblings: everything above them is a stream protocol.
-   #:listener #:tcp-listener #:unix-listener #:open-listener #:unix-listen
-   #:listener-kind #:listener-endpoint #:listener-open-p #:listener-socket #:listener-path
-   #:listener-port #:listener-address #:listener-mode #:listener-peer-policy #:listener-refused
-   #:listener-accept #:accept-stream
-   #:runtime-dir #:socket-path #:socket-sibling #:*runtime-dir* #:*socket-file-mode* #:*socket-dir-mode*
-   #:clear-stale-socket #:unix-socket-live-p
-   #:peer-credentials #:peer-allowed-p #:peer-name #:socket-fd #:*peer-policy*
-   #:open-connection #:parse-endpoint #:endpoint-string #:socket-unsent-bytes
+   #:serve #:serve-one #:*desktop-name* #:make-wake #:wake-signal
+   ;; TRANSPORTS ARE NOT OURS ANY MORE.  Listeners, socket files, peer credentials and
+   ;; the platform assumptions that come with them live in cl-transport now, beside DIAL
+   ;; and EXPOSE, where "how do bytes travel" already lived.  None of it was ever about
+   ;; pixels, and a window system owning it is how glass became the one repo here that
+   ;; could not compile on Windows.
+   ;;
+   ;; They are imported into GLASS and re-exported by src/transports.lisp, NOT named
+   ;; here: this file belongs to :glass/fb, the portable core that depends on nothing,
+   ;; and naming them here would intern GLASS::OPEN-LISTENER as a different symbol from
+   ;; CL-TRANSPORT:OPEN-LISTENER -- which is exactly the conflict IMPORT then signals.
    ;; VNC authentication (from-scratch DES); *vnc-password* nil = open, string = required.
    ;; A credential is per TRANSPORT (SERVE's :PASSWORD); *vnc-password* is what a transport
    ;; that named none inherits, and MAKE-VNC-CREDENTIAL mints one worth naming.
