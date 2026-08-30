@@ -117,6 +117,19 @@
   #+unix (ignore-errors (sb-posix:chmod (string-right-trim "/" (namestring path)) mode))
   #-unix (progn path mode nil))
 
+(defun %local-socket ()
+  "A fresh AF_UNIX stream socket.
+
+   Gated for the same read-time reason as the sb-posix calls above, and for a starker
+   case: SB-BSD-SOCKETS:LOCAL-SOCKET is not a class that behaves differently on
+   Windows, it is a symbol that is not in the package there at all, so naming it
+   anywhere in this file stopped the whole of glass from compiling.  A UNIX-domain
+   socket genuinely has no Windows counterpart -- AF_UNIX exists on modern Windows but
+   sb-bsd-sockets does not expose it -- so this signals rather than pretending."
+  #+unix (make-instance 'sb-bsd-sockets:local-socket :type :stream)
+  #-unix (error "glass: UNIX-domain sockets are not available on this platform. ~
+                 Use a TCP listener instead: (open-listener :tcp :port N)."))
+
 (defun %unlink (path)
   #+unix (ignore-errors (sb-posix:unlink path))
   #-unix (ignore-errors (delete-file path)))
@@ -356,7 +369,7 @@
    the same inode whether the server is alive or was SIGKILLed a week ago.  connect()
    distinguishes them: ECONNREFUSED means the file has no listener behind it and is stale;
    a successful connect means somebody is there and this path is taken."
-  (let ((sock (make-instance 'sb-bsd-sockets:local-socket :type :stream)))
+  (let ((sock (%local-socket)))
     (unwind-protect
          (handler-case (progn (sb-bsd-sockets:socket-connect sock path) t)
            (sb-bsd-sockets:connection-refused-error () nil)
@@ -388,7 +401,7 @@
    reasons, because this is the property the whole change exists for.)"
   (ensure-directories-exist (directory-namestring path))
   (clear-stale-socket path)
-  (let ((sock (make-instance 'sb-bsd-sockets:local-socket :type :stream)))
+  (let ((sock (%local-socket)))
     (handler-bind ((error (lambda (e) (declare (ignore e))
                             (ignore-errors (sb-bsd-sockets:socket-close sock)))))
       (sb-bsd-sockets:socket-bind sock path)
@@ -569,7 +582,7 @@
   (multiple-value-bind (kind h p sock-path) (parse-endpoint host port)
     (let* ((path (or path (and (eq kind :unix) sock-path)))
            (sock (if path
-                     (make-instance 'sb-bsd-sockets:local-socket :type :stream)
+                     (%local-socket)
                      (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp))))
       (handler-bind ((error (lambda (e) (declare (ignore e))
                               (ignore-errors (sb-bsd-sockets:socket-close sock)))))
