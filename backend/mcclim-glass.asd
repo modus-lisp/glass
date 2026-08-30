@@ -68,6 +68,18 @@ without them."
   :serial t
   :components ((:file "climacs-compat")))
 
+(asdf:defsystem "mcclim-glass/music"
+  :description "A playlist, a transport and a clock — Winamp's arrangement, because it was the
+right one.  It decodes nothing and plays nothing: reed decodes, spool's player turns that into
+a source with a position, and the session mixer plays it to whoever is listening.  All three
+existed already; what was missing was a way to point them at a file and a window to do it in.
+
+OPTIONAL, and spool is found by name rather than depended on, so a desktop without it still
+builds this window and the window says what is missing."
+  :depends-on ("mcclim-glass")
+  :serial t
+  :components ((:file "music-app")))
+
 (asdf:defsystem "mcclim-glass/mixer"
   :description "The session's audio as a window: every source by name, its level, its gain and
 whether the session can hear it.  The WebRTC client's two RMS meters generalised to the machine

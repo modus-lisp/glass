@@ -2538,6 +2538,8 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
                          :width 560 :height 400 :title "Listen")
             ;; What the session is playing and who can hear it — the thing to open when the
             ;; desktop is silent and you need to know whether that is correct.
+            (wm-app-item "Music" '#:glass-music "MUSIC-BOX"
+                         :width 520 :height 420 :title "Music")
             (wm-app-item "Mixer" '#:glass-mixer "MIXER-BOX"
                          :width 460 :height 340 :title "Mixer")
             (let ((img (wm-sample-image))) (and img (list "Image Viewer" :image img)))))
