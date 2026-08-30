@@ -67,6 +67,30 @@
   (let ((f (%fn fn "GLASS-SDL")))
     (and f (ignore-errors (funcall f)))))
 
+(defun %mic-open-p ()
+  "Whether a capture device is actually held right now — asked of the device, not of a flag."
+  (let ((f (%fn "AUDIO-IN-OPEN-P" "GLASS-SDL"))
+        (v (let ((s (and (find-package "GLASS-SDL") (find-symbol "*VIEWER*" "GLASS-SDL"))))
+             (and s (boundp s) (symbol-value s)))))
+    (and f v (ignore-errors
+              (funcall f (funcall (find-symbol "V-MIC" "GLASS-SDL") v))))))
+
+(defun %mic-reader ()
+  "What is reading the microphone, to print after its state, or NIL.
+
+   Today there is one consumer and it is the ear, so this names it rather than pretending at
+   a registry with one entry.  It asks whether the ear is LISTENING and whether it is reading
+   the microphone rather than the session mix, because those are different answers and only
+   one of them explains a live capture device."
+  (let* ((ears  (let ((s (and (find-package "GLASS") (find-symbol "*SESSION-EARS*" "GLASS"))))
+                  (and s (boundp s) (symbol-value s))))
+         (going (let ((f (%fn "LISTENING-P"))) (and ears f (ignore-errors (funcall f ears)))))
+         (src   (let ((f (%fn "EAR-LISTENING-TO"))) (and ears f (ignore-errors (funcall f ears))))))
+    (cond ((and going (eq src :peer)) " — the ear is reading it")
+          (going " — an ear is running, on the session mix")
+          (t nil))))
+
+
 (defun %session-level ()
   (let ((m (%mixer)) (f (%fn "MIXER-LEVEL")))
     (and m f (ignore-errors (funcall f m)))))
@@ -131,7 +155,15 @@
        (when (%fn "MICROPHONE-MUTED-P" "GLASS-SDL")
          (format stream "~&  mic  ")
          (%meter stream nil)
-         (format stream "~a~%" (if (%muted-p "MICROPHONE-MUTED-P") "muted" "open")))
+         ;; AND WHO IS READING IT.  "The microphone is live" is half an answer, and the
+         ;; half that reads as a fault: a recording light with nothing visibly using it
+         ;; looks like something stuck on, and the honest reply — an ear somebody started —
+         ;; was written nowhere.  A device is held BY something, so say what.
+         (format stream "~a~a~%"
+                 (cond ((%muted-p "MICROPHONE-MUTED-P") "muted")
+                       ((%mic-open-p) "open")
+                       (t "not in use"))
+                 (or (%mic-reader) "")))
        (format stream "~%")
 
        (clim:with-text-style (stream (ui-bold 14))
