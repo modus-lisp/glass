@@ -64,14 +64,74 @@
 (defun %as-directory (s)
   (if (and (plusp (length s)) (char= (char s (1- (length s))) #\/)) s (concatenate 'string s "/")))
 
+
+;;; ---- the POSIX corner -------------------------------------------------------
+;;;
+;;; A UNIX-domain socket is a Unix idea, and so is everything this file asks about
+;;; one: the mode bits it is created with, the uid that owns the directory it sits
+;;; in, and the inode used to tell "the socket we bound" from "whatever is at that
+;;; path now".  None of it has a Windows meaning.
+;;;
+;;; Every sb-posix call goes through the shims below, gated with #+unix -- and the
+;;; gate has to be a READ-time one.  SB-POSIX exists on Windows; it simply has a
+;;; different set of symbols in it, so SB-POSIX:GETUID is not a function that fails
+;;; at run time, it is a symbol the reader cannot find, and the whole file fails to
+;;; compile before any of it runs.  #- suppresses the form instead of evaluating it,
+;;; which is the only mechanism that survives that.  IGNORE-ERRORS cannot: it is
+;;; inside the form that could not be read.
+;;;
+;;; Found by glass-sdl's Windows CI, which is the only thing here that compiles glass
+;;; on a machine without a uid.
+
+(defun %uid ()
+  "This process's real uid, or NIL where the platform has no such notion."
+  #+unix (ignore-errors (sb-posix:getuid))
+  #-unix nil)
+
+(defun %stat-of (path)
+  "(values mode uid ino) for PATH, or NIL if it cannot be statted."
+  #+unix (handler-case
+             (let ((st (sb-posix:stat (string-right-trim "/" (namestring path)))))
+               (values (sb-posix:stat-mode st) (sb-posix:stat-uid st) (sb-posix:stat-ino st)))
+           (error () nil))
+  #-unix (progn path nil))
+
+(defun %file-inode (path)
+  (multiple-value-bind (mode uid ino) (%stat-of path) (declare (ignore mode uid)) ino))
+
+(defun %is-dir (mode)
+  "Does a stat mode say `directory'?  Only ever called with a mode we obtained."
+  #+unix (and mode (sb-posix:s-isdir mode) t)
+  #-unix (progn mode nil))
+
+(defun %directory-p (path)
+  #+unix (%is-dir (%stat-of path))
+  #-unix (and (probe-file path) t))
+
+(defun %socket-p (path)
+  #+unix (let ((mode (%stat-of path))) (and mode (sb-posix:s-issock mode) t))
+  #-unix (and (probe-file path) t))
+
+(defun %chmod (path mode)
+  "Set PATH's mode where that means something; elsewhere, quietly do nothing."
+  #+unix (ignore-errors (sb-posix:chmod (string-right-trim "/" (namestring path)) mode))
+  #-unix (progn path mode nil))
+
+(defun %unlink (path)
+  #+unix (ignore-errors (sb-posix:unlink path))
+  #-unix (ignore-errors (delete-file path)))
+
 (defun %dir-ours-p (dir)
   "Does DIR exist, as a directory, owned by this uid?  NIL for anything else — including
    the case that actually happens, a runtime dir belonging to another user."
-  (handler-case
-      (let ((st (sb-posix:stat (string-right-trim "/" (namestring dir)))))
-        (and (sb-posix:s-isdir (sb-posix:stat-mode st))
-             (eql (sb-posix:stat-uid st) (sb-posix:getuid))))
-    (error () nil)))
+  (multiple-value-bind (mode uid) (%stat-of dir)
+    (let ((me (%uid)))
+      (cond ((null me)
+             ;; Where there are no uids there is no other user to have made it, and the
+             ;; directory sits under this user's own runtime root by construction.
+             (%directory-p dir))
+            ((null mode) nil)                     ; missing, or not stattable
+            (t (and (%is-dir mode) (eql uid me)))))))
 
 (defun runtime-dir ()
   "The directory socket files go in, as a pathname, CREATED (mode 0700) if it is missing.
@@ -86,7 +146,7 @@
                      (merge-pathnames "glass/" (pathname (%as-directory xdg))))
                     (t (merge-pathnames ".glass/run/" (user-homedir-pathname))))))
     (ensure-directories-exist dir)
-    (ignore-errors (sb-posix:chmod (string-right-trim "/" (namestring dir)) *socket-dir-mode*))
+    (%chmod dir *socket-dir-mode*)
     dir))
 
 (defun socket-sibling (path type)
@@ -195,7 +255,7 @@
   (cond ((null uid) t)                            ; no credentials to judge — not a UNIX peer
         ((eq policy :any) t)
         ((functionp policy) (and (funcall policy uid gid pid) t))
-        ((eq policy :same-uid) (or (eql uid (sb-posix:getuid)) (eql uid 0)))
+        ((eq policy :same-uid) (or (eql uid (%uid)) (eql uid 0)))
         (t t)))
 
 (defun peer-name (sock)
@@ -287,8 +347,7 @@
 (defvar *unix-listeners-lock* (sb-thread:make-mutex :name "glass-unix-listeners"))
 
 (defun %socket-file-p (path)
-  (handler-case (sb-posix:s-issock (sb-posix:stat-mode (sb-posix:stat path)))
-    (error () nil)))
+  (%socket-p path))
 
 (defun unix-socket-live-p (path)
   "Is somebody ACCEPTING on PATH right now?  The only honest way to ask: connect to it.
@@ -315,7 +374,7 @@
   (and (probe-file path)
        (%socket-file-p path)
        (null (unix-socket-live-p path))
-       (progn (ignore-errors (sb-posix:unlink path)) t)))
+       (progn (%unlink path) t)))
 
 (defun unix-listen (path &key (backlog 8) (mode *socket-file-mode*) (peer-policy *peer-policy*))
   "A listening UNIX socket at PATH, owner-only.  Returns a UNIX-LISTENER.
@@ -333,11 +392,11 @@
     (handler-bind ((error (lambda (e) (declare (ignore e))
                             (ignore-errors (sb-bsd-sockets:socket-close sock)))))
       (sb-bsd-sockets:socket-bind sock path)
-      (sb-posix:chmod path mode)                       ; before listen: see above
+      (%chmod path mode)                               ; before listen: see above
       (sb-bsd-sockets:socket-listen sock backlog))
     (let ((l (make-instance 'unix-listener :socket sock :path path :backlog backlog
                                            :mode mode :peer-policy peer-policy
-                                           :inode (ignore-errors (sb-posix:stat-ino (sb-posix:stat path))))))
+                                           :inode (%file-inode path))))
       (sb-thread:with-mutex (*unix-listeners-lock*) (push l *unix-listeners*))
       l)))
 
@@ -460,8 +519,8 @@
       (setf *unix-listeners* (remove l *unix-listeners*)))
     (let ((path (listener-path l)) (ino (listener-inode l)))
       (when (and path (or (null ino)
-                          (eql ino (ignore-errors (sb-posix:stat-ino (sb-posix:stat path))))))
-        (ignore-errors (sb-posix:unlink path))))
+                          (eql ino (%file-inode path))))
+        (%unlink path)))
     live))
 
 (defvar *unix-exit-hook-installed* nil)

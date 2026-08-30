@@ -29,6 +29,15 @@
 
 (require :asdf)
 (load "~/quicklisp/setup.lisp")
+;; Sibling repos by tree, found relative to this file so the workspace can live
+;; anywhere.  Without it this gate resolves glass's dependencies out of quicklisp's
+;; local-projects, a hand-made list that does not have reed in it -- so it died with
+;; `Component "reed" not found' before running a single check.  Same shape as the
+;; failure in loom's gates and glass-sdl's CI.
+(asdf:initialize-source-registry
+ (let ((here (make-pathname :name nil :type nil :defaults *load-truename*)))
+   `(:source-registry (:tree ,(merge-pathnames "../../" here))
+                      (:exclude "vendor") (:exclude "deps") :inherit-configuration)))
 (handler-bind ((warning #'muffle-warning))
   (let ((*standard-output* (make-broadcast-stream)))
     (asdf:load-system :glass/mic-stream)          ; brings :glass and :glass/audio-stream
