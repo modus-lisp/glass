@@ -33,10 +33,20 @@ jobs:
       # the suite passed everywhere except on a machine with nothing.
       - name: Quicklisp dependencies
         run: |
-          curl -sSLo /tmp/quicklisp.lisp https://beta.quicklisp.org/quicklisp.lisp
-          sbcl --non-interactive --load /tmp/quicklisp.lisp \
-               --eval '(quicklisp-quickstart:install :path "~/quicklisp/")' \
-               --eval '(ql-util:without-prompting (ql:add-to-init-file))'
+          # RETRIED, because this is the one step that reaches the network and a
+          # transient failure here is indistinguishable from a broken repository.
+          # loom went red on "Connection reset by peer" mid-install and was diagnosed
+          # as having a non-hermetic test suite; it did not, and its suite never ran.
+          # A badge that goes red on somebody else's CDN teaches people to ignore it.
+          for attempt in 1 2 3; do
+            rm -rf ~/quicklisp
+            curl -sSLo /tmp/quicklisp.lisp https://beta.quicklisp.org/quicklisp.lisp || { sleep 5; continue; }
+            sbcl --non-interactive --load /tmp/quicklisp.lisp \
+                 --eval '(quicklisp-quickstart:install :path "~/quicklisp/")' \
+                 --eval '(ql-util:without-prompting (ql:add-to-init-file))' && break
+            echo "quicklisp install attempt $attempt failed; retrying"
+            sleep 10
+          done
           sbcl --non-interactive --eval '(ql:quickload (list :bordeaux-threads :chipz :cl-base64 :com.inuoe.jzon :ironclad :salza2 :usocket))'
       - name: Gate
         working-directory: glass
