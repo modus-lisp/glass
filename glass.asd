@@ -45,10 +45,13 @@ give modus a remote display, developed and tested on SBCL first."
   :version "0.0.1"
   :author "ynniv"
   :license "MIT"
-  ;; cl-transport carries the listeners now (src/listeners.lisp there), so :glass
-  ;; depends on it rather than owning sockets.  sb-posix stays for what is left in
-  ;; nostr.lisp; glass/fb still declares none, which is the point of glass/fb.
-  :depends-on ("glass/fb" "glass/clipboard" "cl-transport" "sb-bsd-sockets" "sb-posix" "cram")
+  ;; cl-transport carries the listeners now, and :glass takes ONLY that part of it.
+  ;; cl-transport/listeners depends on nothing but sb-bsd-sockets, so glass stays free
+  ;; of quicklisp -- cram and two SBCL contribs -- exactly as it was when it owned the
+  ;; sockets itself.  Depending on the whole of cl-transport would have quietly put
+  ;; usocket and bordeaux-threads under a display server.
+  :depends-on ("glass/fb" "glass/clipboard" "cl-transport/listeners"
+               "sb-bsd-sockets" "sb-posix" "cram")
   :serial t
   :components
   ((:module "src"

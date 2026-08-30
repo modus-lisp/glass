@@ -26,9 +26,9 @@
                  #:peer-credentials #:peer-allowed-p #:peer-name #:socket-fd #:*peer-policy*
                  #:open-connection #:parse-endpoint #:endpoint-string #:socket-unsent-bytes)))
     (dolist (n names)
-      (let ((sym (find-symbol (string n) '#:cl-transport)))
+      (let ((sym (find-symbol (string n) '#:cl-transport.listeners)))
         (unless sym
-          (error "glass: cl-transport does not export ~a — the listener layer moved ~
+          (error "glass: cl-transport.listeners does not export ~a — the listener layer moved ~
                   there; see cl-transport/src/listeners.lisp." n))
         (import sym '#:glass)
         (export sym '#:glass)))))
