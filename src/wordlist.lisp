@@ -286,6 +286,21 @@
                             (ldb (byte 1 (- 7 (mod bit 8))) (aref bytes byte))
                             0)))))))
 
+(defun %pid ()
+  "This process's id, or 0 where there is no such notion.
+
+   BY NAME, because :glass/fb is the portable core -- no FFI, no sockets, the piece
+   that drops onto modus on bare metal -- and a bare SB-POSIX:GETPID puts a hard
+   dependency on a contrib package into it.  Not hypothetically: this file is compiled
+   before anything has loaded sb-posix in a minimal image, and a package prefix is read
+   before IGNORE-ERRORS can do anything about it, so glass/fb failed to compile at all
+   with `Package SB-POSIX does not exist\'.  Found by glass-sdl\'s CI, which is the only
+   place that builds this system without the rest of the workspace around it.
+
+   The pid is one term of a seed for naming desktops; absent, the clock still varies."
+  (let ((f (and (find-package "SB-POSIX") (find-symbol "GETPID" "SB-POSIX"))))
+    (or (and f (fboundp f) (ignore-errors (funcall f))) 0)))
+
 (defun %fresh-bytes (n)
   "N bytes of entropy, read now.
 
@@ -303,7 +318,7 @@
            (and in (= n (read-sequence out in)) out)))
         (let ((seed (logxor (get-universal-time)
                             (get-internal-real-time)
-                            (ash (or (ignore-errors (sb-posix:getpid)) 0) 16))))
+                            (ash (%pid) 16))))
           (dotimes (i n out)
             ;; a small LCG over the seed: enough to spread the bits across the bytes
             (setf seed (mod (+ (* seed 6364136223846793005) 1442695040888963407)
