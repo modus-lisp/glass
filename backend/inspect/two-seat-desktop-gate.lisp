@@ -685,6 +685,17 @@
          "CONTROL-ANSWER reports an unfinished form off a string stream too: ~a" unbalanced)
   (check (equal fine "(1 2)") "…evaluates a good one: ~s" fine)
   (check (null nothing) "…and an empty request is the one thing that gets silence"))
+;; WHAT THE FORM PRINTS COMES BACK, as at a REPL.  Every reporting function in the image
+;; writes to *STANDARD-OUTPUT* and returns something small, so without this a control
+;; connection gets the small thing and the report goes to the session log:
+;; (cl-transport.gate:report) answered "5", which was the number of lines it had just
+;; written somewhere the asker could not see.
+(let ((printed (control-answer (make-string-input-stream "(progn (princ \"hello\") 5)")))
+      (failed  (control-answer (make-string-input-stream "(progn (princ \"partial\") (error \"boom\"))"))))
+  (check (and (search "hello" printed) (search "5" printed))
+         "CONTROL-ANSWER returns what the form printed AND its value: ~s" printed)
+  (check (and (search "partial" failed) (search "ERROR" failed))
+         "…and keeps what was printed before a form failed: ~s" failed))
 
 ;;; ==============================================================================
 (banner "the desktop ran through all of it, and nothing else was touched")

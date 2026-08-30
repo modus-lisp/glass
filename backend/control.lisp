@@ -45,8 +45,34 @@
           (error (e) (values nil e)))
       (cond (read-error (format nil "ERROR: unreadable form: ~a" read-error))
             ((null form) nil)
-            (t (handler-case (princ-to-string (eval form))
-                 (error (e) (format nil "ERROR: ~a" e))))))))
+            (t
+             ;; WHAT THE FORM PRINTS COMES BACK TOO, which is what a REPL does and what
+             ;; anybody typing at this expects.  Without it, every reporting function in
+             ;; the image answers a control connection with its return value while the
+             ;; interesting part goes to the session log: (cl-transport.gate:report)
+             ;; replied `5\' -- a true and useless statement of how many lines it had
+             ;; just written somewhere else.
+             ;;
+             ;; Only *STANDARD-OUTPUT*.  Warnings and backtraces belong in the log
+             ;; whether or not somebody is holding this socket open, and folding them
+             ;; into the answer would make an unrelated warning look like the reply.
+             (let ((printed (make-string-output-stream)))
+               (handler-case
+                   (let* ((value (let ((*standard-output* printed)) (eval form)))
+                          (text (get-output-stream-string printed))
+                          (shown (princ-to-string value)))
+                     (if (plusp (length text))
+                         ;; Value last, as a REPL does -- and separated, so a caller
+                         ;; reading only the final line still gets the value.
+                         (format nil "~a~:[~;~%~]~a" text
+                                 (char/= (char text (1- (length text))) #\Newline)
+                                 shown)
+                         shown))
+                 (error (e)
+                   ;; Anything already printed is part of the story of the failure.
+                   (let ((text (get-output-stream-string printed)))
+                     (format nil "~@[~a~%~]ERROR: ~a"
+                             (and (plusp (length text)) text) e))))))))))
 
 (defun start-control-socket (&key port path (name "glass-control"))
   "Serve a read-eval-print wire onto this image: one form per connection, evaluated in the
