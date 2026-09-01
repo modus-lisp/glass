@@ -616,36 +616,60 @@
 
 ;;; ---- PTY + run --------------------------------------------------------------
 
+(defconstant +tiocswinsz+
+  #+darwin #x80087467                   ; BSD encodes direction and size in the request
+  #-darwin #x5414                       ; Linux numbers its tty ioctls sequentially
+  "TIOCSWINSZ, which is not the same number on every kernel.
+
+   Linux numbers its tty ioctls sequentially; BSD encodes the direction and the
+   argument size into the request, so the same operation is #x5414 there and
+   #x80087467 here.  The Linux value used to be hard-coded, so on macOS this failed —
+   silently, inside IGNORE-ERRORS — and every program in the terminal was told nothing
+   about the window size.  A shell copes; anything that draws does not.
+
+   Fixing the number was not sufficient on its own: see SET-WINSIZE for the variadic
+   calling convention that was failing underneath it.")
+
 (defun set-winsize (stream rows cols)
   "TIOCSWINSZ on the pty master so programs know the size (best-effort)."
   (ignore-errors
    (sb-alien:with-alien ((ws (sb-alien:array sb-alien:unsigned-short 4)))
      (setf (sb-alien:deref ws 0) rows (sb-alien:deref ws 1) cols
            (sb-alien:deref ws 2) 0 (sb-alien:deref ws 3) 0)
-     (sb-alien:alien-funcall
-      (sb-alien:extern-alien "ioctl"
-        (function sb-alien:int sb-alien:int sb-alien:unsigned-long
-                  (* (sb-alien:array sb-alien:unsigned-short 4))))
-      (sb-sys:fd-stream-fd stream) #x5414 (sb-alien:addr ws)))))
+     ;; THROUGH SB-POSIX, not a bare EXTERN-ALIEN.  ioctl(2) is variadic, and on
+     ;; arm64 Darwin variadic arguments are passed on the STACK while fixed ones go in
+     ;; registers — so declaring it as a plain three-argument function hands the
+     ;; pointer to a register ioctl never reads, and every call returns -1.  Measured:
+     ;; the same call is 0 through SB-POSIX and -1 through EXTERN-ALIEN, on the same
+     ;; fd, with either kernel's request number.  SBCL provides a non-variadic entry
+     ;; point precisely for this.
+     (sb-posix::ioctl-with-pointer-arg
+      (sb-sys:fd-stream-fd stream) +tiocswinsz+ (sb-alien:addr ws)))))
 
 (defun enable-echo (stream)
-  "Turn ECHO on for the pty.  SBCL's :pty t leaves the line discipline in -echo
-   (so a pty *driver* isn't shown its own writes), which means a shell reading in
-   canonical mode never echoes your keystrokes — you type blind, the command runs
-   but the command line never appears.  TCGETS, set the ECHO bit (0x08) in c_lflag
-   (Linux struct termios: c_iflag/oflag/cflag/lflag are 4-byte fields, so c_lflag
-   is at byte 12, little-endian), TCSETS.  Best-effort; Linux-only."
+  "Turn ECHO on for the pty.
+
+   SBCL's :pty t leaves the line discipline in -echo, so a shell reading in canonical
+   mode never echoes your keystrokes: you type blind, the command runs, and the command
+   line never appears.
+
+   THROUGH SB-POSIX, not a raw ioctl.  This used to poke TCGETS/TCSETS (0x5401/0x5402)
+   and set bit 3 of byte 12, which is Linux's request numbering and Linux's struct
+   termios — where c_lflag is a 4-byte field at offset 12.  On Darwin the requests are
+   TIOCGETA/TIOCSETA (0x40487413/0x40487414), tcflag_t is EIGHT bytes, and c_lflag is
+   at offset 24.  The ioctl therefore failed on macOS, inside IGNORE-ERRORS, and the
+   terminal had no local echo with nothing said about why.  The docstring admitted it
+   was Linux-only; the caller did not, and neither did the behaviour.
+
+   SB-POSIX already knows all of that per platform.  There was never a reason to
+   restate it here, and restating it is what made it wrong in one place."
   (ignore-errors
-   (sb-alien:with-alien ((tio (sb-alien:array sb-alien:unsigned-char 64)))
-     (let ((fd (sb-sys:fd-stream-fd stream)))
-       (flet ((tio (req) (sb-alien:alien-funcall
-                          (sb-alien:extern-alien "ioctl"
-                            (function sb-alien:int sb-alien:int sb-alien:unsigned-long
-                                      (* (sb-alien:array sb-alien:unsigned-char 64))))
-                          fd req (sb-alien:addr tio))))
-         (when (zerop (tio #x5401))                                  ; TCGETS
-           (setf (sb-alien:deref tio 12) (logior (sb-alien:deref tio 12) #x08))   ; c_lflag |= ECHO
-           (tio #x5402)))))))                                        ; TCSETS
+    (let* ((fd (sb-sys:fd-stream-fd stream))
+           (tio (sb-posix:tcgetattr fd)))
+      (setf (sb-posix:termios-lflag tio)
+            (logior (sb-posix:termios-lflag tio) sb-posix:echo))
+      (sb-posix:tcsetattr fd sb-posix:tcsanow tio)
+      t)))
 
 ;; Colour emoji come from scribe's bundled COLR fallback (Twemoji) by default;
 ;; :emoji-font is an optional override (a path to another COLR font).

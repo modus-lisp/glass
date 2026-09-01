@@ -268,7 +268,10 @@ admission.  A system boundary is the only thing that reliably keeps code out of 
   :description "A terminal emulator on glass: a real PTY + shell, an ANSI/VT
 parser, and a character grid rendered with scribe, served over VNC.  No xterm,
 no X.  (sb-ext:run-program + one winsize ioctl are the platform seam.)"
-  :depends-on ("glass" "glass/text" "scribe")
+  ;; sb-posix for the pty's termios: SBCL knows the ioctl numbers and the struct
+  ;; layout per platform, which the hand-rolled version in term.lisp did not — it
+  ;; carried Linux's and so gave macOS a terminal with no echo.
+  :depends-on ("glass" "glass/text" "scribe" "sb-posix")
   :serial t
   :components ((:module "src" :serial t :components ((:file "term")))))
 
