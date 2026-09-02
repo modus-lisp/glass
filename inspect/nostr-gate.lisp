@@ -45,7 +45,18 @@
 ;;; ---- the fixture, in /tmp, and never anywhere else ---------------------------
 
 (defparameter *fixture* "/tmp/glass-nostr-gate-devices")
-(defparameter *live* "/home/claude/webrtc-data/demo/glass-webrtc/.glass-devices")
+(defparameter *live*
+  ;; THE REAL LIVE STORE: wherever GLASS:*ENROLMENT-FILE* defaults to — $GLASS_DEVICE_FILE,
+  ;; else ~/.glass-devices.
+  ;;
+  ;; It used to name /home/claude/webrtc-data/demo/glass-webrtc/.glass-devices: one
+  ;; machine's home directory, one repository ago.  Everything below asserts that this
+  ;; gate does NOT touch the live store — and against a path that exists nowhere,
+  ;; PROBE-FILE is NIL, the mtime comparison is NIL against NIL, and every one of those
+  ;; checks passes without testing anything.  A safety check aimed at a file that cannot
+  ;; exist is the most comfortable kind of green there is.
+  (or (sb-ext:posix-getenv "GLASS_DEVICE_FILE")
+      (namestring (merge-pathnames ".glass-devices" (user-homedir-pathname)))))
 
 (defparameter *owner* "1111111111111111111111111111111111111111111111111111111111111111")
 (defparameter *guest* "2222222222222222222222222222222222222222222222222222222222222222")

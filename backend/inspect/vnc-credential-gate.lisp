@@ -35,7 +35,11 @@
     ;; sense that this file says so if it is missing; the evidence needs it.
     (ignore-errors
      (ql:quickload '(:webrtc-data :webrtc-media))
-     (load "/home/claude/webrtc-data/demo/glass-webrtc/glass-capture.lisp"))))
+     ;; ASKED FOR BY NAME.  This used to load an absolute path under /home/claude —
+     ;; another machine's home directory — so on every other machine the form failed
+     ;; inside its own IGNORE-ERRORS and the gate carried on without the video path
+     ;; it says it needs.  A check that runs on one laptop is not a check.
+     (asdf:load-system "glass-webrtc"))))
 (in-package :clim-glass)
 
 (defvar *fail* 0)
