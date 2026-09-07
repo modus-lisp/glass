@@ -438,7 +438,7 @@
 (head "the control socket — the one that EVALUATES what you send it")
 
 ;;; :4013 is READ + EVAL + print, with no authentication of any kind, and its only protection
-;;; today is that you have to already be on the machine.  It lives in warren/desktop-5903.lisp
+;;; today is that you have to already be on the machine.  It lives in cortez/desktop-5903.lisp
 ;;; rather than here, so what this checks is the SHAPE that launcher would take: the same four
 ;;; lines with GLASS:OPEN-LISTENER and GLASS:ACCEPT-STREAM in them.  A character stream, because
 ;;; that is what READ wants — which is the whole reason ACCEPT-STREAM takes an element type.

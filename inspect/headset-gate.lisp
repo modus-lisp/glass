@@ -95,7 +95,7 @@ sender's clock would have collected."
 
 ;;; ---- the one-seat desktop, exactly as its startup script starts it ------------
 ;;;
-;;; warren/desktop-5903.lisp says, and says only, this:
+;;; cortez/desktop-5903.lisp says, and says only, this:
 ;;;
 ;;;   (glass:start-session-audio :port 5913 :address "127.0.0.1" :file nil)
 ;;;   (glass:start-session-mic   :port 5914 :address "127.0.0.1")

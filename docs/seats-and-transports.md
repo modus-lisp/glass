@@ -106,7 +106,7 @@ guest seat" unsayable, and that is a thing people do.
 
 ## The migration, and its honest cost
 
-`run-wm` is called by every launcher (`warren/desktop-5903.lisp`, `backend/inspect/serve-desktop.lisp`,
+`run-wm` is called by every launcher (`cortez/desktop-5903.lisp`, `backend/inspect/serve-desktop.lisp`,
 the gates). Splitting "run a session" from "expose a seat" changes the one call everything makes,
 and its name stops being true. The launchers keep doing both, in two calls instead of one.
 
