@@ -524,15 +524,31 @@ cannot drift apart."
                                                 (when (zerop n) (clim-token-seat-gone port seat)))
                                   ;; every transport of THIS seat shares THIS selection
                                   :clipboard  (seat-clipboard seat)
-                                  ;; The RFB desktop name is what a viewer puts in its title
-                                  ;; bar.  The primary seat keeps the name it has always
-                                  ;; advertised — a one-seat desktop must look identical from
-                                  ;; the outside, and a nested desktop shows this string in
-                                  ;; the hosting window's title — and only a further seat says
-                                  ;; which one it is, where the question can actually arise.
-                                  :name (if (seat-primary-p seat)
-                                            "glass-mcclim"
-                                            (format nil "glass-mcclim (~a)" (seat-name seat))))
+                                  ;; The RFB desktop name is what a viewer puts in its title bar
+                                  ;; — and what the WebRTC client LEARNS THIS DESKTOP'S NAME FROM,
+                                  ;; since glass sends it in the handshake and nothing else on that
+                                  ;; wire says which box you reached.
+                                  ;;
+                                  ;; IT USED TO BE THE CONSTANT "glass-mcclim", so every connection
+                                  ;; screen said `glass-mcclim' no matter which desktop it was, and
+                                  ;; GLASS:*DESKTOP-NAME* — which the WM already draws as the
+                                  ;; on-screen session label, which SERVE takes as its :NAME default,
+                                  ;; and which kiln sets to the session's own three-word name — was
+                                  ;; simply not consulted on this path.  One variable, set correctly
+                                  ;; by everyone, read by everything except the one place a remote
+                                  ;; viewer could see it.
+                                  ;;
+                                  ;; The constant survives as the FALLBACK, so a desktop that never
+                                  ;; set a name looks exactly as it did; and a further seat still
+                                  ;; says which one it is, now qualifying whatever the desktop is
+                                  ;; actually called rather than a fixed string.
+                                  :name (let ((base (if (and (stringp glass:*desktop-name*)
+                                                             (plusp (length glass:*desktop-name*)))
+                                                        glass:*desktop-name*
+                                                        "glass-mcclim")))
+                                          (if (seat-primary-p seat)
+                                              base
+                                              (format nil "~a (~a)" base (seat-name seat)))))
                    (error (e)
                      (unless (transport-closing-p tr)
                        (format *error-output* "~&glass: seat ~a transport ~a ended: ~a~%"
