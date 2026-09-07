@@ -2527,6 +2527,12 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
             '("Browse"    :browse)                                  ; loom + weft
             (wm-surface-item "Files" '#:warren "DESKTOP-SURFACE"    ; warren, a glass surface
                              :width 1000 :height 640)
+            ;; warp-media: the media player as a warp projection over a framebuffer — WebM and
+            ;; MP4 through cassette (VP8, and H.264 for intra-only streams), MP3/AAC/Opus files
+            ;; through reed, sound on the session mixer.  A surface app like Files, found by name
+            ;; like everything else here.
+            (wm-surface-item "Media" '#:warp-media-glass "MAKE-MEDIA-SURFACE"
+                             :width 512 :height 640)
             (wm-app-item "Podcasts" '#:spool.app "PODCASTS"         ; spool: feeds, cache, playback
                          :width 980 :height 660 :title "Podcasts")
             ;; chord and stave, as windows.  Each says what it needs when it has no model
