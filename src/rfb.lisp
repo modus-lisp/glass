@@ -829,7 +829,20 @@ its bytes would land in the middle of a rect."
         ((null req) (wake-wait wake 1/60))
         ;; incremental request, but the fb hasn't changed since we last caught up:
         ;; nothing to do — skip the (whole-frame) diff entirely and park.
-        ((and (plusp (first req)) (= (fb-generation fb) (rc-last-gen client)))
+        ;; ...AND WE HAVE A SNAPSHOT TO HAVE CAUGHT UP *WITH*.  The generation test alone
+        ;; says "nothing has changed since we last served this client", which is only the
+        ;; same as "this client has the picture" while its snapshot still stands.  A
+        ;; DesktopSize announcement breaks exactly that: SEND-UPDATE emits the size rect,
+        ;; returns T, and the caller records LAST-GEN — but no pixels went out and the
+        ;; snapshot was dropped, because the new size invalidates it.  The client then asks
+        ;; incrementally for the picture at its new size, the generations match, and it is
+        ;; parked here forever: a static desktop never bumps the generation again, so the
+        ;; feed dies on any resize and does not recover.  Measured end to end -- resize,
+        ;; DESKTOPSIZE rect, then silence, with the client's requests arriving and being
+        ;; short-circuited here.  With no snapshot we OWE a full frame, whatever the
+        ;; generation says.
+        ((and (plusp (first req)) (= (fb-generation fb) (rc-last-gen client))
+              (car (rc-snap-box client)))
          (wake-wait wake 1/60))
         (t
          ;; TAKE AND DIFF ARE ONE STEP.  The frame triple and the pixels are two
@@ -859,7 +872,11 @@ its bytes would land in the middle of a rect."
                               (tx (list 0)) (t0 (get-internal-real-time))
                               (sent (let ((*tx* tx))
                                       (handler-case (send-update client fb s req region copy)
-                                        (error () (setf (rc-running client) nil) nil)))))
+                                        (error (e)
+                                          (format *error-output*
+                                                  "~&glass: SEND-UPDATE died, client dropped: ~a~%" e)
+                                          (finish-output *error-output*)
+                                          (setf (rc-running client) nil) nil)))))
                          (when (and sent *perf-on*)
                            (perf-record-send (- (get-internal-real-time) t0) region copy (car tx))
                            (when fd (note-send-queue (socket-unsent-bytes fd))))  ; real downstream backlog
