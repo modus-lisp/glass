@@ -93,7 +93,7 @@
    #:headset-primary-p
    ;; the voice (the :glass/speech system; chord-backed) — one speaker on the session mix
    #:speak #:hush #:speaking-p #:make-speaker #:session-speaker #:stop-speaker #:speech-report
-   #:speaker #:speaker-p #:*session-speaker* #:*speech-voice* #:speech-voice #:*speech-gain* #:*speech-gap-ms*
+   #:speaker #:speaker-p #:*session-speaker* #:*speech-voice* #:speech-voice #:*speech-speed* #:speech-voices #:speech-options #:choose-speech-voice #:*speech-gain* #:*speech-gap-ms*
    ;; the ear (the :glass/hearing system; stave-backed) — one sink on the same mix
    #:start-listening #:stop-listening #:listening-p #:make-ears #:ears #:ears-p
    #:ear-mix #:ear-mic-stream #:ear-rec #:ear-listening-to

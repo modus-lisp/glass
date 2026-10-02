@@ -113,6 +113,54 @@ lazily keeps a desktop that never speaks from paying for a voice."
                               to a chord .graph"))))
         (setf (spk-voice spk) (funcall (%chord "LOAD-VOICE") path)))))
 
+;;; ---- choosing a voice at run time --------------------------------------------
+
+(defvar *speech-speed* nil
+  "Speaking rate, 1 = the voice's own, or NIL for 1.  Applied per sentence, so a change takes
+effect at the next sentence rather than at the next voice load.")
+
+(defun %chord-voice-dir ()
+  (let ((v (and (find-package "CHORD") (find-symbol "*VOICE-DIR*" "CHORD"))))
+    (or (and v (boundp v) (symbol-value v))
+        (namestring (merge-pathnames ".chord/voices/" (user-homedir-pathname))))))
+
+(defun %voice-name (path)
+  (and path (pathname-name (pathname path))))
+
+(defun speech-voices ()
+  "The Piper voices installed in chord's voice directory, by name, sorted.  A voice that carries
+a NAME.voices/ style directory is kokoro-shaped and is left out: it needs ~2 GB of heap beside
+the ear, which a 4 GB desktop does not have.  It still loads if named explicitly."
+  (let ((dir (%chord-voice-dir)))
+    (sort (remove-if (lambda (n) (probe-file (merge-pathnames (concatenate 'string n ".voices/") dir)))
+                     (remove-duplicates
+                      (mapcar #'pathname-name
+                              (append (directory (merge-pathnames "*.graph" dir))
+                                      (directory (merge-pathnames "*.onnx" dir))))
+                      :test #'string=))
+          #'string<)))
+
+(defun speech-options ()
+  "What the voice is and what it could be: (:voice NAME :voices (...) :speed X)."
+  (list :voice (%voice-name (speech-voice))
+        :voices (speech-voices)
+        :speed (or *speech-speed* 1)))
+
+(defun choose-speech-voice (&key voice (speed nil speed-p) (speaker (session-speaker)))
+  "Switch what the desktop speaks with, live.  VOICE is a bare name from SPEECH-VOICES (or a
+path); changing it drops the loaded voice, which is reloaded on the next utterance -- the same
+lazy load as the first.  SPEED (0.5..2, NIL = the voice's own) applies from the next sentence."
+  (when speed-p (setf *speech-speed* (and speed (max 0.5 (min 2.0 speed)))))
+  (when (and voice (plusp (length voice)))
+    (let ((path (funcall (%chord "VOICE-PATH") voice)))
+      (unless (probe-file path)
+        (error "glass speech: no voice ~s (looked for ~a)" voice path))
+      (unless (equal (%voice-name path) (%voice-name (speech-voice)))
+        (setf *speech-voice* (namestring path))
+        (sb-thread:with-mutex ((spk-lock speaker))
+          (setf (spk-voice speaker) nil)))))
+  (speech-options))
+
 ;;; ---- text in ---------------------------------------------------------------
 
 (defun %audience-list (audience)
@@ -234,7 +282,10 @@ changes who it is talking to."
       (when (/= gen (sb-thread:with-mutex ((spk-lock spk)) (spk-generation spk)))
         (return))
       (when (plusp (length sentence))
-        (multiple-value-bind (samples rate) (funcall synthesize voice sentence)
+        (multiple-value-bind (samples rate)
+            (apply synthesize voice sentence
+                   (when (and *speech-speed* (/= *speech-speed* 1))
+                     (list :length-scale (/ 1.0 *speech-speed*))))
           (let ((pcm (%to-mix-rate spk samples rate))
                 (gap (unless first (%speech-gap spk))))
             (setf first nil)
