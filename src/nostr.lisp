@@ -1603,6 +1603,65 @@ each record's cause — `on whose authority' being one of the questions the reco
                     (mapcar (lambda (pk) (subseq pk 0 8)) killed)
                     (audit-retained-p))))))
 
+(defvar *turn-ice*
+  (let ((srv (%blank->nil (sb-ext:posix-getenv "TURN_SERVER")))
+        (usr (%blank->nil (sb-ext:posix-getenv "TURN_USER")))
+        (pw  (%blank->nil (sb-ext:posix-getenv "TURN_PASS"))))
+    (and srv (list srv usr pw)))
+  "The TURN relay a login link carries, as (SERVER USER PASS), or NIL for a link that names none.
+
+THE CREDENTIAL RIDES THE LINK, NOT THE PAGE.  It used to be a literal in the published client —
+`shell.js' built its ICE list from a hardcoded `turn:…' with a static username and password — and
+the published client is a PUBLIC page, so the relay's long-term credential was readable by anyone
+who fetched it.  A TURN credential is a bearer credential: whoever holds it can relay through the
+box's allocation, on the box's bandwidth, until it is rotated.
+
+The link is the only place it can go.  The browser must have its ICE servers BEFORE it gathers and
+sends the offer, and the offer is the first thing it sends — so neither the payload (which arrives
+over the data channel, after the connection is up) nor the answer envelope (which comes back after
+the offer is already gone) can supply it.  The link's `#' fragment is the one pre-connection channel
+there is, it is already where `box' and `code' live, and a fragment is never sent to a server.
+
+NIL IS A WORKING LINK.  A box with no relay still mints one; the browser simply gathers host and
+server-reflexive candidates and the LAN case works exactly as it did.  What breaks is the
+symmetric-NAT / cellular case, which is what the relay is for — so this is a degradation, not a
+refusal, and it is the right shape for a value that is a deployment detail rather than an identity.
+
+READ ONCE, AT LOAD, like *LOGIN-URL-BASE* and for the same reason: the mint reads a variable, and a
+variable cannot go stale the way a file re-read by a process that stopped re-reading it can.")
+
+(defun %url-encode (s)
+  "Percent-encode S for a URL fragment.  Unreserved characters pass; everything else is %XX.
+
+NOT COSMETIC.  The fragment is `&'-separated, so a password containing `&' would truncate the
+fragment and silently drop every parameter after it — and a `#' would end it outright.  A TURN
+password is base64-ish and usually survives, which is exactly why this has to be here: the failure
+would be rare, silent, and look like a relay that does not work."
+  (with-output-to-string (o)
+    (loop for c across s
+          for n = (char-code c)
+          do (if (or (<= (char-code #\a) n (char-code #\z))
+                     (<= (char-code #\A) n (char-code #\Z))
+                     (<= (char-code #\0) n (char-code #\9))
+                     (find c "-._~"))
+                 (write-char c o)
+                 (format o "%~2,'0X" n)))))
+
+(defun login-link-fragment (token)
+  "The `#' fragment a login link carries: the box, the one-time code, and the TURN relay if there is
+one.  Returns the fragment WITHOUT the leading `#'.
+
+ONE PLACE, because there are two minters — the `link' command's reply and the unprompted
+SEND-LOGIN-LINK — and a credential that rides one of them and not the other is a link that works
+from a phone and not from a laptop, which is the kind of difference nobody reports as a bug."
+  (with-output-to-string (o)
+    (format o "box=~a&code=~a" (or (box-npub) "") token)
+    (when *turn-ice*
+      (destructuring-bind (srv &optional usr pw) *turn-ice*
+        (format o "&turn=~a" (%url-encode srv))
+        (when usr (format o "&user=~a" (%url-encode usr)))
+        (when pw  (format o "&pass=~a" (%url-encode pw)))))))
+
 (defvar *login-url-base*
   (or (%blank->nil (sb-ext:posix-getenv "GLASS_LOGIN_URL_BASE"))
       (%blank->nil (sb-ext:posix-getenv "LOGIN_URL_BASE")))
@@ -1652,9 +1711,10 @@ that is the whole reason the two surfaces cannot drift apart."
                         (t (multiple-value-bind (token killed)
                                (mint-login-token :ttl *login-ttl* :for pubkey)
                              (if token
-                                 (format nil "Fresh glass login link (expires in ~a min):~%~%~a#box=~a&code=~a~@[~%~%~a~]"
+                                 (format nil "Fresh glass login link~@[ for ~a~] (expires in ~a min):~%~%~a#~a~@[~%~%~a~]"
+                                         (%session-name-for-dm)
                                          (max 1 (round *login-ttl* 60)) *login-url-base*
-                                         (or (box-npub) "") token
+                                         (login-link-fragment token)
                                          ;; said out loud, because a person who taps an older link
                                          ;; after this will be refused and deserves to know why
                                          (and (integerp killed) (plusp killed)
@@ -2269,6 +2329,12 @@ still a desktop, and a desktop that did not start is not."
     (when (eq bot *session-nostr-bot*) (setf *session-nostr-bot* nil)))
   t)
 
+(defun %session-name-for-dm ()
+  "The name this desktop wears in its corner, for a DM to say WHICH desktop -- or NIL while it
+still has the generic default, which would name nothing."
+  (let ((n (and (boundp '*desktop-name*) *desktop-name*)))
+    (and (stringp n) (plusp (length n)) (string/= n "glass") n)))
+
 (defun send-login-link (target &key (ttl *login-ttl*) (bot *session-nostr-bot*))
   "Mint a login link for TARGET and gift-wrap it to them, UNPROMPTED.  Returns the URL,
    or NIL with a reason on *ERROR-OUTPUT*.
@@ -2293,14 +2359,15 @@ still a desktop, and a desktop that did not start is not."
            ((null token)
             (format *error-output* "~&@@ link: this session has no identity and cannot mint one~%") nil)
            (t
-            (let ((url (format nil "~a#box=~a&code=~a" *login-url-base* (or (box-npub) "") token)))
+            (let ((url (format nil "~a#~a" *login-url-base* (login-link-fragment token))))
               (handler-case
                   (progn
                     (cl-nostr.pool:pool-publish
                      (nostr-bot-pool bot)
                      (cl-nostr.nip59:build-giftwrap
                       (nostr-bot-keypair bot) pubkey
-                      (format nil "Your glass desktop is up (expires in ~a min):~%~%~a~@[~%~%~a~]"
+                      (format nil "Your glass desktop~@[ ~a~] is up (expires in ~a min):~%~%~a~@[~%~%~a~]"
+                              (%session-name-for-dm)
                               (max 1 (round ttl 60)) url
                               (and (integerp killed) (plusp killed)
                                    "This replaces any earlier link I sent you."))))

@@ -142,6 +142,7 @@
    #:code-redeemer #:code-minted #:code-settled #:code-table #:code-lock #:code-source #:code-mtime
    #:list-login-codes #:find-login-code #:login-code-count #:describe-login-codes #:code-live-p
    #:admit-peer #:parse-nostr-command #:nostr-command-reply #:*login-url-base*
+   #:*turn-ice* #:login-link-fragment
    #:*admission-port* #:*admission-port-offset* #:seat-admission-port #:*admission-host*
    #:*admission-timeout* #:admission-serve #:start-admission-service #:stop-admission-service
    #:admission-service #:admission-service-p #:admission-service-port #:admission-service-report
