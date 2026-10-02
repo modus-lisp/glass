@@ -550,7 +550,13 @@ has heard nothing, which is the truth and is cheap to say.
 
 For the push half of the transcript — a consumer that must ACT on speech rather than display it,
 as dictation does — see HEARING-LISTEN."
-  (let* ((target (as-mix (or mix mixer)))
+  (let* ((target (if (or mix source)
+                     (as-mix (or mix mixer))
+                     ;; The ear's own composite of the session: everything but what a source
+                     ;; says is not for a recognizer (music).  Same sum, no second pull.
+                     (let ((m (make-mix (mix-bus (as-mix mixer)) :name "ears")))
+                       (setf (mix-transcribing m) t)
+                       m)))
          (bus (mix-bus target))
          (frame (max 1 (round (* rate (mixer-period bus)))))
          (sink (unless source
@@ -616,6 +622,9 @@ dictation listener registered on it, so the lie would survive the fix for it."
     (when (ear-sink ear)
       (ignore-errors (sink-unsubscribe (ear-sink ear)))
       (setf (ear-sink ear) nil))
+    (let ((m (ear-mix ear)))
+      (when (and m (mix-transcribing m))
+        (ignore-errors (remove-mix (mix-bus m) m))))
     (when (eq ear *session-ears*) (setf *session-ears* nil)))
   t)
 

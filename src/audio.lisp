@@ -93,6 +93,7 @@ frames gets them without rebuffering; nothing here depends on the number.")
   ;; person's selection aloud means.  It is live, so one voice can answer one seat and then
   ;; the room (see speech.lisp) without a second engine.
   (audience nil)
+  (ears t)                          ; NIL = a mix that feeds a recognizer does not hear this
   (frames 0 :type fixnum)
   (errors 0 :type fixnum))
 
@@ -116,7 +117,11 @@ frames gets them without rebuffering; nothing here depends on the number.")
    ;; source id -> this listener's gain for it.  ABSENT means 1.0, so a mix that has never been
    ;; touched hears the whole session at its own volume — which is what a seat that just sat
    ;; down should hear, and what makes an empty table the one-seat case.
-   (gains :initform (make-hash-table :test 'eql) :accessor mix-gains))
+   (gains :initform (make-hash-table :test 'eql) :accessor mix-gains)
+   ;; T = this mix feeds a recognizer, so it hears only sources that offer themselves to one
+   ;; (SRC-EARS).  A player's music is the desktop's own noise: transcribing it burns every core
+   ;; on words nobody is saying.
+   (transcribing :initform nil :accessor mix-transcribing))
   (:documentation "One listener's composite of the session's sources: its selection, its gains,
    its ring and its sinks.  The mixer's DEFAULT-MIX is the session's own."))
 
@@ -208,7 +213,7 @@ the depth every further MIX on this bus gets, for the same reason."
     (mixer-default-mix m)               ; the session's own mix, made here rather than lazily
     m))
 
-(defun mixer-add-source (m source &key (name "source") (gain 1.0d0) finite audience)
+(defun mixer-add-source (m source &key (name "source") (gain 1.0d0) finite audience (ears t))
   "Register SOURCE (a thunk returning the next frame of mono samples at the mixer's rate, or
 NIL) and return its handle.  FINITE t removes it the first time it returns NIL — right for a
 file, wrong for a capture device, which returns NIL whenever it simply has nothing yet.
@@ -218,7 +223,8 @@ an application playing audio means — it is making noise in the session, not ta
 person."
   (sb-thread:with-mutex ((mixer-lock m))
     (let ((s (%make-src :id (mixer-next-id m) :name name :thunk source
-                        :gain (float gain 1d0) :finite finite :audience audience)))
+                        :gain (float gain 1d0) :finite finite :audience audience
+                        :ears (and ears t))))
       (incf (mixer-next-id m))
       (setf (mixer-sources m) (append (mixer-sources m) (list s)))
       s)))
@@ -270,6 +276,7 @@ else's mix — which is the whole of what a per-seat mix is for."
 may be ADDRESSED elsewhere (its audience), and this listener may have MUTED it (its gain)."
   (let ((aud (src-audience src)))
     (and (or (null aud) (member mix aud))
+         (or (not (mix-transcribing mix)) (src-ears src))
          (plusp (sb-thread:with-mutex ((mix-lock mix))
                   (gethash (src-id src) (mix-gains mix) 1d0))))))
 
