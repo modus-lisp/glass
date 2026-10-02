@@ -75,6 +75,43 @@ the line that says so.")
 (defun %pos ()     (let ((f (%fn "PLAYER-POSITION"))) (and *player* f (ignore-errors (funcall f *player*)))))
 (defun %dur ()     (let ((f (%fn "PLAYER-DURATION"))) (and *player* f (ignore-errors (funcall f *player*)))))
 (defun %title ()   (let ((f (%fn "PLAYER-TITLE")))    (and *player* f (ignore-errors (funcall f *player*)))))
+(defun %live-p ()  (let ((f (%fn "PLAYER-LIVE-P")))   (and *player* f (ignore-errors (funcall f *player*)))))
+(defun %stream-title () (let ((f (%fn "PLAYER-STREAM-TITLE"))) (and *player* f (ignore-errors (funcall f *player*)))))
+(defun %station ()      (let ((f (%fn "PLAYER-STATION")))      (and *player* f (ignore-errors (funcall f *player*)))))
+
+;;; ---- stations ----------------------------------------------------------------
+
+(defparameter *default-stations*
+  '(("SomaFM Groove Salad"  . "http://ice1.somafm.com/groovesalad-128-mp3")
+    ("SomaFM Drone Zone"    . "http://ice1.somafm.com/dronezone-128-mp3")
+    ("SomaFM Secret Agent"  . "http://ice1.somafm.com/secretagent-128-mp3")
+    ("Radio Paradise"       . "http://stream.radioparadise.com/mp3-128"))
+  "What a fresh desktop offers before anyone has written a stations file.")
+
+(defun stations-file ()
+  (or (sb-ext:posix-getenv "GLASS_STATIONS")
+      (namestring (merge-pathnames "stations.txt" (pathname *music-dir*)))))
+
+(defun stations ()
+  "The stations to show: `Name | http://…` lines from stations.txt in the music directory
+(GLASS_STATIONS names another file), `#` for comments.  A missing or unreadable file is
+the defaults, not an error — the file is how you add a station, not a requirement to have one.
+Only http: URLs are taken; this player has no TLS, and a line it cannot play is better
+absent than listed and failing."
+  (let ((rows '()))
+    (ignore-errors
+     (with-open-file (in (stations-file) :external-format :utf-8)
+       (loop for line = (read-line in nil) while line
+             do (let* ((l (string-trim '(#\Space #\Tab #\Return) line))
+                       (bar (position #\| l)))
+                  (when (and bar (plusp (length l)) (char/= (char l 0) #\#))
+                    (let ((name (string-trim " " (subseq l 0 bar)))
+                          (url (string-trim " " (subseq l (1+ bar)))))
+                      (when (and (plusp (length name))
+                                 (> (length url) 7)
+                                 (string-equal "http://" url :end2 7))
+                        (push (cons name url) rows))))))))
+    (if rows (nreverse rows) *default-stations*)))
 
 ;;; ---- the playlist ------------------------------------------------------------
 
@@ -106,11 +143,14 @@ the line that says so.")
 (clim:define-presentation-type music-track ())
 (clim:define-presentation-type music-place ())
 (clim:define-presentation-type music-button ())
+(clim:define-presentation-type music-station ())
 
 (clim:define-application-frame music-box ()
   ((dir :initform *music-dir* :accessor app-dir)
    (list :initform '() :accessor app-list)
    (index :initform -1 :accessor app-index)
+   (stations :initform '() :accessor app-stations)
+   (tuned :initform nil :accessor app-tuned)
    (shown :initform nil :accessor app-shown)
    (note :initform nil :accessor app-note)
    (ticker :initform nil :accessor app-ticker))
@@ -125,9 +165,12 @@ the line that says so.")
   (:layouts (default (clim:vertically () transport playlist))))
 
 (defun draw-transport (frame stream)
-  (let* ((st (%state)) (pos (%pos)) (dur (%dur)))
+  (let* ((st (%state)) (pos (%pos)) (dur (%dur)) (live (%live-p)))
     (clim:with-text-style (stream (ui-bold 14))
-      (format stream "~&~a~%" (or (%title frame) (%title) "—")))
+      (format stream "~&~a~%"
+              (if live
+                  (or (%stream-title) (%station) "—")
+                  (or (%title frame) (%title) "—"))))
     (format stream "~&")
     ;; The four that never move.  A transport whose buttons appear and disappear is one you
     ;; have to look at before you can press.
@@ -135,14 +178,21 @@ the line that says so.")
       (clim:with-output-as-presentation (stream (car b) 'music-button)
         (clim:with-text-style (stream (ui-bold 13))
           (format stream "  ~a  " (cdr b)))))
-    (format stream "   ~a / ~a" (mmss pos) (mmss dur))
+    ;; A live stream has no length and nowhere to seek, so it shows how long you have been
+    ;; listening rather than a duration that would read "--:--" forever.
+    (if live
+        (format stream "   LIVE ~a" (mmss pos))
+        (format stream "   ~a / ~a" (mmss pos) (mmss dur)))
     (format stream "   ~a"
             (case st
               (:playing "playing") (:paused "paused") (:loading "loading…")
+              (:buffering "buffering…")
               (:ended "ended")     (:error (or (let ((f (%fn "PLAYER-ERROR")))
                                                  (and f *player* (funcall f *player*)))
                                                "error"))
               (t "stopped")))
+    (when (and live (%stream-title) (%station))
+      (clim:with-text-style (stream (ui-font 11)) (format stream "~%~a" (%station))))
     (when (app-note frame) (format stream "~%~a" (app-note frame)))))
 
 (defun %title (&optional frame)
@@ -155,6 +205,13 @@ the line that says so.")
      (clim:with-text-style (stream (ui-bold 14)) (format stream "~&No player in this image.~%"))
      (format stream "~&This desktop was built without spool, which is what decodes and plays.~%"))
     (t
+     (when (and (%fn "PLAY-URL") (app-stations frame))
+       (clim:with-text-style (stream (ui-bold)) (format stream "~&Radio~%"))
+       (dolist (st (app-stations frame))
+         (clim:with-output-as-presentation (stream st 'music-station)
+           (clim:with-text-style (stream (if (eq st (app-tuned frame)) (ui-bold) (ui-font)))
+             (format stream "  ~a ~a~%" (if (eq st (app-tuned frame)) ">" " ") (car st)))))
+       (terpri stream))
      (format stream "~&~a~%~%" (app-dir frame))
      (dolist (d (subdirs (app-dir frame)))
        (clim:with-output-as-presentation (stream d 'music-place)
@@ -181,7 +238,7 @@ the line that says so.")
 (defun %play-index (frame i)
   (let ((ts (app-list frame)))
     (when (and ts (< -1 i (length ts)))
-      (setf (app-index frame) i (app-note frame) nil)
+      (setf (app-index frame) i (app-tuned frame) nil (app-note frame) nil)
       (let ((p (%ensure-player #'%advance)) (play (%fn "PLAY-FILE")))
         (if (and p play)
             (unless (ignore-errors (funcall play p (namestring (nth i ts))))
@@ -191,6 +248,16 @@ the line that says so.")
 (define-music-box-command (com-play-track) ((tr 'music-track :gesture :select))
   (let ((frame clim:*application-frame*))
     (%play-index frame (or (position tr (app-list frame) :test #'equal) 0))))
+
+(defun %tune (frame st)
+  (setf (app-tuned frame) st (app-index frame) -1 (app-note frame) nil)
+  (let ((p (%ensure-player #'%advance)) (play (%fn "PLAY-URL")))
+    (if (and p play)
+        (funcall play p (cdr st) :name (car st))
+        (setf (app-note frame) "this spool cannot play streams"))))
+
+(define-music-box-command (com-tune) ((st 'music-station :gesture :select))
+  (%tune clim:*application-frame* st))
 
 (define-music-box-command (com-enter-place) ((d 'music-place :gesture :select))
   (let ((frame clim:*application-frame*))
@@ -208,7 +275,10 @@ the line that says so.")
 
 (define-music-box-command (com-toggle) ()
   (let ((f (%fn "TOGGLE")) (frame clim:*application-frame*))
-    (cond ((and *player* f (member (%state) '(:playing :paused))) (funcall f *player*))
+    (cond ((and *player* f (member (%state) '(:playing :paused :buffering))) (funcall f *player*))
+          ;; A station that dropped or was stopped: play means "tune it again", not "start
+          ;; the file list at the top".
+          ((app-tuned frame) (%tune frame (app-tuned frame)))
           ;; Nothing loaded yet, so the play button means "start at the top", which is what
           ;; pressing play on a fresh playlist has always meant.
           (t (%play-index frame (max 0 (app-index frame)))))))
@@ -226,7 +296,8 @@ the line that says so.")
     (clim:redisplay-frame-pane frame (clim:find-pane-named frame 'transport) :force-p t)))
 
 (defun %status (frame)
-  (list (%state) (round (or (%pos) 0)) (app-index frame) (app-note frame)))
+  (list (%state) (round (or (%pos) 0)) (app-index frame) (app-note frame)
+        (and (%live-p) (%stream-title))))
 
 (defun %start-ticker (frame)
   "Redraw the transport when the clock or the state would read differently — a second's
@@ -247,6 +318,7 @@ the line that says so.")
 
 (defmethod clim:run-frame-top-level :before ((frame music-box) &key)
   (setf (app-list frame) (tracks (app-dir frame))
+        (app-stations frame) (stations)
         (app-ticker frame) (%start-ticker frame)))
 
 (defun run (&key (width 520) (height 420))

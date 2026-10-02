@@ -711,6 +711,7 @@ its bytes would land in the middle of a rect."
   (enc +enc-raw+) dss cursor cursor-sent copyrect trle
   eds                           ; client offered ExtendedDesktopSize (-308) specifically
   eds-announced                 ; ...and we have sent it one, which is what unlocks resizing
+  resize-ack                    ; a SetDesktopSize is owed a reply: NIL, or the RESULT code to send (0 = ok)
   (fmt nil)                     ; client pixel format (a PXFMT), or NIL = our native 32bpp
   (snap-box (list nil)) (zs (cram:make-zstream))
   last-size                     ; (cons w h) — fb size last announced to this client
@@ -730,6 +731,22 @@ its bytes would land in the middle of a rect."
    were written, NIL if there was nothing to send."
   (destructuring-bind (inc x y w h) req
     (let ((ls (rc-last-size client)))                                ; resize takes priority
+      ;; EVERY SetDesktopSize IS ANSWERED, with reason 1 ("because you asked").  noVNC latches
+      ;; _pendingRemoteResize when it asks and clears it ONLY on a reason-1 rect, so a server that
+      ;; answers with reason 0 (the announcement below) -- or with nothing, because the size did
+      ;; not change -- leaves the latch set for the life of the connection and the client never
+      ;; asks for a size again.  The first request worked, every later one was swallowed.
+      (let ((ack (sb-thread:with-mutex ((rc-lock client))
+                   (prog1 (rc-resize-ack client) (setf (rc-resize-ack client) nil)))))
+        (when (and ack (rc-eds client))
+          (with-fb-locked (fb)
+            (send-extended-desktop-size s (fb-width fb) (fb-height fb)
+                                        :reason 1 :result ack)
+            (unless (and (= (fb-width fb) (car ls)) (= (fb-height fb) (cdr ls)))
+              (setf (car ls) (fb-width fb) (cdr ls) (fb-height fb)
+                    (car (rc-snap-box client)) nil))
+            (setf (rc-eds-announced client) t)
+            (return-from send-update t))))
       (when (rc-dss client)
         (with-fb-locked (fb)
           ;; ANNOUNCE ONCE even when the size has not changed.  LAST-SIZE starts at the
@@ -842,7 +859,8 @@ its bytes would land in the middle of a rect."
         ;; short-circuited here.  With no snapshot we OWE a full frame, whatever the
         ;; generation says.
         ((and (plusp (first req)) (= (fb-generation fb) (rc-last-gen client))
-              (car (rc-snap-box client)))
+              (car (rc-snap-box client))
+              (not (rc-resize-ack client)))
          (wake-wait wake 1/60))
         (t
          ;; TAKE AND DIFF ARE ONE STEP.  The frame triple and the pixels are two
@@ -1015,7 +1033,16 @@ its bytes would land in the middle of a rect."
                     (let ((rw (r-u16 s)) (rh (r-u16 s)) (nscreens (r-u8 s)))
                       (skip s 1)
                       (dotimes (i nscreens) (r-bytes s 16))   ; per-screen layout (ignored)
-                      (when on-resize (funcall on-resize rw rh))))
+                      (let ((result (cond ((not (and (plusp rw) (plusp rh))) 3)   ; invalid layout
+                                          (t (when on-resize (funcall on-resize rw rh)) 0))))
+                        (when (rc-eds client)
+                          (sb-thread:with-mutex ((rc-lock client))
+                            (setf (rc-resize-ack client) result)
+                            ;; The reply rides a FramebufferUpdate, which the sender builds only
+                            ;; for a parked request: park one if the client has none pending.
+                            (unless (rc-want client)
+                              (setf (rc-want client) (list 1 0 0 (fb-width fb) (fb-height fb)))))
+                          (wake-signal wake)))))
                (t (unless (eq msg :eof)                    ; EOF = normal disconnect; anything else is notable
                     (format *trace-output* "~&glass: dropping client on unhandled message-type ~a~%" msg)
                     (force-output *trace-output*))
