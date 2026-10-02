@@ -46,9 +46,34 @@
     (ceiling w)))
 
 (declaim (inline %over))
-(defun %over (dst8 fg8 a ia)
-  "Composite an 8-bit sRGB FG channel over DST at coverage A (ia = 1-A), linear."
-  (scribe:linear->srgb (+ (* ia (scribe:srgb->linear dst8)) (* a (scribe:srgb->linear fg8)))))
+(defun %over (dst8 lfg a ia)
+  "Composite a FG channel, already in LINEAR light (LFG), over the 8-bit sRGB DST8 at coverage
+   A (ia = 1-A).  Back to sRGB through scribe's 4096-entry table rather than LINEAR->SRGB's
+   EXPT: three EXPTs a pixel were most of what a line of text cost on modus.  The table can
+   land a level away from the exact curve; that is scribe's own compositing path too."
+  (let ((l (+ (* ia (scribe:srgb->linear dst8)) (* a lfg))))
+    (aref scribe:*linear->srgb* (min 4096 (max 0 (round (* l 4096d0)))))))
+
+;;; THE GLYPH CACHE.  Rasterising a glyph from its outline is the expensive half of drawing
+;;; text (0.7 ms a glyph on modus), and a UI draws the same few glyphs every frame.  Keyed by
+;;; font, glyph, size and the pen's subpixel offset ROUNDED TO A QUARTER PIXEL -- an exact
+;;; offset would make nearly every glyph a miss -- so a glyph may sit up to an eighth of a pixel
+;;; from where the exact offset would put it.  On modus, whose threads share no memory, only the
+;;; main thread fills it (a worker storing into the shared table is refused); other threads
+;;; rasterise as before.
+(defvar *glyph-cache* (make-hash-table :test 'equal #+sbcl :synchronized #+sbcl t))
+
+(defun %cached-glyph (font gid size sub)
+  "(values coverage w h left top advance) for GID, through *GLYPH-CACHE*."
+  (let* ((q (/ (round (* sub 4)) 4d0))
+         (key (list font gid size q))
+         (hit (gethash key *glyph-cache*)))
+    (if hit
+        (values-list hit)
+        (let ((r (multiple-value-list (scribe:rasterize-glyph font gid size :subpixel q))))
+          (when #+modus (sb-thread:main-thread-p) #-modus t
+            (setf (gethash key *glyph-cache*) r))
+          (values-list r)))))
 
 (defun fb-text (fb x y string &key (size 13) (color +black+) (font (default-font))
                                    (alpha 1d0))
@@ -61,14 +86,17 @@
    caller had before and is bit-identical to it."
   (let* ((upem (scribe:font-units-per-em font))
          (baseline (+ y (round (* (scribe:font-ascent font) size) upem)))
-         (fr (ldb (byte 8 16) color)) (fg (ldb (byte 8 8) color)) (fbb (ldb (byte 8 0) color))
+         (fr (scribe:srgb->linear (ldb (byte 8 16) color)))
+         (fg (scribe:srgb->linear (ldb (byte 8 8) color)))
+         (fbb (scribe:srgb->linear (ldb (byte 8 0) color)))
+         (solid (logand color #xffffff))
          (px (fb-pixels fb)) (fw (fb-width fb)) (fh (fb-height fb))
          (penx (float x 1d0)))
     (loop for ch across string do
       (let* ((gid (scribe:font-glyph-index font (char-code ch)))
              (sub (- penx (ffloor penx))))
         (multiple-value-bind (cov w h left top adv)
-            (scribe:rasterize-glyph font gid size :subpixel sub)
+            (%cached-glyph font gid size sub)
           (when cov
             (let ((ox (+ (floor penx) left)) (oy (+ baseline top)))
               (dotimes (gy h)
@@ -81,8 +109,10 @@
                             (let* ((idx (+ frow fx)) (dst (aref px idx))
                                    (a (min 1d0 (* alpha c))) (ia (- 1d0 a)))
                               (setf (aref px idx)
-                                    (logior (ash (%over (ldb (byte 8 16) dst) fr a ia) 16)
-                                            (ash (%over (ldb (byte 8 8) dst) fg a ia) 8)
-                                            (%over (ldb (byte 8 0) dst) fbb a ia)))))))))))))
+                                    (if (>= a 1d0)
+                                        solid   ; full coverage: the colour, no blend
+                                        (logior (ash (%over (ldb (byte 8 16) dst) fr a ia) 16)
+                                                (ash (%over (ldb (byte 8 8) dst) fg a ia) 8)
+                                                (%over (ldb (byte 8 0) dst) fbb a ia))))))))))))))
           (incf penx (or adv (float size 1d0))))))
     (floor penx)))

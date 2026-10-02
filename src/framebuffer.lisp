@@ -373,12 +373,51 @@ would not have to visit every call site in the tree."
    that the WM actually calls.  Correct and obvious and a hundred times slower, which is the
    right trade for a primitive that exists to say what the operation IS — and the wrong one
    for a compositor, where it cost more than the frame budget and the desktop crawled."
-  (if (= scale 1)
-      (fb-blit dst src dx dy)
+  (cond
+    ((= scale 1) (fb-blit dst src dx dy))
+    ((and (integerp scale) (> scale 1)) (%fb-blit-scaled-int dst src dx dy scale))
+    (t
       (let* ((sw (fb-width src)) (sh (fb-height src))
              (dw (round (* sw scale))) (dh (round (* sh scale))))
         (dotimes (y dh dst)
           (let ((sy (min (1- sh) (floor (* y sh) dh))))
             (dotimes (x dw)
               (fb-put dst (+ dx x) (+ dy y)
-                      (fb-get src (min (1- sw) (floor (* x sw) dw)) sy))))))))
+                      (fb-get src (min (1- sw) (floor (* x sw) dw)) sy)))))))))
+
+(defun %fb-blit-scaled-int (dst src dx dy k)
+  "FB-BLIT-SCALED at a whole-number K > 1, a row at a time: the same pixels as the general
+   path (destination pixel (dx+x, dy+y) is source (floor x/k, floor y/k), clipped to DST), but
+   each magnified row is built once and copied to the K-1 rows below it, with no call per
+   pixel.  A phone shows a 512-px window at 2x on every frame -- 1.3 million FB-PUTs, 131 ms
+   on modus; this is the copy alone."
+  (let* ((sw (fb-width src)) (sh (fb-height src))
+         (tw (fb-width dst)) (th (fb-height dst))
+         (sp (fb-pixels src)) (dp (fb-pixels dst))
+         (x0 (max 0 dx)) (x1 (min tw (+ dx (* sw k)))))
+    (declare (type (simple-array (unsigned-byte 32) (*)) sp dp)
+             (type fixnum sw sh tw th x0 x1 k dx dy))
+    (when (< x0 x1)
+      (dotimes (sy sh)
+        (let ((srow (* sy sw)) (built -1))
+          (declare (type fixnum srow built))
+          (dotimes (j k)
+            (let ((ty (+ dy (* sy k) j)))
+              (declare (type fixnum ty))
+              (when (and (>= ty 0) (< ty th))
+                (let ((drow (* ty tw)))
+                  (declare (type fixnum drow))
+                  (if (>= built 0)
+                      (replace dp dp :start1 (+ drow x0) :end1 (+ drow x1) :start2 (+ built x0))
+                      (let* ((off (- x0 dx)) (sx (floor off k)) (ph (- off (* sx k))) (tx x0))
+                        (declare (type fixnum off sx ph tx))
+                        (loop while (< tx x1)
+                              do (let ((v (logand (aref sp (+ srow sx)) #xffffff)))
+                                   (loop while (and (< ph k) (< tx x1))
+                                         do (setf (aref dp (+ drow tx)) v)
+                                            (incf tx) (incf ph))
+                                   (setq ph 0)
+                                   (incf sx)))
+                        (setq built drow)))))))))
+      (fb-touch dst))
+    dst))
