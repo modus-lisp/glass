@@ -1529,6 +1529,7 @@ every call site to pass a number."
           when (logtest mask bit)
           do (enqueue port (make-instance 'climi::pointer-scroll-event
                                           :pointer (climi::port-pointer port) :sheet sheet
+                                          :button bit
                                           :x lx :y ly :delta-x 0 :delta-y delta
                                           :modifier-state (seat-mods seat)
                                           :timestamp (next-timestamp port))))

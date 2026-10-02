@@ -1330,7 +1330,14 @@ for the same reason and in the same way COMPOSITE-SEAT binds it."
      (dolist (seat (glass-port-seats port))
        (when (eq (seat-focus-surface seat) obj) (setf (seat-focus-surface seat) nil))))
     (t
-     (setf (glass-port-mirrors port) (remove obj (glass-port-mirrors port)))))
+     (setf (glass-port-mirrors port) (remove obj (glass-port-mirrors port)))
+     ;; Dropping the mirror leaves the frame's thread running with no window.  Ask the frame to
+     ;; exit — from its OWN thread (com-quit runs there),
+     ;; so its unwind-protect cleanups run: a player stops, a socket closes.
+     (let* ((sheet (ignore-errors (glass-mirror-sheet obj)))
+            (frame (and sheet (ignore-errors (clim:pane-frame sheet)))))
+       (when (and frame (eq (ignore-errors (clim:frame-top-level-sheet frame)) sheet))
+         (ignore-errors (climi::execute-frame-command frame (list 'climi::com-quit)))))))
   (port-forget-window port obj)
   (composite-all port))
 

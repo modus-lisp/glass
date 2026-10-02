@@ -68,7 +68,7 @@ the line that says so.")
                 (ignore-errors
                  (glass:mixer-add-source (glass:session-mixer)
                                          (funcall src *player*)
-                                         :name "music" :gain 1.0d0))))))
+                                         :name "music" :gain 1.0d0 :ears nil))))))
     *player*))
 
 (defun %state ()   (let ((f (%fn "PLAYER-STATE")))    (and *player* f (funcall f *player*))))
@@ -316,10 +316,41 @@ absent than listed and failing."
          (error () (return)))))
    :name "glass-music-ticker"))
 
-(defmethod clim:run-frame-top-level :before ((frame music-box) &key)
+(defvar *open-frames* nil
+  "The Music windows that are open.  The player is one per session, shared by all of them.
+   A list of frames rather than a count, so a window that died without saying so is pruned by
+   its state instead of holding the last-window teardown off forever.")
+
+(defun %live-frames ()
+  (setf *open-frames*
+        (remove-if-not (lambda (f) (member (ignore-errors (clim:frame-state f)) '(:enabled :shrunk)))
+                       *open-frames*)))
+
+(defun %teardown ()
+  "Silence the session: stop the player (and its radio thread) and take its source off the
+   mixer.  Without this, closing the window leaves the player running with nobody to stop it."
+  (sb-thread:with-mutex (*lock*)
+    (let ((stop (%fn "STOP")))
+      (when (and *player* stop) (ignore-errors (funcall stop *player*))))
+    (when *source-id*
+      (ignore-errors (glass:mixer-remove-source (glass:session-mixer :start nil) *source-id*))
+      (setf *source-id* nil))))
+
+(defun stop-music ()
+  "Stop whatever the music player is doing, with or without a window.  For a control socket."
+  (%teardown))
+
+(defmethod clim:run-frame-top-level :around ((frame music-box) &key)
   (setf (app-list frame) (tracks (app-dir frame))
         (app-stations frame) (stations)
-        (app-ticker frame) (%start-ticker frame)))
+        (app-ticker frame) (%start-ticker frame))
+  (sb-thread:with-mutex (*lock*) (pushnew frame *open-frames*))
+  (unwind-protect (call-next-method)
+    (ignore-errors (sb-thread:terminate-thread (app-ticker frame)))
+    (when (sb-thread:with-mutex (*lock*)
+            (setf *open-frames* (remove frame *open-frames*))
+            (null (%live-frames)))
+      (%teardown))))
 
 (defun run (&key (width 520) (height 420))
   (clim:run-frame-top-level (clim:make-application-frame 'music-box :width width :height height)))
