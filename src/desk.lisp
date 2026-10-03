@@ -48,7 +48,8 @@
   (menu nil)               ; NIL, or (x y) of the open root menu
   (drag nil)               ; (window dx dy) while a title bar is held
   (cascade 0)
-  (dirty t))
+  (damage '())             ; ((x y w h) ...) to repaint at the next tick
+  (dirty t))               ; T = repaint everything
 
 (defun make-desk (fb)
   "A desktop drawing into FB (the screen, in the desk's own pixels)."
@@ -59,10 +60,16 @@
   (setf (desk-apps desk)
         (append (remove label (desk-apps desk) :key #'first :test #'string=)
                 (list (list label make-fn width height))))
-  (setf (desk-dirty desk) t)
+  (when (desk-menu desk) (setf (desk-dirty desk) t))
   label)
 
 (defun desk-redraw (desk) (setf (desk-dirty desk) t))
+
+(defun %damage (desk x y w h)
+  (when (and (plusp w) (plusp h)) (push (list x y w h) (desk-damage desk))))
+
+(defun %damage-frame (desk win)
+  (multiple-value-bind (fx fy fw fh) (%frame-box win) (%damage desk fx fy fw fh)))
 
 ;;; ---- windows -------------------------------------------------------------------------------------
 
@@ -88,19 +95,24 @@
             (incf (desk-cascade desk))
             (let ((win (make-window :title lbl :x x :y y :w w :h h :fb fb :on-key on-key
                                     :on-pointer on-pointer :dirty-p dirty-p :close-fn close-fn)))
-              (push win (desk-windows desk))
-              (setf (desk-dirty desk) t)
+              (let ((old-top (first (desk-windows desk))))
+                (push win (desk-windows desk))
+                (when old-top (%damage-frame desk old-top)))   ; its title bar dims
+              (%damage-frame desk win)
               win)))))))
 
 (defun %close (desk win)
+  (%damage-frame desk win)
   (setf (desk-windows desk) (remove win (desk-windows desk)))
-  (when (win-close-fn win) (ignore-errors (funcall (win-close-fn win))))
-  (setf (desk-dirty desk) t))
+  (when (first (desk-windows desk)) (%damage-frame desk (first (desk-windows desk))))  ; new top
+  (when (win-close-fn win) (ignore-errors (funcall (win-close-fn win)))))
 
 (defun %raise (desk win)
-  (unless (eq win (first (desk-windows desk)))
-    (setf (desk-windows desk) (cons win (remove win (desk-windows desk)))
-          (desk-dirty desk) t)))
+  (let ((old-top (first (desk-windows desk))))
+    (unless (eq win old-top)
+      (setf (desk-windows desk) (cons win (remove win (desk-windows desk))))
+      (%damage-frame desk win)
+      (when old-top (%damage-frame desk old-top)))))   ; its title bar dims
 
 (defun %hit (desk x y)
   "(values WINDOW PART) for the topmost window under (X,Y); PART is :close, :title or :content."
@@ -142,9 +154,11 @@
          ;; keep 40 pixels of title bar on screen: a window dragged out of reach could never
          ;; be dragged back, and on a touch screen there is nothing else to grab it by
          (let ((sw (glass:fb-width (desk-fb desk))) (sh (glass:fb-height (desk-fb desk))))
+           ;; where it was and where it is now: everything a move can change
+           (%damage-frame desk win)
            (setf (win-x win) (max (- 40 (win-w win)) (min (- sw 40) (- x dx)))
-                 (win-y win) (max (+ *title-h* *border*) (min (+ sh -4) (- y dy)))
-                 (desk-dirty desk) t))
+                 (win-y win) (max (+ *title-h* *border*) (min (+ sh -4) (- y dy))))
+           (%damage-frame desk win))
          (unless down (setf (desk-drag desk) nil))))
       ;; a window's content holds the pointer until the lift, wherever it goes
       ((find-if #'win-pressed (desk-windows desk))
@@ -156,12 +170,17 @@
       ((desk-menu desk)
        (when down
          (let ((label (%menu-item-at desk x y)))
-           (setf (desk-menu desk) nil (desk-dirty desk) t)
+           (multiple-value-bind (mx my mw mh) (%menu-box desk)
+             (%damage desk (1- mx) (1- my) (+ mw 2) (+ mh 2)))
+           (setf (desk-menu desk) nil)
            (when label (desk-open desk label)))))
       (down
        (multiple-value-bind (win part) (%hit desk x y)
          (cond
-           ((null win) (setf (desk-menu desk) (list x y) (desk-dirty desk) t))
+           ((null win)
+            (setf (desk-menu desk) (list x y))
+            (multiple-value-bind (mx my mw mh) (%menu-box desk)
+              (%damage desk (1- mx) (1- my) (+ mw 2) (+ mh 2))))
            ((eq part :close) (%close desk win))
            ((eq part :title)
             (%raise desk win)
@@ -188,13 +207,15 @@
 (defun %blit (dst src dx dy)
   "SRC into DST at (DX,DY), clipped, a row at a time."
   (let* ((sw (glass:fb-width src)) (sh (glass:fb-height src))
+         (clip (glass:fb-clip dst))
          (tw (glass:fb-width dst)) (th (glass:fb-height dst))
+         (cy0 (if clip (max 0 (second clip)) 0)) (cy1 (if clip (min th (fourth clip)) th))
          (sp (glass:fb-pixels src)) (dp (glass:fb-pixels dst))
-         (x0 (max 0 dx)) (x1 (min tw (+ dx sw))))
+         (x0 (max 0 dx (if clip (first clip) 0))) (x1 (min tw (+ dx sw) (if clip (third clip) tw))))
     (when (< x0 x1)
       (dotimes (sy sh)
         (let ((ty (+ dy sy)))
-          (when (and (>= ty 0) (< ty th))
+          (when (and (>= ty cy0) (< ty cy1))
             (replace dp sp :start1 (+ (* ty tw) x0) :end1 (+ (* ty tw) x1)
                            :start2 (+ (* sy sw) (- x0 dx)))))))))
 
@@ -245,38 +266,54 @@
     (when (desk-menu desk) (%draw-menu desk))
     (glass:fb-touch fb)))
 
+(defun %redraw-region (desk x y w h)
+  "Repaint (X,Y,W,H) of the screen: background, the windows that cross it bottom to top, the
+   menu -- every stroke clipped to it."
+  (let ((fb (desk-fb desk)) (top (first (desk-windows desk))))
+    (glass:with-fb-clip (fb x y w h)
+      (glass:fb-rect fb x y w h *bg*)
+      (dolist (win (reverse (desk-windows desk)))
+        (multiple-value-bind (fx fy fw fh) (%frame-box win)
+          (when (%overlaps-p x y w h fx fy fw fh)
+            (%draw-window fb win (eq win top)))))
+      (when (desk-menu desk)
+        (multiple-value-bind (mx my mw mh) (%menu-box desk)
+          (when (%overlaps-p x y w h (1- mx) (1- my) (+ mw 2) (+ mh 2))
+            (%draw-menu desk)))))))
+
 (defun desk-tick (desk)
   "Poll the windows and bring the screen up to date.  Returns NIL when nothing changed, else
    (values T X Y W H): the rectangle of FB that changed, so a host need only show that.
 
-   ONLY WHAT CHANGED.  A video in a window changes its content thirty times a second and nothing
-   else; repainting the whole desk for it (fill, every frame and title, every window) was most
-   of a frame on a phone.  A window whose content changed and that nothing covers is copied on
-   its own; anything else -- a move, a raise, the menu, a window opened or closed, a changed
-   window under another -- repaints the whole desk, as before."
-  (let ((changed '()))
+   ONLY WHAT CHANGED.  A window whose content changed and that nothing covers is copied on its
+   own.  Everything else is DAMAGE -- a dragged window's old and new frames, a raised window, the
+   menu's box, content under another window -- and only the rectangle around it is repainted,
+   clipped.  Dragging a small window repainted the whole desk and magnified the whole screen,
+   and stuttered; now it costs about the window.  A host's DESK-REDRAW still repaints all."
+  (let ((fb (desk-fb desk)) (copied '()))
     (dolist (w (desk-windows desk))
       (when (and (win-dirty-p w) (funcall (win-dirty-p w)))
-        (push w changed)))
-    (when (and changed (not (desk-dirty desk)) (some (lambda (w) (%covered-p desk w)) changed))
-      (setf (desk-dirty desk) t))
-    (let ((fb (desk-fb desk)))
-      (cond
-        ((desk-dirty desk)
-         (setf (desk-dirty desk) nil)
-         (%redraw-all desk)
-         (values t 0 0 (glass:fb-width fb) (glass:fb-height fb)))
-        (changed
-         (let ((x0 most-positive-fixnum) (y0 most-positive-fixnum) (x1 0) (y1 0))
-           (dolist (w changed)
-             (%blit fb (win-fb w) (win-x w) (win-y w))
-             (setf x0 (min x0 (win-x w)) y0 (min y0 (win-y w))
-                   x1 (max x1 (+ (win-x w) (win-w w))) y1 (max y1 (+ (win-y w) (win-h w)))))
-           (glass:fb-touch fb)
-           ;; clipped to the screen: a window may hang off an edge
-           (let ((x0 (max 0 x0)) (y0 (max 0 y0))
-                 (x1 (min (glass:fb-width fb) x1)) (y1 (min (glass:fb-height fb) y1)))
-             (if (and (< x0 x1) (< y0 y1))
-                 (values t x0 y0 (- x1 x0) (- y1 y0))
-                 nil))))
-        (t nil)))))
+        (if (%covered-p desk w)
+            (%damage desk (win-x w) (win-y w) (win-w w) (win-h w))
+            (progn (%blit fb (win-fb w) (win-x w) (win-y w)) (push w copied)))))
+    (let ((x0 most-positive-fixnum) (y0 most-positive-fixnum) (x1 most-negative-fixnum)
+          (y1 most-negative-fixnum) (any nil))
+      (flet ((grow (x y w h)
+               (setf any t x0 (min x0 x) y0 (min y0 y) x1 (max x1 (+ x w)) y1 (max y1 (+ y h)))))
+        (cond
+          ((desk-dirty desk)
+           (setf (desk-dirty desk) nil (desk-damage desk) '())
+           (%redraw-all desk)
+           (grow 0 0 (glass:fb-width fb) (glass:fb-height fb)))
+          (t
+           (when (desk-damage desk)
+             (dolist (r (desk-damage desk)) (apply #'grow r))
+             (setf (desk-damage desk) '())
+             (%redraw-region desk x0 y0 (- x1 x0) (- y1 y0)))
+           (dolist (w copied) (grow (win-x w) (win-y w) (win-w w) (win-h w))))))
+      (when any
+        (glass:fb-touch fb)
+        (let ((x0 (max 0 x0)) (y0 (max 0 y0))
+              (x1 (min (glass:fb-width fb) x1)) (y1 (min (glass:fb-height fb) y1)))
+          (when (and (< x0 x1) (< y0 y1))
+            (values t x0 y0 (- x1 x0) (- y1 y0))))))))

@@ -91,6 +91,11 @@
          (fbb (scribe:srgb->linear (ldb (byte 8 0) color)))
          (solid (logand color #xffffff))
          (px (fb-pixels fb)) (fw (fb-width fb)) (fh (fb-height fb))
+         ;; THE CLIP BOX, like FB-RECT: a compositor redrawing one damaged rectangle draws a title
+         ;; that crosses its edge, and glyphs outside it must not land on what was not redrawn
+         (clip (fb-clip fb))
+         (cx0 (if clip (max 0 (first clip)) 0)) (cy0 (if clip (max 0 (second clip)) 0))
+         (cx1 (if clip (min fw (third clip)) fw)) (cy1 (if clip (min fh (fourth clip)) fh))
          (penx (float x 1d0)))
     (loop for ch across string do
       (let* ((gid (scribe:font-glyph-index font (char-code ch)))
@@ -101,11 +106,11 @@
             (let ((ox (+ (floor penx) left)) (oy (+ baseline top)))
               (dotimes (gy h)
                 (let ((fy (+ oy gy)))
-                  (when (< -1 fy fh)
+                  (when (and (<= cy0 fy) (< fy cy1))
                     (let ((frow (* fy fw)))
                       (dotimes (gx w)
                         (let ((c (aref cov (+ (* gy w) gx))) (fx (+ ox gx)))
-                          (when (and (> c 0d0) (< -1 fx fw))
+                          (when (and (> c 0d0) (<= cx0 fx) (< fx cx1))
                             (let* ((idx (+ frow fx)) (dst (aref px idx))
                                    (a (min 1d0 (* alpha c))) (ia (- 1d0 a)))
                               (setf (aref px idx)
