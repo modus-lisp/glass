@@ -222,18 +222,61 @@
                                     :size 13 :color *menu-fg*))
             (glass:fb-text fb (+ mx 12) (+ my 8) "(no applications)" :size 13 :color *menu-fg*))))))
 
+(defun %overlaps-p (ax ay aw ah bx by bw bh)
+  (and (< ax (+ bx bw)) (< bx (+ ax aw)) (< ay (+ by bh)) (< by (+ ay ah))))
+
+(defun %covered-p (desk win)
+  "Does anything drawn above WIN -- a window over it, or the open menu -- overlap its content?"
+  (let ((x (win-x win)) (y (win-y win)) (w (win-w win)) (h (win-h win)))
+    (or (loop for above in (desk-windows desk)
+              until (eq above win)
+              thereis (multiple-value-bind (fx fy fw fh) (%frame-box above)
+                        (%overlaps-p x y w h fx fy fw fh)))
+        (and (desk-menu desk)
+             (multiple-value-bind (mx my mw mh) (%menu-box desk)
+               (%overlaps-p x y w h (1- mx) (1- my) (+ mw 2) (+ mh 2)))))))
+
+(defun %redraw-all (desk)
+  (let ((fb (desk-fb desk)))
+    (glass:fb-fill fb *bg*)
+    (let ((top (first (desk-windows desk))))
+      (dolist (w (reverse (desk-windows desk)))
+        (%draw-window fb w (eq w top))))
+    (when (desk-menu desk) (%draw-menu desk))
+    (glass:fb-touch fb)))
+
 (defun desk-tick (desk)
-  "Poll the windows; if anything changed, redraw the screen.  T when FB was redrawn."
-  (dolist (w (desk-windows desk))
-    (when (and (win-dirty-p w) (funcall (win-dirty-p w)))
-      (setf (desk-dirty desk) t)))
-  (when (desk-dirty desk)
-    (setf (desk-dirty desk) nil)
+  "Poll the windows and bring the screen up to date.  Returns NIL when nothing changed, else
+   (values T X Y W H): the rectangle of FB that changed, so a host need only show that.
+
+   ONLY WHAT CHANGED.  A video in a window changes its content thirty times a second and nothing
+   else; repainting the whole desk for it (fill, every frame and title, every window) was most
+   of a frame on a phone.  A window whose content changed and that nothing covers is copied on
+   its own; anything else -- a move, a raise, the menu, a window opened or closed, a changed
+   window under another -- repaints the whole desk, as before."
+  (let ((changed '()))
+    (dolist (w (desk-windows desk))
+      (when (and (win-dirty-p w) (funcall (win-dirty-p w)))
+        (push w changed)))
+    (when (and changed (not (desk-dirty desk)) (some (lambda (w) (%covered-p desk w)) changed))
+      (setf (desk-dirty desk) t))
     (let ((fb (desk-fb desk)))
-      (glass:fb-fill fb *bg*)
-      (let ((top (first (desk-windows desk))))
-        (dolist (w (reverse (desk-windows desk)))
-          (%draw-window fb w (eq w top))))
-      (when (desk-menu desk) (%draw-menu desk))
-      (glass:fb-touch fb))
-    t))
+      (cond
+        ((desk-dirty desk)
+         (setf (desk-dirty desk) nil)
+         (%redraw-all desk)
+         (values t 0 0 (glass:fb-width fb) (glass:fb-height fb)))
+        (changed
+         (let ((x0 most-positive-fixnum) (y0 most-positive-fixnum) (x1 0) (y1 0))
+           (dolist (w changed)
+             (%blit fb (win-fb w) (win-x w) (win-y w))
+             (setf x0 (min x0 (win-x w)) y0 (min y0 (win-y w))
+                   x1 (max x1 (+ (win-x w) (win-w w))) y1 (max y1 (+ (win-y w) (win-h w)))))
+           (glass:fb-touch fb)
+           ;; clipped to the screen: a window may hang off an edge
+           (let ((x0 (max 0 x0)) (y0 (max 0 y0))
+                 (x1 (min (glass:fb-width fb) x1)) (y1 (min (glass:fb-height fb) y1)))
+             (if (and (< x0 x1) (< y0 y1))
+                 (values t x0 y0 (- x1 x0) (- y1 y0))
+                 nil))))
+        (t nil)))))

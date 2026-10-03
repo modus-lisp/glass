@@ -385,6 +385,44 @@ would not have to visit every call site in the tree."
               (fb-put dst (+ dx x) (+ dy y)
                       (fb-get src (min (1- sw) (floor (* x sw) dw)) sy)))))))))
 
+(defun fb-blit-scaled-region (dst src k x y w h)
+  "The rectangle (X,Y,W,H) of SRC into DST at (X*K, Y*K), magnified by the whole number K: the
+   same pixels FB-BLIT-SCALED would put there, for a host that knows what changed and need not
+   magnify the rest.  Clipped to both framebuffers."
+  (let* ((sw (fb-width src)) (sh (fb-height src))
+         (tw (fb-width dst)) (th (fb-height dst))
+         (sp (fb-pixels src)) (dp (fb-pixels dst))
+         (x (max 0 x)) (y (max 0 y))
+         (xe (min sw (+ x w))) (ye (min sh (+ y h)))
+         (dx0 (* x k)) (dx1 (min tw (* xe k))))
+    (declare (type (simple-array (unsigned-byte 32) (*)) sp dp)
+             (type fixnum sw sh tw th x y xe ye dx0 dx1 k))
+    (when (and (< x xe) (< dx0 dx1))
+      (loop for sy of-type fixnum from y below ye
+            do (let ((srow (* sy sw)) (built -1))
+                 (declare (type fixnum srow built))
+                 (dotimes (j k)
+                   (let ((ty (+ (* sy k) j)))
+                     (declare (type fixnum ty))
+                     (when (< ty th)
+                       (let ((drow (* ty tw)))
+                         (declare (type fixnum drow))
+                         (if (>= built 0)
+                             (replace dp dp :start1 (+ drow dx0) :end1 (+ drow dx1)
+                                            :start2 (+ built dx0))
+                             (let ((sx x) (tx dx0))
+                               (declare (type fixnum sx tx))
+                               (loop while (< tx dx1)
+                                     do (let ((v (logand (aref sp (+ srow sx)) #xffffff)) (n 0))
+                                          (declare (type fixnum n))
+                                          (loop while (and (< n k) (< tx dx1))
+                                                do (setf (aref dp (+ drow tx)) v)
+                                                   (incf tx) (incf n))
+                                          (incf sx)))
+                               (setf built drow)))))))))
+      (fb-touch dst))
+    dst))
+
 (defun %fb-blit-scaled-int (dst src dx dy k)
   "FB-BLIT-SCALED at a whole-number K > 1, a row at a time: the same pixels as the general
    path (destination pixel (dx+x, dy+y) is source (floor x/k, floor y/k), clipped to DST), but
