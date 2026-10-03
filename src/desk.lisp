@@ -1,0 +1,239 @@
+;;;; desk.lisp — a minimal desktop: windows you drag, a root menu, and nothing that needs CLIM.
+;;;;
+;;;; mcclim-glass's window manager is the full desktop, and it is built on a McCLIM port.  This is
+;;;; the part of a desktop that a screen with no McCLIM still wants -- a phone running modus, today
+;;;; -- and it is deliberately small: windows with a title bar to drag them by and a box to close
+;;;; them, raise on touch, and a menu of applications on the background.
+;;;;
+;;;; AN APPLICATION IS THE SAME CONTRACT THE WM'S SURFACE APPS USE, so one written for the full
+;;;; desktop runs here unchanged: a MAKE-FN called with the window's content framebuffer, returning
+;;;; (values ON-KEY ON-POINTER DIRTY-P [COPY-P CLOSE-FN]).  ON-KEY (down keysym) and ON-POINTER
+;;;; (mask x y) take window-local coordinates; DIRTY-P is polled every tick and answers whether
+;;;; the content changed; CLOSE-FN, if given, runs when the window closes.
+;;;;
+;;;; DRIVING IT: the host owns the screen and the clock.  It makes a DESK over a framebuffer,
+;;;; registers applications, forwards pointer and key events (DESK-POINTER, DESK-KEY), and calls
+;;;; DESK-TICK, which answers T when the screen framebuffer changed and should be shown.  Pointer
+;;;; MASK bit 0 is the (one) button: a touch down is 1, the lift is 0, a drag is moves with 1.
+
+(defpackage #:glass.desk
+  (:use #:cl)
+  (:export #:make-desk #:desk-register-app #:desk-open #:desk-pointer #:desk-key #:desk-tick
+           #:desk-fb #:desk-windows #:desk-apps #:desk-redraw))
+
+(in-package #:glass.desk)
+
+(defparameter *title-h* 24 "Title bar height.")
+(defparameter *border* 1)
+(defparameter *menu-item-h* 30)
+(defparameter *menu-w* 180)
+(defparameter *bg* #x1e2530)
+(defparameter *title-bg* #x3a4556)
+(defparameter *title-bg-top* #x4f6a8f)
+(defparameter *title-fg* #xe6ebf2)
+(defparameter *frame* #x0d1117)
+(defparameter *menu-bg* #x2a3240)
+(defparameter *menu-hi* #x4f6a8f)
+(defparameter *menu-fg* #xe6ebf2)
+
+(defstruct (window (:conc-name win-))
+  title x y w h            ; content size; the frame adds the title bar and border
+  fb on-key on-pointer dirty-p close-fn
+  (pressed nil))           ; the content holds the pointer (down landed in it)
+
+(defstruct (desk (:constructor %make-desk))
+  fb
+  (windows '())            ; topmost first
+  (apps '())               ; ((label make-fn w h) ...), in menu order
+  (menu nil)               ; NIL, or (x y) of the open root menu
+  (drag nil)               ; (window dx dy) while a title bar is held
+  (cascade 0)
+  (dirty t))
+
+(defun make-desk (fb)
+  "A desktop drawing into FB (the screen, in the desk's own pixels)."
+  (%make-desk :fb fb))
+
+(defun desk-register-app (desk label make-fn &key (width 400) (height 300))
+  "Put LABEL on the root menu; choosing it opens a WIDTH x HEIGHT window running MAKE-FN."
+  (setf (desk-apps desk)
+        (append (remove label (desk-apps desk) :key #'first :test #'string=)
+                (list (list label make-fn width height))))
+  (setf (desk-dirty desk) t)
+  label)
+
+(defun desk-redraw (desk) (setf (desk-dirty desk) t))
+
+;;; ---- windows -------------------------------------------------------------------------------------
+
+(defun %frame-box (w)
+  "(values x y w h) of window W's whole frame, title bar and border included."
+  (values (- (win-x w) *border*) (- (win-y w) *title-h* *border*)
+          (+ (win-w w) (* 2 *border*)) (+ (win-h w) *title-h* (* 2 *border*))))
+
+(defun desk-open (desk label)
+  "Open the application LABEL in a new window, on top.  Returns the window."
+  (let ((app (find label (desk-apps desk) :key #'first :test #'string=)))
+    (when app
+      (destructuring-bind (lbl make-fn w h) app
+        (let* ((sw (glass:fb-width (desk-fb desk))) (sh (glass:fb-height (desk-fb desk)))
+               (w (min w (- sw (* 2 *border*))))
+               (h (min h (- sh *title-h* (* 2 *border*))))
+               (fb (glass:make-framebuffer w h))
+               (n (desk-cascade desk))
+               (x (+ *border* (mod (* n 24) (max 1 (- sw w (* 2 *border*))))))
+               (y (+ *title-h* *border* (mod (* n 24) (max 1 (- sh h *title-h* (* 2 *border*)))))))
+          (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn) (funcall make-fn fb)
+            (declare (ignore copy-p))
+            (incf (desk-cascade desk))
+            (let ((win (make-window :title lbl :x x :y y :w w :h h :fb fb :on-key on-key
+                                    :on-pointer on-pointer :dirty-p dirty-p :close-fn close-fn)))
+              (push win (desk-windows desk))
+              (setf (desk-dirty desk) t)
+              win)))))))
+
+(defun %close (desk win)
+  (setf (desk-windows desk) (remove win (desk-windows desk)))
+  (when (win-close-fn win) (ignore-errors (funcall (win-close-fn win))))
+  (setf (desk-dirty desk) t))
+
+(defun %raise (desk win)
+  (unless (eq win (first (desk-windows desk)))
+    (setf (desk-windows desk) (cons win (remove win (desk-windows desk)))
+          (desk-dirty desk) t)))
+
+(defun %hit (desk x y)
+  "(values WINDOW PART) for the topmost window under (X,Y); PART is :close, :title or :content."
+  (dolist (w (desk-windows desk) (values nil nil))
+    (multiple-value-bind (fx fy fw fh) (%frame-box w)
+      (when (and (<= fx x) (< x (+ fx fw)) (<= fy y) (< y (+ fy fh)))
+        (return
+          (values w (cond ((>= y (win-y w)) :content)
+                          ((>= x (- (+ fx fw) *title-h*)) :close)
+                          (t :title))))))))
+
+;;; ---- the root menu -------------------------------------------------------------------------------
+
+(defun %menu-items (desk) (mapcar #'first (desk-apps desk)))
+
+(defun %menu-box (desk)
+  "(values x y w h) of the open menu, kept on screen."
+  (destructuring-bind (mx my) (desk-menu desk)
+    (let* ((h (* *menu-item-h* (max 1 (length (%menu-items desk)))))
+           (fb (desk-fb desk))
+           (x (max 0 (min mx (- (glass:fb-width fb) *menu-w*))))
+           (y (max 0 (min my (- (glass:fb-height fb) h)))))
+      (values x y *menu-w* h))))
+
+(defun %menu-item-at (desk x y)
+  (multiple-value-bind (mx my mw mh) (%menu-box desk)
+    (when (and (<= mx x) (< x (+ mx mw)) (<= my y) (< y (+ my mh)))
+      (nth (floor (- y my) *menu-item-h*) (%menu-items desk)))))
+
+;;; ---- input ---------------------------------------------------------------------------------------
+
+(defun desk-pointer (desk mask x y)
+  "A pointer event in desk pixels.  MASK bit 0 is the button."
+  (let ((down (logbitp 0 mask)))
+    (cond
+      ;; a title bar held: follow the pointer, let go on lift
+      ((desk-drag desk)
+       (destructuring-bind (win dx dy) (desk-drag desk)
+         ;; keep 40 pixels of title bar on screen: a window dragged out of reach could never
+         ;; be dragged back, and on a touch screen there is nothing else to grab it by
+         (let ((sw (glass:fb-width (desk-fb desk))) (sh (glass:fb-height (desk-fb desk))))
+           (setf (win-x win) (max (- 40 (win-w win)) (min (- sw 40) (- x dx)))
+                 (win-y win) (max (+ *title-h* *border*) (min (+ sh -4) (- y dy)))
+                 (desk-dirty desk) t))
+         (unless down (setf (desk-drag desk) nil))))
+      ;; a window's content holds the pointer until the lift, wherever it goes
+      ((find-if #'win-pressed (desk-windows desk))
+       (let ((win (find-if #'win-pressed (desk-windows desk))))
+         (unless down (setf (win-pressed win) nil))
+         (when (win-on-pointer win)
+           (funcall (win-on-pointer win) mask (- x (win-x win)) (- y (win-y win))))))
+      ;; the menu is open: a press on an item opens it, anywhere else closes the menu
+      ((desk-menu desk)
+       (when down
+         (let ((label (%menu-item-at desk x y)))
+           (setf (desk-menu desk) nil (desk-dirty desk) t)
+           (when label (desk-open desk label)))))
+      (down
+       (multiple-value-bind (win part) (%hit desk x y)
+         (cond
+           ((null win) (setf (desk-menu desk) (list x y) (desk-dirty desk) t))
+           ((eq part :close) (%close desk win))
+           ((eq part :title)
+            (%raise desk win)
+            (setf (desk-drag desk) (list win (- x (win-x win)) (- y (win-y win)))))
+           (t
+            (%raise desk win)
+            (setf (win-pressed win) t)
+            (when (win-on-pointer win)
+              (funcall (win-on-pointer win) mask (- x (win-x win)) (- y (win-y win))))))))
+      ;; a move with nothing held goes to whatever window it is over
+      (t
+       (multiple-value-bind (win part) (%hit desk x y)
+         (when (and win (eq part :content) (win-on-pointer win))
+           (funcall (win-on-pointer win) mask (- x (win-x win)) (- y (win-y win)))))))
+    nil))
+
+(defun desk-key (desk down keysym)
+  "A key goes to the topmost window."
+  (let ((win (first (desk-windows desk))))
+    (when (and win (win-on-key win)) (funcall (win-on-key win) down keysym))))
+
+;;; ---- drawing -------------------------------------------------------------------------------------
+
+(defun %blit (dst src dx dy)
+  "SRC into DST at (DX,DY), clipped, a row at a time."
+  (let* ((sw (glass:fb-width src)) (sh (glass:fb-height src))
+         (tw (glass:fb-width dst)) (th (glass:fb-height dst))
+         (sp (glass:fb-pixels src)) (dp (glass:fb-pixels dst))
+         (x0 (max 0 dx)) (x1 (min tw (+ dx sw))))
+    (when (< x0 x1)
+      (dotimes (sy sh)
+        (let ((ty (+ dy sy)))
+          (when (and (>= ty 0) (< ty th))
+            (replace dp sp :start1 (+ (* ty tw) x0) :end1 (+ (* ty tw) x1)
+                           :start2 (+ (* sy sw) (- x0 dx)))))))))
+
+(defun %draw-window (fb win top)
+  (multiple-value-bind (fx fy fw fh) (%frame-box win)
+    (glass:fb-rect fb fx fy fw fh *frame*)
+    (glass:fb-rect fb (win-x win) (- (win-y win) *title-h*) (win-w win) *title-h*
+                   (if top *title-bg-top* *title-bg*))
+    (glass:fb-text fb (+ (win-x win) 8) (+ (- (win-y win) *title-h*) 4) (win-title win)
+                   :size 13 :color *title-fg*)
+    ;; the close box: an X in the title bar's right-hand square
+    (let ((cx (- (+ fx fw) *title-h*)) (cy fy))
+      (glass:fb-text fb (+ cx 7) (+ cy 4) "x" :size 13 :color *title-fg*))
+    (%blit fb (win-fb win) (win-x win) (win-y win))))
+
+(defun %draw-menu (desk)
+  (let ((fb (desk-fb desk)))
+    (multiple-value-bind (mx my mw mh) (%menu-box desk)
+      (glass:fb-rect fb (1- mx) (1- my) (+ mw 2) (+ mh 2) *frame*)
+      (glass:fb-rect fb mx my mw mh *menu-bg*)
+      (let ((items (%menu-items desk)))
+        (if items
+            (loop for label in items for i from 0
+                  do (glass:fb-text fb (+ mx 12) (+ my (* i *menu-item-h*) 8) label
+                                    :size 13 :color *menu-fg*))
+            (glass:fb-text fb (+ mx 12) (+ my 8) "(no applications)" :size 13 :color *menu-fg*))))))
+
+(defun desk-tick (desk)
+  "Poll the windows; if anything changed, redraw the screen.  T when FB was redrawn."
+  (dolist (w (desk-windows desk))
+    (when (and (win-dirty-p w) (funcall (win-dirty-p w)))
+      (setf (desk-dirty desk) t)))
+  (when (desk-dirty desk)
+    (setf (desk-dirty desk) nil)
+    (let ((fb (desk-fb desk)))
+      (glass:fb-fill fb *bg*)
+      (let ((top (first (desk-windows desk))))
+        (dolist (w (reverse (desk-windows desk)))
+          (%draw-window fb w (eq w top))))
+      (when (desk-menu desk) (%draw-menu desk))
+      (glass:fb-touch fb))
+    t))
