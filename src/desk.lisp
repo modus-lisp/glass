@@ -19,7 +19,10 @@
 (defpackage #:glass.desk
   (:use #:cl)
   (:export #:make-desk #:desk-register-app #:desk-open #:desk-pointer #:desk-key #:desk-tick
-           #:desk-fb #:desk-windows #:desk-apps #:desk-redraw #:desk-keyboard-fn))
+           #:desk-fb #:desk-windows #:desk-apps #:desk-redraw #:desk-keyboard-fn
+           ;; sizes a host may set for its screen: a phone at one desk pixel per point wants
+           ;; touch-sized bars and rows (44 is iOS's minimum touch target)
+           #:*title-h* #:*menu-item-h* #:*menu-w* #:*font-size*))
 
 (in-package #:glass.desk)
 
@@ -27,6 +30,11 @@
 (defparameter *border* 1)
 (defparameter *menu-item-h* 30)
 (defparameter *menu-w* 180)
+(defparameter *font-size* 13 "Title and menu text.")
+
+(defun %text-top (box-top box-h)
+  "Where FB-TEXT's top goes for a line of *FONT-SIZE* text centred in a box."
+  (+ box-top (max 0 (floor (- box-h (round (* 1.3 *font-size*))) 2))))
 (defparameter *bg* #x1e2530)
 (defparameter *title-bg* #x3a4556)
 (defparameter *title-bg-top* #x4f6a8f)
@@ -229,16 +237,18 @@
     (glass:fb-rect fb fx fy fw fh *frame*)
     (glass:fb-rect fb (win-x win) (- (win-y win) *title-h*) (win-w win) *title-h*
                    (if top *title-bg-top* *title-bg*))
-    (glass:fb-text fb (+ (win-x win) 8) (+ (- (win-y win) *title-h*) 4) (win-title win)
-                   :size 13 :color *title-fg*)
+    (glass:fb-text fb (+ (win-x win) 8) (%text-top (- (win-y win) *title-h*) *title-h*) (win-title win)
+                   :size *font-size* :color *title-fg*)
     ;; the close box: an X in the title bar's right-hand square
     (let ((cx (- (+ fx fw) *title-h*)) (cy fy))
-      (glass:fb-text fb (+ cx 7) (+ cy 4) "x" :size 13 :color *title-fg*)
-      ;; and, when the host has a keyboard to offer, a keys button beside it
+      (glass:fb-text fb (+ cx (floor (- *title-h* (glass:text-width "x" :size *font-size*)) 2))
+                     (%text-top cy *title-h*) "x" :size *font-size* :color *title-fg*)
+      ;; and, when the host has a keyboard to offer, a keys button beside it: a key-cap outline
       (when keys
-        (glass:fb-rect fb (- cx *title-h* -4) (+ cy 6) (- *title-h* 8) (- *title-h* 11) *title-fg*)
-        (glass:fb-rect fb (- cx *title-h* -6) (+ cy 8) (- *title-h* 12) (- *title-h* 15)
-                       (if top *title-bg-top* *title-bg*))))
+        (let* ((in (max 3 (floor *title-h* 4))) (kx (+ (- cx *title-h*) in)) (ky (+ cy in 1))
+               (kw (- *title-h* (* 2 in))) (kh (- *title-h* (* 2 in) 2)))
+          (glass:fb-rect fb kx ky kw kh *title-fg*)
+          (glass:fb-rect fb (+ kx 2) (+ ky 2) (- kw 4) (- kh 4) (if top *title-bg-top* *title-bg*)))))
     (%blit fb (win-fb win) (win-x win) (win-y win))))
 
 (defun %draw-menu (desk)
@@ -249,9 +259,10 @@
       (let ((items (%menu-items desk)))
         (if items
             (loop for label in items for i from 0
-                  do (glass:fb-text fb (+ mx 12) (+ my (* i *menu-item-h*) 8) label
-                                    :size 13 :color *menu-fg*))
-            (glass:fb-text fb (+ mx 12) (+ my 8) "(no applications)" :size 13 :color *menu-fg*))))))
+                  do (glass:fb-text fb (+ mx 12) (%text-top (+ my (* i *menu-item-h*)) *menu-item-h*) label
+                                    :size *font-size* :color *menu-fg*))
+            (glass:fb-text fb (+ mx 12) (%text-top my *menu-item-h*) "(no applications)"
+                           :size *font-size* :color *menu-fg*))))))
 
 (defun %overlaps-p (ax ay aw ah bx by bw bh)
   (and (< ax (+ bx bw)) (< bx (+ ax aw)) (< ay (+ by bh)) (< by (+ ay ah))))
