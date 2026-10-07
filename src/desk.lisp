@@ -7,9 +7,11 @@
 ;;;;
 ;;;; AN APPLICATION IS THE SAME CONTRACT THE WM'S SURFACE APPS USE, so one written for the full
 ;;;; desktop runs here unchanged: a MAKE-FN called with the window's content framebuffer, returning
-;;;; (values ON-KEY ON-POINTER DIRTY-P [COPY-P CLOSE-FN]).  ON-KEY (down keysym) and ON-POINTER
+;;;; (values ON-KEY ON-POINTER DIRTY-P [COPY-P CLOSE-FN TEXT-P]).  ON-KEY (down keysym) and ON-POINTER
 ;;;; (mask x y) take window-local coordinates; DIRTY-P is polled every tick and answers whether
-;;;; the content changed; CLOSE-FN, if given, runs when the window closes.
+;;;; the content changed; CLOSE-FN, if given, runs when the window closes.  TEXT-P says the app
+;;;; takes typing: while its window has the focus (it was opened, or last tapped into) the host's
+;;;; on-screen keyboard is up, and tapping elsewhere puts it away.
 ;;;;
 ;;;; DRIVING IT: the host owns the screen and the clock.  It makes a DESK over a framebuffer,
 ;;;; registers applications, forwards pointer and key events (DESK-POINTER, DESK-KEY), and calls
@@ -47,6 +49,7 @@
 (defstruct (window (:conc-name win-))
   title x y w h            ; content size; the frame adds the title bar and border
   fb on-key on-pointer dirty-p close-fn
+  (text-p nil)             ; the app takes typing: focusing it brings up the keyboard
   (pressed nil))           ; the content holds the pointer (down landed in it)
 
 (defstruct (desk (:constructor %make-desk))
@@ -57,7 +60,9 @@
   (drag nil)               ; (window dx dy) while a title bar is held
   (cascade 0)
   (damage '())             ; ((x y w h) ...) to repaint at the next tick
-  (keyboard-fn nil)        ; the host's on-screen keyboard toggle; NIL = no keys button
+  (keyboard-fn nil)        ; (lambda (on)): show or hide the host's on-screen keyboard; NIL = none
+  (focus nil)              ; the window typing goes to: the last one tapped into, or opened
+  (keyboard-up nil)        ; what KEYBOARD-FN was last told
   (dirty t))               ; T = repaint everything
 
 (defun make-desk (fb)
@@ -99,18 +104,31 @@
                (n (desk-cascade desk))
                (x (+ *border* (mod (* n 24) (max 1 (- sw w (* 2 *border*))))))
                (y (+ *title-h* *border* (mod (* n 24) (max 1 (- sh h *title-h* (* 2 *border*)))))))
-          (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn) (funcall make-fn fb)
+          (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn text-p) (funcall make-fn fb)
             (declare (ignore copy-p))
             (incf (desk-cascade desk))
             (let ((win (make-window :title lbl :x x :y y :w w :h h :fb fb :on-key on-key
-                                    :on-pointer on-pointer :dirty-p dirty-p :close-fn close-fn)))
+                                    :on-pointer on-pointer :dirty-p dirty-p :close-fn close-fn
+                                    :text-p text-p)))
               (let ((old-top (first (desk-windows desk))))
                 (push win (desk-windows desk))
                 (when old-top (%damage-frame desk old-top)))   ; its title bar dims
               (%damage-frame desk win)
+              (%focus desk win)                               ; a new note wants typing at once
               win)))))))
 
+(defun %focus (desk win &optional force)
+  "Typing now goes to WIN (or nowhere, for NIL).  The host keyboard follows: up while the focused
+   window takes text, down otherwise.  FORCE tells the host again even if nothing changed -- a tap
+   into a text window after the keyboard was swiped away by hand should bring it back."
+  (setf (desk-focus desk) win)
+  (let ((want (and win (win-text-p win) t)))
+    (when (and (desk-keyboard-fn desk) (or force (not (eq want (desk-keyboard-up desk)))))
+      (setf (desk-keyboard-up desk) want)
+      (funcall (desk-keyboard-fn desk) want))))
+
 (defun %close (desk win)
+  (when (eq win (desk-focus desk)) (%focus desk nil))
   (%damage-frame desk win)
   (setf (desk-windows desk) (remove win (desk-windows desk)))
   (when (first (desk-windows desk)) (%damage-frame desk (first (desk-windows desk))))  ; new top
@@ -131,7 +149,6 @@
         (return
           (values w (cond ((>= y (win-y w)) :content)
                           ((>= x (- (+ fx fw) *title-h*)) :close)
-                          ((and (desk-keyboard-fn desk) (>= x (- (+ fx fw) (* 2 *title-h*)))) :keys)
                           (t :title))))))))
 
 ;;; ---- the root menu -------------------------------------------------------------------------------
@@ -188,17 +205,19 @@
        (multiple-value-bind (win part) (%hit desk x y)
          (cond
            ((null win)
+            (%focus desk nil)                       ; the desktop takes no typing
             (setf (desk-menu desk) (list x y))
             (multiple-value-bind (mx my mw mh) (%menu-box desk)
               (%damage desk (1- mx) (1- my) (+ mw 2) (+ mh 2))))
            ((eq part :close) (%close desk win))
-           ;; the keys button: this window gets the keyboard's typing, so it comes to the front
-           ((eq part :keys) (%raise desk win) (funcall (desk-keyboard-fn desk)))
            ((eq part :title)
+            ;; dragging the focused window keeps its typing; picking up another one takes it away
+            (unless (eq win (desk-focus desk)) (%focus desk nil))
             (%raise desk win)
             (setf (desk-drag desk) (list win (- x (win-x win)) (- y (win-y win)))))
            (t
             (%raise desk win)
+            (%focus desk win (win-text-p win))
             (setf (win-pressed win) t)
             (when (win-on-pointer win)
               (funcall (win-on-pointer win) mask (- x (win-x win)) (- y (win-y win))))))))
@@ -210,9 +229,9 @@
     nil))
 
 (defun desk-key (desk down keysym)
-  "A key goes to the topmost window.  KEYSYM is X11's: Latin-1 as itself, other Unicode
+  "A key goes to the focused window.  KEYSYM is X11's: Latin-1 as itself, other Unicode
    #x01000000+codepoint, Return #xff0d, BackSpace #xff08, arrows #xff51-#xff54."
-  (let ((win (first (desk-windows desk))))
+  (let ((win (desk-focus desk)))
     (when (and win (win-on-key win)) (funcall (win-on-key win) down keysym))))
 
 ;;; ---- drawing -------------------------------------------------------------------------------------
@@ -232,7 +251,7 @@
             (replace dp sp :start1 (+ (* ty tw) x0) :end1 (+ (* ty tw) x1)
                            :start2 (+ (* sy sw) (- x0 dx)))))))))
 
-(defun %draw-window (fb win top &optional keys)
+(defun %draw-window (fb win top)
   (multiple-value-bind (fx fy fw fh) (%frame-box win)
     (glass:fb-rect fb fx fy fw fh *frame*)
     (glass:fb-rect fb (win-x win) (- (win-y win) *title-h*) (win-w win) *title-h*
@@ -242,13 +261,7 @@
     ;; the close box: an X in the title bar's right-hand square
     (let ((cx (- (+ fx fw) *title-h*)) (cy fy))
       (glass:fb-text fb (+ cx (floor (- *title-h* (glass:text-width "x" :size *font-size*)) 2))
-                     (%text-top cy *title-h*) "x" :size *font-size* :color *title-fg*)
-      ;; and, when the host has a keyboard to offer, a keys button beside it: a key-cap outline
-      (when keys
-        (let* ((in (max 3 (floor *title-h* 4))) (kx (+ (- cx *title-h*) in)) (ky (+ cy in 1))
-               (kw (- *title-h* (* 2 in))) (kh (- *title-h* (* 2 in) 2)))
-          (glass:fb-rect fb kx ky kw kh *title-fg*)
-          (glass:fb-rect fb (+ kx 2) (+ ky 2) (- kw 4) (- kh 4) (if top *title-bg-top* *title-bg*)))))
+                     (%text-top cy *title-h*) "x" :size *font-size* :color *title-fg*))
     (%blit fb (win-fb win) (win-x win) (win-y win))))
 
 (defun %draw-menu (desk)
@@ -283,7 +296,7 @@
     (glass:fb-fill fb *bg*)
     (let ((top (first (desk-windows desk))))
       (dolist (w (reverse (desk-windows desk)))
-        (%draw-window fb w (eq w top) (desk-keyboard-fn desk))))
+        (%draw-window fb w (eq w top))))
     (when (desk-menu desk) (%draw-menu desk))
     (glass:fb-touch fb)))
 
@@ -296,7 +309,7 @@
       (dolist (win (reverse (desk-windows desk)))
         (multiple-value-bind (fx fy fw fh) (%frame-box win)
           (when (%overlaps-p x y w h fx fy fw fh)
-            (%draw-window fb win (eq win top) (desk-keyboard-fn desk)))))
+            (%draw-window fb win (eq win top)))))
       (when (desk-menu desk)
         (multiple-value-bind (mx my mw mh) (%menu-box desk)
           (when (%overlaps-p x y w h (1- mx) (1- my) (+ mw 2) (+ mh 2))
