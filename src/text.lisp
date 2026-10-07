@@ -36,11 +36,13 @@
       (or *font-regular* (setf *font-regular* (load-font (%scribe-font "LiberationSans-Regular.ttf"))))))
 
 (defun text-width (string &key (size 13) (font (default-font)))
-  "The advance width of STRING at SIZE px in FONT (for centring/layout)."
+  "The advance width of STRING at SIZE px in FONT (for centring/layout).  Through the glyph
+   cache, as FB-TEXT is: measuring rasterized every glyph afresh, which made laying out a line of
+   text (word wrap measures every word) cost more than drawing it."
   (let ((w 0d0))
     (loop for ch across string do
       (multiple-value-bind (cov gw gh left top adv)
-          (scribe:rasterize-glyph font (scribe:font-glyph-index font (char-code ch)) size)
+          (%cached-glyph font (scribe:font-glyph-index font (char-code ch)) size 0d0)
         (declare (ignore cov gw gh left top))
         (incf w (or adv (float size 1d0)))))
     (ceiling w)))
