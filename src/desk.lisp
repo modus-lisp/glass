@@ -19,7 +19,7 @@
 (defpackage #:glass.desk
   (:use #:cl)
   (:export #:make-desk #:desk-register-app #:desk-open #:desk-pointer #:desk-key #:desk-tick
-           #:desk-fb #:desk-windows #:desk-apps #:desk-redraw))
+           #:desk-fb #:desk-windows #:desk-apps #:desk-redraw #:desk-keyboard-fn))
 
 (in-package #:glass.desk)
 
@@ -49,6 +49,7 @@
   (drag nil)               ; (window dx dy) while a title bar is held
   (cascade 0)
   (damage '())             ; ((x y w h) ...) to repaint at the next tick
+  (keyboard-fn nil)        ; the host's on-screen keyboard toggle; NIL = no keys button
   (dirty t))               ; T = repaint everything
 
 (defun make-desk (fb)
@@ -122,6 +123,7 @@
         (return
           (values w (cond ((>= y (win-y w)) :content)
                           ((>= x (- (+ fx fw) *title-h*)) :close)
+                          ((and (desk-keyboard-fn desk) (>= x (- (+ fx fw) (* 2 *title-h*)))) :keys)
                           (t :title))))))))
 
 ;;; ---- the root menu -------------------------------------------------------------------------------
@@ -182,6 +184,8 @@
             (multiple-value-bind (mx my mw mh) (%menu-box desk)
               (%damage desk (1- mx) (1- my) (+ mw 2) (+ mh 2))))
            ((eq part :close) (%close desk win))
+           ;; the keys button: this window gets the keyboard's typing, so it comes to the front
+           ((eq part :keys) (%raise desk win) (funcall (desk-keyboard-fn desk)))
            ((eq part :title)
             (%raise desk win)
             (setf (desk-drag desk) (list win (- x (win-x win)) (- y (win-y win)))))
@@ -198,7 +202,8 @@
     nil))
 
 (defun desk-key (desk down keysym)
-  "A key goes to the topmost window."
+  "A key goes to the topmost window.  KEYSYM is X11's: Latin-1 as itself, other Unicode
+   #x01000000+codepoint, Return #xff0d, BackSpace #xff08, arrows #xff51-#xff54."
   (let ((win (first (desk-windows desk))))
     (when (and win (win-on-key win)) (funcall (win-on-key win) down keysym))))
 
@@ -219,7 +224,7 @@
             (replace dp sp :start1 (+ (* ty tw) x0) :end1 (+ (* ty tw) x1)
                            :start2 (+ (* sy sw) (- x0 dx)))))))))
 
-(defun %draw-window (fb win top)
+(defun %draw-window (fb win top &optional keys)
   (multiple-value-bind (fx fy fw fh) (%frame-box win)
     (glass:fb-rect fb fx fy fw fh *frame*)
     (glass:fb-rect fb (win-x win) (- (win-y win) *title-h*) (win-w win) *title-h*
@@ -228,7 +233,12 @@
                    :size 13 :color *title-fg*)
     ;; the close box: an X in the title bar's right-hand square
     (let ((cx (- (+ fx fw) *title-h*)) (cy fy))
-      (glass:fb-text fb (+ cx 7) (+ cy 4) "x" :size 13 :color *title-fg*))
+      (glass:fb-text fb (+ cx 7) (+ cy 4) "x" :size 13 :color *title-fg*)
+      ;; and, when the host has a keyboard to offer, a keys button beside it
+      (when keys
+        (glass:fb-rect fb (- cx *title-h* -4) (+ cy 6) (- *title-h* 8) (- *title-h* 11) *title-fg*)
+        (glass:fb-rect fb (- cx *title-h* -6) (+ cy 8) (- *title-h* 12) (- *title-h* 15)
+                       (if top *title-bg-top* *title-bg*))))
     (%blit fb (win-fb win) (win-x win) (win-y win))))
 
 (defun %draw-menu (desk)
@@ -262,7 +272,7 @@
     (glass:fb-fill fb *bg*)
     (let ((top (first (desk-windows desk))))
       (dolist (w (reverse (desk-windows desk)))
-        (%draw-window fb w (eq w top))))
+        (%draw-window fb w (eq w top) (desk-keyboard-fn desk))))
     (when (desk-menu desk) (%draw-menu desk))
     (glass:fb-touch fb)))
 
@@ -275,7 +285,7 @@
       (dolist (win (reverse (desk-windows desk)))
         (multiple-value-bind (fx fy fw fh) (%frame-box win)
           (when (%overlaps-p x y w h fx fy fw fh)
-            (%draw-window fb win (eq win top)))))
+            (%draw-window fb win (eq win top) (desk-keyboard-fn desk)))))
       (when (desk-menu desk)
         (multiple-value-bind (mx my mw mh) (%menu-box desk)
           (when (%overlaps-p x y w h (1- mx) (1- my) (+ mw 2) (+ mh 2))
