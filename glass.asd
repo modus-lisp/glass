@@ -104,6 +104,14 @@ Kept separate so the core framebuffer + RFB server stay dependency-light."
   :serial t
   :components ((:module "src" :serial t :components ((:file "text")))))
 
+(asdf:defsystem :glass/desk
+  :description "A minimal desktop on a glass framebuffer with no McCLIM: windows you drag by the
+title bar and close, raise on touch, and a root menu of applications.  Applications use the same
+MAKE-FN contract as the full desktop's surface apps (mcclim-glass's REGISTER-APP :surface)."
+  :depends-on ("glass/fb" "glass/text")
+  :serial t
+  :components ((:module "src" :serial t :components ((:file "desk")))))
+
 (asdf:defsystem :glass/audio
   :description "The session's sound: one mix, read by however many listeners a
 session has.  Sources are reed source-thunks; the mix runs on its OWN 20 ms clock
