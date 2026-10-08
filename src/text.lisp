@@ -93,6 +93,12 @@
          (fbb (scribe:srgb->linear (ldb (byte 8 0) color)))
          (solid (logand color #xffffff))
          (px (fb-pixels fb)) (fw (fb-width fb)) (fh (fb-height fb))
+         ;; :I420: luma blended per pixel; each pixel nudges its 2x2 chroma block a quarter
+         ;; of its coverage toward the text's chroma, so a block the glyph fills becomes the
+         ;; text's colour and a block it grazes barely moves
+         (i420 (eq (fb-format fb) :i420))
+         (yp (fb-y fb)) (up (fb-u fb)) (vp (fb-v fb)) (cw (and i420 (fb-chroma-width fb)))
+         (ty (and i420 (%rgb-y color))) (tu (and i420 (%rgb-u color))) (tv (and i420 (%rgb-v color)))
          ;; THE CLIP BOX, like FB-RECT: a compositor redrawing one damaged rectangle draws a title
          ;; that crosses its edge, and glyphs outside it must not land on what was not redrawn
          (clip (fb-clip fb))
@@ -112,7 +118,14 @@
                     (let ((frow (* fy fw)))
                       (dotimes (gx w)
                         (let ((c (aref cov (+ (* gy w) gx))) (fx (+ ox gx)))
-                          (when (and (> c 0d0) (<= cx0 fx) (< fx cx1))
+                          (when (and i420 (> c 0d0) (<= cx0 fx) (< fx cx1))
+                            (let* ((idx (+ frow fx)) (a (min 1d0 (* alpha c)))
+                                   (ci (+ (ash fx -1) (* (ash fy -1) cw)))
+                                   (q (* 0.25d0 a)))
+                              (setf (aref yp idx) (round (+ (* (aref yp idx) (- 1d0 a)) (* ty a)))
+                                    (aref up ci) (round (+ (* (aref up ci) (- 1d0 q)) (* tu q)))
+                                    (aref vp ci) (round (+ (* (aref vp ci) (- 1d0 q)) (* tv q))))))
+                          (when (and (not i420) (> c 0d0) (<= cx0 fx) (< fx cx1))
                             (let* ((idx (+ frow fx)) (dst (aref px idx))
                                    (a (min 1d0 (* alpha c))) (ia (- 1d0 a)))
                               (setf (aref px idx)

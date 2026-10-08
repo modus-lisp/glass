@@ -78,10 +78,54 @@ would not have to visit every call site in the tree."
 #-sb-thread (defmacro %with-frame-lock ((fb) &body body)
               (declare (ignore fb)) `(progn ,@body))
 
+;;; ---- the pixel FORMAT -------------------------------------------------------
+;;; What a pixel IS, as the header says, is X8R8G8B8 -- for a framebuffer whose FORMAT is
+;;; :XRGB, the default and every framebuffer there was before this.  A framebuffer can
+;;; instead be :I420: planar Y'CbCr 4:2:0 (BT.601, limited range), three byte planes, Y at
+;;; full resolution and Cb/Cr at half in each direction -- the format a VP8 decoder hands
+;;; out and a VP8 encoder takes, and one a display controller can scan out as it stands
+;;; (the Pi's HVS does).  A machine whose screen and whose video are both Y'CbCr then never
+;;; converts at all: a decoded picture is copied into the framebuffer plane by plane, and
+;;; the screen reads the framebuffer.
+;;;
+;;; Drawing is the same API in either format: colours are still X8R8G8B8 integers, and
+;;; each primitive converts once.  What 4:2:0 costs is chroma resolution -- one Cb/Cr
+;;; sample per 2x2 block -- so a 1-pixel coloured line or coloured text has soft colour
+;;; edges (its brightness stays exact).  Measured on the Zero's HVS at 11-16 px: legible,
+;;; and white text is untouched.  FB-GET converts back, so readers that want X8R8G8B8 (an
+;;; RFB encoder, a screenshot) keep working; FB-PIXELS is :XRGB-only.
+(defvar *default-fb-format* :xrgb
+  "The FORMAT MAKE-FRAMEBUFFER gives a framebuffer when none is named: :XRGB or :I420.
+   A platform whose screen is Y'CbCr binds it once, and everything -- the desk, its
+   windows -- is made in that format.")
+
+(declaim (inline %rgb-y %rgb-u %rgb-v))
+(defun %rgb-y (c)
+  (let ((r (ldb (byte 8 16) c)) (g (ldb (byte 8 8) c)) (b (ldb (byte 8 0) c)))
+    (+ 16 (ash (+ (* 66 r) (* 129 g) (* 25 b) 128) -8))))
+(defun %rgb-u (c)
+  (let ((r (ldb (byte 8 16) c)) (g (ldb (byte 8 8) c)) (b (ldb (byte 8 0) c)))
+    (+ 128 (ash (+ (* -38 r) (* -74 g) (* 112 b) 128) -8))))
+(defun %rgb-v (c)
+  (let ((r (ldb (byte 8 16) c)) (g (ldb (byte 8 8) c)) (b (ldb (byte 8 0) c)))
+    (+ 128 (ash (+ (* 112 r) (* -94 g) (* -18 b) 128) -8))))
+
+(defun %ycc-rgb (y u v)
+  "X8R8G8B8 from BT.601 limited-range Y'CbCr."
+  (let* ((c (- y 16)) (d (- u 128)) (e (- v 128))
+         (r (ash (+ (* 298 c) (* 409 e) 128) -8))
+         (g (ash (+ (* 298 c) (* -100 d) (* -208 e) 128) -8))
+         (b (ash (+ (* 298 c) (* 516 d) 128) -8)))
+    (logior (ash (max 0 (min 255 r)) 16) (ash (max 0 (min 255 g)) 8) (max 0 (min 255 b)))))
+
+(defun %u8-plane (n v) (make-array n :element-type '(unsigned-byte 8) :initial-element v))
+
 (defstruct (framebuffer (:conc-name fb-) (:constructor %make-framebuffer))
   (width  0 :type fixnum)
   (height 0 :type fixnum)
-  (pixels #() :type (simple-array (unsigned-byte 32) (*)))
+  (pixels #() :type (simple-array (unsigned-byte 32) (*)))   ; :XRGB only
+  (format :xrgb)                                             ; :XRGB or :I420
+  (y nil) (u nil) (v nil)            ; :I420 planes: W x H, and ceil(W/2) x ceil(H/2) twice
   ;; Guards the (width height pixels) triple against a RESIZE racing a reader.
   ;; Per-pixel content races are benign (a stale read is re-sent next update);
   ;; only the array swap needs protecting, so readers grab this only to snapshot.
@@ -234,20 +278,36 @@ would not have to visit every call site in the tree."
 #-sb-thread (defmacro with-fb-locked ((fb) &body body)
               (declare (ignore fb)) `(progn ,@body))
 
-(defun make-framebuffer (width height &optional (fill +black+))
-  "A WIDTH x HEIGHT framebuffer, cleared to FILL."
-  (let ((px (make-array (* width height) :element-type '(unsigned-byte 32)
-                                         :initial-element (logand fill #xffffff))))
-    (%make-framebuffer :width width :height height :pixels px)))
+(defun fb-chroma-width (fb) (ceiling (fb-width fb) 2))
+(defun fb-chroma-height (fb) (ceiling (fb-height fb) 2))
+
+(defun %i420-planes (fb width height fill)
+  (let ((cn (* (ceiling width 2) (ceiling height 2))))
+    (setf (fb-y fb) (%u8-plane (* width height) (%rgb-y fill))
+          (fb-u fb) (%u8-plane cn (%rgb-u fill))
+          (fb-v fb) (%u8-plane cn (%rgb-v fill)))
+    fb))
+
+(defun make-framebuffer (width height &optional (fill +black+) (format *default-fb-format*))
+  "A WIDTH x HEIGHT framebuffer, cleared to FILL, in FORMAT (:XRGB or :I420)."
+  (if (eq format :i420)
+      (%i420-planes (%make-framebuffer :width width :height height :format :i420
+                                       :pixels (make-array 0 :element-type '(unsigned-byte 32)))
+                    width height fill)
+      (let ((px (make-array (* width height) :element-type '(unsigned-byte 32)
+                                             :initial-element (logand fill #xffffff))))
+        (%make-framebuffer :width width :height height :pixels px))))
 
 (defun fb-resize (fb width height &optional (fill +black+))
   "Resize FB in place to WIDTH x HEIGHT (contents reset to FILL).  Atomic against
    readers that snapshot under WITH-FB-LOCKED.  No-op if the size is unchanged."
   (with-fb-locked (fb)
     (unless (and (= width (fb-width fb)) (= height (fb-height fb)))
-      (setf (fb-pixels fb) (make-array (* width height) :element-type '(unsigned-byte 32)
-                                                        :initial-element (logand fill #xffffff))
-            (fb-width fb) width
+      (if (eq (fb-format fb) :i420)
+          (%i420-planes fb width height fill)
+          (setf (fb-pixels fb) (make-array (* width height) :element-type '(unsigned-byte 32)
+                                                            :initial-element (logand fill #xffffff))))
+      (setf (fb-width fb) width
             (fb-height fb) height)
       (fb-touch fb)))
   fb)
@@ -257,22 +317,38 @@ would not have to visit every call site in the tree."
   (and (>= x 0) (>= y 0) (< x (fb-width fb)) (< y (fb-height fb))))
 
 (defun fb-put (fb x y color)
-  "Set pixel (X,Y) to COLOR (no-op if out of bounds)."
+  "Set pixel (X,Y) to COLOR (no-op if out of bounds).  In :I420 the pixel's luma is
+   exact and its 2x2 chroma block takes COLOR's chroma."
   (when (%in-bounds fb x y)
-    (setf (aref (fb-pixels fb) (+ (* y (fb-width fb)) x)) (logand color #xffffff))
+    (if (eq (fb-format fb) :i420)
+        (let ((ci (+ (ash x -1) (* (ash y -1) (fb-chroma-width fb)))))
+          (setf (aref (fb-y fb) (+ (* y (fb-width fb)) x)) (%rgb-y color)
+                (aref (fb-u fb) ci) (%rgb-u color)
+                (aref (fb-v fb) ci) (%rgb-v color)))
+        (setf (aref (fb-pixels fb) (+ (* y (fb-width fb)) x)) (logand color #xffffff)))
     (fb-touch fb))
   color)
 
 (defun fb-get (fb x y)
-  "Pixel (X,Y), or 0 if out of bounds."
-  (if (%in-bounds fb x y) (aref (fb-pixels fb) (+ (* y (fb-width fb)) x)) 0))
+  "Pixel (X,Y) as X8R8G8B8, or 0 if out of bounds."
+  (cond ((not (%in-bounds fb x y)) 0)
+        ((eq (fb-format fb) :i420)
+         (let ((ci (+ (ash x -1) (* (ash y -1) (fb-chroma-width fb)))))
+           (%ycc-rgb (aref (fb-y fb) (+ (* y (fb-width fb)) x))
+                     (aref (fb-u fb) ci) (aref (fb-v fb) ci))))
+        (t (aref (fb-pixels fb) (+ (* y (fb-width fb)) x)))))
 
 (defun fb-fill (fb color)
   "Clear the framebuffer to COLOR (only the clip region, if a clip is set)."
   (let ((clip (fb-clip fb)))
     (if clip
         (fb-rect fb (first clip) (second clip) (- (third clip) (first clip)) (- (fourth clip) (second clip)) color)
-        (progn (fill (fb-pixels fb) (logand color #xffffff)) (fb-touch fb))))
+        (progn (if (eq (fb-format fb) :i420)
+                   (progn (fill (fb-y fb) (%rgb-y color))
+                          (fill (fb-u fb) (%rgb-u color))
+                          (fill (fb-v fb) (%rgb-v color)))
+                   (fill (fb-pixels fb) (logand color #xffffff)))
+               (fb-touch fb))))
   color)
 
 (defun fb-rect (fb x y w h color)
@@ -287,9 +363,21 @@ would not have to visit every call site in the tree."
          (x1 (min fw (+ x w) (if clip (third clip) fw))) (y1 (min fh (+ y h) (if clip (fourth clip) fh)))
          (px (fb-pixels fb)) (c (logand color #xffffff)))
     (when (< x0 x1)
-      (loop for yy from y0 below y1
-            for row = (* yy fw)
-            do (fill px c :start (+ row x0) :end (+ row x1)))))
+      (if (eq (fb-format fb) :i420)
+          ;; luma exactly; chroma over every 2x2 block the rectangle touches
+          (let ((yp (fb-y fb)) (up (fb-u fb)) (vp (fb-v fb)) (cw (fb-chroma-width fb))
+                (yc (%rgb-y c)) (uc (%rgb-u c)) (vc (%rgb-v c))
+                (cx0 (ash x0 -1)) (cx1 (ash (1+ x1) -1)))
+            (loop for yy from y0 below y1
+                  for row = (* yy fw)
+                  do (fill yp yc :start (+ row x0) :end (+ row x1)))
+            (loop for cy from (ash y0 -1) below (ash (1+ y1) -1)
+                  for row = (* cy cw)
+                  do (fill up uc :start (+ row cx0) :end (+ row cx1))
+                     (fill vp vc :start (+ row cx0) :end (+ row cx1))))
+          (loop for yy from y0 below y1
+                for row = (* yy fw)
+                do (fill px c :start (+ row x0) :end (+ row x1))))))
   (fb-touch fb)
   fb)
 
@@ -307,6 +395,8 @@ would not have to visit every call site in the tree."
    scratch row rather than trusting REPLACE's same-sequence overlap rule."
   (declare (optimize (speed 3) (safety 0))
            (fixnum sx sy dx dy w h))
+  (when (eq (fb-format fb) :i420)
+    (return-from fb-move-rect (%fb-move-rect-i420 fb sx sy dx dy w h)))
   (let* ((px (fb-pixels fb)) (fw (fb-width fb)) (fh (fb-height fb)))
     (declare (type (simple-array (unsigned-byte 32) (*)) px) (fixnum fw fh))
     (when (and (plusp w) (plusp h)
@@ -330,6 +420,105 @@ would not have to visit every call site in the tree."
       (fb-touch fb)))
   fb)
 
+(defun %move-plane (p stride sx sy dx dy w h)
+  "FB-MOVE-RECT's row moves on one byte plane P of row length STRIDE (already checked)."
+  (flet ((row (k)
+           (let ((s (+ (* (+ sy k) stride) sx)) (d (+ (* (+ dy k) stride) dx)))
+             (replace p p :start1 d :end1 (+ d w) :start2 s :end2 (+ s w)))))
+    (cond
+      ((= sy dy)
+       (let ((tmp (make-array w :element-type '(unsigned-byte 8))))
+         (dotimes (k h)
+           (let ((s (+ (* (+ sy k) stride) sx)) (d (+ (* (+ dy k) stride) dx)))
+             (replace tmp p :start2 s :end2 (+ s w))
+             (replace p tmp :start1 d :end1 (+ d w))))))
+      ((> dy sy) (loop for k from (1- h) downto 0 do (row k)))
+      (t         (loop for k from 0 below h do (row k))))))
+
+(defun %fb-move-rect-i420 (fb sx sy dx dy w h)
+  "FB-MOVE-RECT for :I420: the luma block exactly, the chroma blocks covering it moved by
+   the move halved -- exact for an even move, half a pixel of chroma off for an odd one."
+  (let ((fw (fb-width fb)) (fh (fb-height fb)))
+    (when (and (plusp w) (plusp h)
+               (<= 0 sx) (<= 0 sy) (<= (+ sx w) fw) (<= (+ sy h) fh)
+               (<= 0 dx) (<= 0 dy) (<= (+ dx w) fw) (<= (+ dy h) fh)
+               (or (/= sx dx) (/= sy dy)))
+      (%move-plane (fb-y fb) fw sx sy dx dy w h)
+      (let* ((cw (fb-chroma-width fb)) (ch (fb-chroma-height fb))
+             (csx (ash sx -1)) (csy (ash sy -1)) (cdx (ash dx -1)) (cdy (ash dy -1))
+             (cww (min (- (ash (1+ (+ sx w)) -1) csx) (- cw csx) (- cw cdx)))
+             (chh (min (- (ash (1+ (+ sy h)) -1) csy) (- ch csy) (- ch cdy))))
+        (when (and (plusp cww) (plusp chh) (or (/= csx cdx) (/= csy cdy)))
+          (%move-plane (fb-u fb) cw csx csy cdx cdy cww chh)
+          (%move-plane (fb-v fb) cw csx csy cdx cdy cww chh)))
+      (fb-touch fb)))
+  fb)
+
+(defun fb-blit-clipped (dst src dx dy)
+  "SRC into DST at (DX,DY), clipped to DST and its clip box, a row at a time, in either
+   format (both the same).  The desk's window blit.  In :I420 a window at an odd position
+   has its chroma placed half a pixel off -- invisible at 4:2:0's chroma resolution."
+  (let* ((sw (fb-width src)) (sh (fb-height src))
+         (clip (fb-clip dst)) (tw (fb-width dst)) (th (fb-height dst))
+         (x0 (max 0 dx (if clip (first clip) 0))) (x1 (min tw (+ dx sw) (if clip (third clip) tw)))
+         (y0 (max 0 dy (if clip (second clip) 0))) (y1 (min th (+ dy sh) (if clip (fourth clip) th))))
+    (when (and (< x0 x1) (< y0 y1))
+      (if (eq (fb-format dst) :i420)
+          (let ((sp (fb-y src)) (dp (fb-y dst))
+                (scw (fb-chroma-width src)) (dcw (fb-chroma-width dst))
+                (sch (fb-chroma-height src)))
+            (loop for ty from y0 below y1
+                  do (replace dp sp :start1 (+ (* ty tw) x0) :end1 (+ (* ty tw) x1)
+                                    :start2 (+ (* (- ty dy) sw) (- x0 dx))))
+            (let ((cx0 (ash x0 -1)) (cx1 (ash (1+ x1) -1)) (cdx (ash dx -1)) (cdy (ash dy -1)))
+              (loop for cy from (ash y0 -1) below (ash (1+ y1) -1)
+                    for scy = (- cy cdy)
+                    when (< -1 scy sch)
+                      do (let ((a (max cx0 cdx)) (b (min cx1 (+ cdx scw))))
+                           (when (< a b)
+                             (replace (fb-u dst) (fb-u src) :start1 (+ (* cy dcw) a) :end1 (+ (* cy dcw) b)
+                                                            :start2 (+ (* scy scw) (- a cdx)))
+                             (replace (fb-v dst) (fb-v src) :start1 (+ (* cy dcw) a) :end1 (+ (* cy dcw) b)
+                                                            :start2 (+ (* scy scw) (- a cdx))))))))
+          (let ((sp (fb-pixels src)) (dp (fb-pixels dst)))
+            (loop for ty from y0 below y1
+                  do (replace dp sp :start1 (+ (* ty tw) x0) :end1 (+ (* ty tw) x1)
+                                    :start2 (+ (* (- ty dy) sw) (- x0 dx)))))))
+    (fb-touch dst)
+    dst))
+
+(defun fb-blit-yuv (fb x y w h ys us vs sw sh ystride cstride)
+  "A 4:2:0 picture -- planes YS, US, VS of an SW x SH image, rows YSTRIDE and CSTRIDE apart --
+   scaled nearest-neighbour into the W x H rectangle at (X,Y) of :I420 framebuffer FB,
+   clipped.  The video path: a decoded frame goes in plane by plane, never through RGB."
+  (declare (type (simple-array (unsigned-byte 8) (*)) ys us vs)
+           (type fixnum x y w h sw sh ystride cstride))
+  (let* ((fw (fb-width fb)) (fh (fb-height fb)) (yp (fb-y fb)) (up (fb-u fb)) (vp (fb-v fb))
+         (cw (fb-chroma-width fb))
+         (x0 (max 0 x)) (x1 (min fw (+ x w))) (y0 (max 0 y)) (y1 (min fh (+ y h))))
+    (declare (type (simple-array (unsigned-byte 8) (*)) yp up vp) (type fixnum fw fh cw x0 x1 y0 y1))
+    (when (and (< x0 x1) (< y0 y1))
+      (let ((xm (make-array (- x1 x0) :element-type 'fixnum)))
+        (dotimes (i (- x1 x0))
+          (setf (aref xm i) (min (1- sw) (floor (* (- (+ x0 i) x) sw) w))))
+        (loop for ty of-type fixnum from y0 below y1
+              do (let ((srow (* ystride (min (1- sh) (floor (* (- ty y) sh) h))))
+                       (drow (* ty fw)))
+                   (declare (type fixnum srow drow))
+                   (dotimes (i (- x1 x0))
+                     (setf (aref yp (+ drow x0 i)) (aref ys (+ srow (aref xm i)))))))
+        (loop for cy of-type fixnum from (ash y0 -1) below (ash (1+ y1) -1)
+              do (let* ((sy (min (1- sh) (floor (* (- (* 2 cy) y) sh) h)))
+                        (srow (* cstride (ash (max 0 sy) -1)))
+                        (drow (* cy cw)))
+                   (declare (type fixnum sy srow drow))
+                   (loop for cx of-type fixnum from (ash x0 -1) below (ash (1+ x1) -1)
+                         do (let ((sx (ash (max 0 (min (1- sw) (floor (* (- (* 2 cx) x) sw) w))) -1)))
+                              (setf (aref up (+ drow cx)) (aref us (+ srow sx))
+                                    (aref vp (+ drow cx)) (aref vs (+ srow sx)))))))))
+    (fb-touch fb)
+    fb))
+
 (defun fb-hline (fb x y w color) (fb-rect fb x y w 1 color))
 (defun fb-vline (fb x y h color) (fb-rect fb x y 1 h color))
 
@@ -343,6 +532,8 @@ would not have to visit every call site in the tree."
 
 (defun fb-blit (dst src dx dy)
   "Copy the whole framebuffer SRC into DST with its top-left at (DX,DY) (clipped)."
+  (when (and (eq (fb-format dst) :i420) (eq (fb-format src) :i420) (null (fb-clip dst)))
+    (return-from fb-blit (fb-blit-clipped dst src dx dy)))
   (dotimes (sy (fb-height src) dst)
     (dotimes (sx (fb-width src))
       (fb-put dst (+ dx sx) (+ dy sy) (fb-get src sx sy)))))
@@ -375,7 +566,8 @@ would not have to visit every call site in the tree."
    for a compositor, where it cost more than the frame budget and the desktop crawled."
   (cond
     ((= scale 1) (fb-blit dst src dx dy))
-    ((and (integerp scale) (> scale 1)) (%fb-blit-scaled-int dst src dx dy scale))
+    ((and (integerp scale) (> scale 1) (eq (fb-format dst) :xrgb) (eq (fb-format src) :xrgb))
+     (%fb-blit-scaled-int dst src dx dy scale))
     (t
       (let* ((sw (fb-width src)) (sh (fb-height src))
              (dw (round (* sw scale))) (dh (round (* sh scale))))
@@ -389,6 +581,12 @@ would not have to visit every call site in the tree."
   "The rectangle (X,Y,W,H) of SRC into DST at (X*K, Y*K), magnified by the whole number K: the
    same pixels FB-BLIT-SCALED would put there, for a host that knows what changed and need not
    magnify the rest.  Clipped to both framebuffers."
+  (unless (and (eq (fb-format dst) :xrgb) (eq (fb-format src) :xrgb))
+    (dotimes (j (* h k))
+      (dotimes (i (* w k))
+        (fb-put dst (+ (* x k) i) (+ (* y k) j)
+                (fb-get src (+ x (floor i k)) (+ y (floor j k))))))
+    (return-from fb-blit-scaled-region dst))
   (let* ((sw (fb-width src)) (sh (fb-height src))
          (tw (fb-width dst)) (th (fb-height dst))
          (sp (fb-pixels src)) (dp (fb-pixels dst))

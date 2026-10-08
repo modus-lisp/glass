@@ -12,7 +12,9 @@
   (:export
    ;; framebuffer
    #:make-framebuffer #:framebuffer #:framebuffer-p
-   #:fb-width #:fb-height #:fb-pixels #:fb-resize #:with-fb-locked #:fb-generation #:fb-touch
+   #:fb-width #:fb-height #:fb-pixels #:fb-resize
+   #:*default-fb-format* #:fb-format #:fb-y #:fb-u #:fb-v #:fb-chroma-width #:fb-chroma-height
+   #:fb-blit-clipped #:fb-blit-yuv #:with-fb-locked #:fb-generation #:fb-touch
    #:fb-clip #:with-fb-clip #:with-fb-locked-or #:fb-frameno #:fb-damage #:fb-copy #:fb-mark-frame #:fb-take-frame #:fb-take-copy
    #:fb-put #:fb-get #:fb-fill #:fb-rect #:fb-hline #:fb-vline #:fb-frame #:fb-blit #:fb-blit-scaled #:fb-blit-scaled-region #:fb-move-rect
    #:rgb #:+black+ #:+white+ #:+red+ #:+green+ #:+blue+

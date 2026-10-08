@@ -238,6 +238,8 @@
 
 (defun %blit (dst src dx dy)
   "SRC into DST at (DX,DY), clipped, a row at a time."
+  (unless (eq (glass:fb-format dst) :xrgb)
+    (return-from %blit (glass:fb-blit-clipped dst src dx dy)))
   (let* ((sw (glass:fb-width src)) (sh (glass:fb-height src))
          (clip (glass:fb-clip dst))
          (tw (glass:fb-width dst)) (th (glass:fb-height dst))
