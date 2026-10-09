@@ -498,24 +498,40 @@ would not have to visit every call site in the tree."
          (x0 (max 0 x)) (x1 (min fw (+ x w))) (y0 (max 0 y)) (y1 (min fh (+ y h))))
     (declare (type (simple-array (unsigned-byte 8) (*)) yp up vp) (type fixnum fw fh cw x0 x1 y0 y1))
     (when (and (< x0 x1) (< y0 y1))
-      (let ((xm (make-array (- x1 x0) :element-type 'fixnum)))
-        (dotimes (i (- x1 x0))
-          (setf (aref xm i) (min (1- sw) (floor (* (- (+ x0 i) x) sw) w))))
+      ;; Column maps once per call, not a FLOOR per pixel: the chroma loop's per-pixel FLOOR was
+      ;; a third of this function on the board.  At 1:1 across (the usual case: a frame shown at
+      ;; its own width) a row is one REPLACE, which is a bulk copy.
+      (let* ((n (- x1 x0)) (cx0 (ash x0 -1)) (cn (- (ash (1+ x1) -1) cx0))
+             (one (and (= w sw) (evenp x)))   ; even X: chroma columns line up too
+             (xm (unless one (make-array n :element-type 'fixnum)))
+             (cxm (unless one (make-array cn :element-type 'fixnum))))
+        (declare (type fixnum n cx0 cn))
+        (unless one
+          (dotimes (i n)
+            (setf (aref xm i) (min (1- sw) (floor (* (- (+ x0 i) x) sw) w))))
+          (dotimes (i cn)
+            (setf (aref cxm i) (ash (max 0 (min (1- sw) (floor (* (- (* 2 (+ cx0 i)) x) sw) w))) -1))))
         (loop for ty of-type fixnum from y0 below y1
               do (let ((srow (* ystride (min (1- sh) (floor (* (- ty y) sh) h))))
                        (drow (* ty fw)))
                    (declare (type fixnum srow drow))
-                   (dotimes (i (- x1 x0))
-                     (setf (aref yp (+ drow x0 i)) (aref ys (+ srow (aref xm i)))))))
+                   (if one
+                       (replace yp ys :start1 (+ drow x0) :end1 (+ drow x1) :start2 (+ srow (- x0 x)))
+                       (dotimes (i n)
+                         (setf (aref yp (+ drow x0 i)) (aref ys (+ srow (aref xm i))))))))
         (loop for cy of-type fixnum from (ash y0 -1) below (ash (1+ y1) -1)
               do (let* ((sy (min (1- sh) (floor (* (- (* 2 cy) y) sh) h)))
                         (srow (* cstride (ash (max 0 sy) -1)))
-                        (drow (* cy cw)))
+                        (drow (+ (* cy cw) cx0)))
                    (declare (type fixnum sy srow drow))
-                   (loop for cx of-type fixnum from (ash x0 -1) below (ash (1+ x1) -1)
-                         do (let ((sx (ash (max 0 (min (1- sw) (floor (* (- (* 2 cx) x) sw) w))) -1)))
-                              (setf (aref up (+ drow cx)) (aref us (+ srow sx))
-                                    (aref vp (+ drow cx)) (aref vs (+ srow sx)))))))))
+                   (if one
+                       (let ((s0 (+ srow (- cx0 (ash x -1)))))
+                         (replace up us :start1 drow :end1 (+ drow cn) :start2 s0)
+                         (replace vp vs :start1 drow :end1 (+ drow cn) :start2 s0))
+                       (dotimes (i cn)
+                         (let ((sx (+ srow (aref cxm i))))
+                           (setf (aref up (+ drow i)) (aref us sx)
+                                 (aref vp (+ drow i)) (aref vs sx)))))))))
     (fb-touch fb)
     fb))
 
