@@ -66,21 +66,30 @@
 (defvar *glyph-cache* (make-hash-table :test 'equal #+sbcl :synchronized #+sbcl t))
 
 (defun %glyph-entry (font gid size sub)
-  "GID's cache entry: (coverage w h left top advance icoverage).  ICOVERAGE is COVERAGE in
-   4096ths, for FB-TEXT's integer compositing."
+  "GID's cache entry: (nil w h left top advance coverage), COVERAGE per pixel in 4096ths as two
+   packed bytes (high, low), NIL for a glyph with nothing to draw.  Packed bytes, not the
+   rasterizer's double floats (nor a word per pixel): the cache is live heap, a copying collector copies all of it at every collection, and
+   on modus the doubles made a prerendered desk's cache 16 MB -- 60 ms more of every GC pause on
+   a Pi Zero.  The first slot, once the double-float coverage, is kept NIL for the shape."
   (let* ((q (/ (round (* sub 4)) 4d0))
          (key (list font gid size q)))
     (or (gethash key *glyph-cache*)
         (multiple-value-bind (cov w h left top adv)
             (scribe:rasterize-glyph font gid size :subpixel q)
-          (let ((r (list cov w h left top adv
-                         (and cov (map 'simple-vector (lambda (c) (min 4096 (max 0 (round (* c 4096))))) cov)))))
+          (let ((r (list nil w h left top adv
+                         (and cov
+                              (let ((v (make-array (* 2 (length cov)) :element-type '(unsigned-byte 8))))
+                                (dotimes (i (length cov) v)
+                                  (let ((c (min 4096 (max 0 (round (* (aref cov i) 4096))))))
+                                    (setf (aref v (* 2 i)) (ash c -8)
+                                          (aref v (1+ (* 2 i))) (logand c 255)))))))))
             (when #+modus (sb-thread:main-thread-p) #-modus t
               (setf (gethash key *glyph-cache*) r))
             r)))))
 
 (defun %cached-glyph (font gid size sub)
-  "(values coverage w h left top advance) for GID, through *GLYPH-CACHE*."
+  "(values nil w h left top advance) for GID, through *GLYPH-CACHE*: the metrics (the coverage
+   is FB-TEXT's, from %GLYPH-ENTRY)."
   (destructuring-bind (cov w h left top adv &rest more) (%glyph-entry font gid size sub)
     (declare (ignore more))
     (values cov w h left top adv)))
@@ -141,7 +150,9 @@
                   (when (and (<= cy0 fy) (< fy cy1))
                     (let ((frow (* fy fw)) (crow (* gy w)))
                       (dotimes (gx w)
-                        (let ((c (aref icov (+ crow gx))) (fx (+ ox gx)))
+                        (let ((c (logior (ash (aref icov (* 2 (+ crow gx))) 8)
+                                         (aref icov (1+ (* 2 (+ crow gx))))))
+                              (fx (+ ox gx)))
                           (when (and (> c 0) (<= cx0 fx) (< fx cx1))
                             (let* ((idx (+ frow fx))
                                    (a (if (= a12 4096) c (ash (* a12 c) -12)))
