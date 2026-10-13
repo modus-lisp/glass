@@ -65,17 +65,40 @@
 ;;; rasterise as before.
 (defvar *glyph-cache* (make-hash-table :test 'equal #+sbcl :synchronized #+sbcl t))
 
+(defun %glyph-entry (font gid size sub)
+  "GID's cache entry: (coverage w h left top advance icoverage).  ICOVERAGE is COVERAGE in
+   4096ths, for FB-TEXT's integer compositing."
+  (let* ((q (/ (round (* sub 4)) 4d0))
+         (key (list font gid size q)))
+    (or (gethash key *glyph-cache*)
+        (multiple-value-bind (cov w h left top adv)
+            (scribe:rasterize-glyph font gid size :subpixel q)
+          (let ((r (list cov w h left top adv
+                         (and cov (map 'simple-vector (lambda (c) (min 4096 (max 0 (round (* c 4096))))) cov)))))
+            (when #+modus (sb-thread:main-thread-p) #-modus t
+              (setf (gethash key *glyph-cache*) r))
+            r)))))
+
 (defun %cached-glyph (font gid size sub)
   "(values coverage w h left top advance) for GID, through *GLYPH-CACHE*."
-  (let* ((q (/ (round (* sub 4)) 4d0))
-         (key (list font gid size q))
-         (hit (gethash key *glyph-cache*)))
-    (if hit
-        (values-list hit)
-        (let ((r (multiple-value-list (scribe:rasterize-glyph font gid size :subpixel q))))
-          (when #+modus (sb-thread:main-thread-p) #-modus t
-            (setf (gethash key *glyph-cache*) r))
-          (values-list r)))))
+  (destructuring-bind (cov w h left top adv &rest more) (%glyph-entry font gid size sub)
+    (declare (ignore more))
+    (values cov w h left top adv)))
+
+;;; INTEGER COMPOSITING.  FB-TEXT blended in double floats, and on modus every intermediate
+;;; double is a heap object: a cached 16-px glyph cost ~4 ms to composite, and a title bar's two
+;;; strings were most of a window-drag frame on a Pi Zero (55 ms; 15 fps).  Coverage and linear light
+;;; are now in 4096ths -- *SRGB->LIN12* below, back through scribe's own
+;;; 4096-entry *LINEAR->SRGB* -- so a pixel is a few fixnum multiplies.  Full coverage still
+;;; writes the colour itself; a partial pixel can land a level from the double-float result.
+(defvar *srgb->lin12*
+  (let ((v (make-array 256)))
+    (dotimes (i 256 v) (setf (aref v i) (round (* 4096 (scribe:srgb->linear i)))))))
+
+(declaim (inline %over12))
+(defun %over12 (dst8 lfg a ia)
+  "FG (linear, 4096ths) over the sRGB byte DST8 at coverage A in 4096ths (IA = 4096 - A)."
+  (aref scribe:*linear->srgb* (ash (+ (* ia (aref *srgb->lin12* dst8)) (* a lfg) 2048) -12)))
 
 (defun fb-text (fb x y string &key (size 13) (color +black+) (font (default-font))
                                    (alpha 1d0))
@@ -88,9 +111,10 @@
    caller had before and is bit-identical to it."
   (let* ((upem (scribe:font-units-per-em font))
          (baseline (+ y (round (* (scribe:font-ascent font) size) upem)))
-         (fr (scribe:srgb->linear (ldb (byte 8 16) color)))
-         (fg (scribe:srgb->linear (ldb (byte 8 8) color)))
-         (fbb (scribe:srgb->linear (ldb (byte 8 0) color)))
+         (fr (aref *srgb->lin12* (ldb (byte 8 16) color)))
+         (fg (aref *srgb->lin12* (ldb (byte 8 8) color)))
+         (fbb (aref *srgb->lin12* (ldb (byte 8 0) color)))
+         (a12 (min 4096 (max 0 (round (* alpha 4096)))))
          (solid (logand color #xffffff))
          (px (fb-pixels fb)) (fw (fb-width fb)) (fh (fb-height fb))
          ;; :I420: luma blended per pixel; each pixel nudges its 2x2 chroma block a quarter
@@ -108,31 +132,32 @@
     (loop for ch across string do
       (let* ((gid (scribe:font-glyph-index font (char-code ch)))
              (sub (- penx (ffloor penx))))
-        (multiple-value-bind (cov w h left top adv)
-            (%cached-glyph font gid size sub)
-          (when cov
+        (destructuring-bind (cov w h left top adv icov) (%glyph-entry font gid size sub)
+          (declare (ignore cov))
+          (when icov
             (let ((ox (+ (floor penx) left)) (oy (+ baseline top)))
               (dotimes (gy h)
                 (let ((fy (+ oy gy)))
                   (when (and (<= cy0 fy) (< fy cy1))
-                    (let ((frow (* fy fw)))
+                    (let ((frow (* fy fw)) (crow (* gy w)))
                       (dotimes (gx w)
-                        (let ((c (aref cov (+ (* gy w) gx))) (fx (+ ox gx)))
-                          (when (and i420 (> c 0d0) (<= cx0 fx) (< fx cx1))
-                            (let* ((idx (+ frow fx)) (a (min 1d0 (* alpha c)))
-                                   (ci (+ (ash fx -1) (* (ash fy -1) cw)))
-                                   (q (* 0.25d0 a)))
-                              (setf (aref yp idx) (round (+ (* (aref yp idx) (- 1d0 a)) (* ty a)))
-                                    (aref up ci) (round (+ (* (aref up ci) (- 1d0 q)) (* tu q)))
-                                    (aref vp ci) (round (+ (* (aref vp ci) (- 1d0 q)) (* tv q))))))
-                          (when (and (not i420) (> c 0d0) (<= cx0 fx) (< fx cx1))
-                            (let* ((idx (+ frow fx)) (dst (aref px idx))
-                                   (a (min 1d0 (* alpha c))) (ia (- 1d0 a)))
-                              (setf (aref px idx)
-                                    (if (>= a 1d0)
-                                        solid   ; full coverage: the colour, no blend
-                                        (logior (ash (%over (ldb (byte 8 16) dst) fr a ia) 16)
-                                                (ash (%over (ldb (byte 8 8) dst) fg a ia) 8)
-                                                (%over (ldb (byte 8 0) dst) fbb a ia))))))))))))))
+                        (let ((c (aref icov (+ crow gx))) (fx (+ ox gx)))
+                          (when (and (> c 0) (<= cx0 fx) (< fx cx1))
+                            (let* ((idx (+ frow fx))
+                                   (a (if (= a12 4096) c (ash (* a12 c) -12)))
+                                   (ia (- 4096 a)))
+                              (if i420
+                                  (let* ((ci (+ (ash fx -1) (* (ash fy -1) cw)))
+                                         (q (ash a -2)) (iq (- 4096 q)))
+                                    (setf (aref yp idx) (ash (+ (* (aref yp idx) ia) (* ty a) 2048) -12)
+                                          (aref up ci) (ash (+ (* (aref up ci) iq) (* tu q) 2048) -12)
+                                          (aref vp ci) (ash (+ (* (aref vp ci) iq) (* tv q) 2048) -12)))
+                                  (setf (aref px idx)
+                                        (if (>= a 4096)
+                                            solid   ; full coverage: the colour, no blend
+                                            (let ((dst (aref px idx)))
+                                              (logior (ash (%over12 (ldb (byte 8 16) dst) fr a ia) 16)
+                                                      (ash (%over12 (ldb (byte 8 8) dst) fg a ia) 8)
+                                                      (%over12 (ldb (byte 8 0) dst) fbb a ia))))))))))))))))
           (incf penx (or adv (float size 1d0))))))
     (floor penx)))
