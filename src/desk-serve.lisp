@@ -44,6 +44,14 @@
         (post (list :stop))
         (ignore-errors (sb-thread:join-thread compositor))))))
 
+(defmacro %app-guard (what &body body)
+  "BODY, with an error in it logged and dropped -- NIL then -- rather than ending the thread."
+  `(handler-case (progn ,@body)
+     (error (e)
+       (ignore-errors (format *error-output* "~&glass desk: ~a: ~a~%" ,what e)
+                      (force-output *error-output*))
+       nil)))
+
 (defun %desk-compositor (fb inbox wake apps open)
   "The compositor thread: make the desk, then apply input and tick it until told to stop."
   ;; Caches the apps fill as they run are this thread's own: the glyph cache, scribe's state, and
@@ -59,14 +67,17 @@
     (dolist (label open) (desk-open desk label))
     (loop
       (dolist (m (glass::mb-take inbox))
-        (case (first m)
-          (:key (desk-key desk (second m) (third m)))
-          (:pointer (destructuring-bind (mask x y) (rest m) (desk-pointer desk mask x y)))
-          (:stop (return-from %desk-compositor-1 nil))))
+        (when (eq (first m) :stop) (return-from %desk-compositor-1 nil))
+        ;; AN APP'S ERROR IS THE APP'S: input reaches app code (ON-KEY, ON-POINTER), and a
+        ;; signal out of it must not end the compositor -- that is the whole desktop.
+        (%app-guard (format nil "~(~a~)" (first m))
+          (case (first m)
+            (:key (desk-key desk (second m) (third m)))
+            (:pointer (destructuring-bind (mask x y) (rest m) (desk-pointer desk mask x y))))))
       ;; Draw under the pixel lock, so a sender diffing the screen never sees half a frame,
       ;; and tell the senders where (FB-MARK-FRAME) so they diff only that.
       (multiple-value-bind (changed x y w h)
-          (glass:with-fb-locked (fb) (desk-tick desk))
+          (%app-guard "tick" (glass:with-fb-locked (fb) (desk-tick desk)))
         (when changed
           (glass:fb-mark-frame fb (list x y (+ x w) (+ y h)))))
       (glass::wake-wait wake 1/60))))
