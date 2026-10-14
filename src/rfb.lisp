@@ -770,9 +770,15 @@ its bytes would land in the middle of a rect."
       (flet ((cursor-done () (when cur (setf (rc-cursor-sent client) t))))
         (if (or (zerop inc) (null (car snap-box)))                   ; full / first frame
             (with-fb-locked (fb)
+              ;; SNAPSHOT FIRST, THEN SEND.  The snapshot is what the client is assumed to
+              ;; hold, so it must not be newer than what went out: copied after the write, it
+              ;; could take in a change drawn (without the fb lock) by someone who had already
+              ;; seen this frame -- the next diff then finds nothing, the request stays parked
+              ;; and the client never gets that change.  Copied before, a change that lands
+              ;; during the send just goes out again next time.
+              (setf (car snap-box) (copy-pixels fb))
               (send-rects s fb (list (clip-rect fb x y w h)) enc zs trle fmt cur)
               (cursor-done)
-              (setf (car snap-box) (copy-pixels fb))
               t)
             (with-fb-locked (fb)                                     ; incremental: dirty tiles
               (let ((snap (car snap-box)))
@@ -784,19 +790,19 @@ its bytes would land in the middle of a rect."
                    (destructuring-bind (sx sy dx dy w h) copy
                      (apply-snapshot-copy snap (fb-width fb) sx sy dx dy w h)
                      (let ((rects (band-rects (dirty-rects fb snap (and (consp region) region)))))
+                       (update-snapshot fb snap rects)        ; before sending -- see the full-frame branch
                        (w-u8 s 0) (w-u8 s 0) (w-u16 s (+ (if cur 1 0) 1 (length rects)))  ; cursor? + CopyRect + exposed
                        (when cur (emit-cursor-rect s fmt))
                        (write-rect-copy s dx dy w h sx sy)
                        (dolist (r rects) (destructuring-bind (rx ry rw rh) r (emit-rect s fb rx ry rw rh enc zs trle fmt)))
                        (force-output s)
                        (cursor-done)
-                       (update-snapshot fb snap rects)
                        t)))
                   (t (let ((rects (dirty-rects fb snap (and (consp region) region))))
                        (when (or rects cur)                          ; send if there's dirt OR a pending cursor
+                         (when rects (update-snapshot fb snap rects)) ; before sending -- see above
                          (send-rects s fb (or rects '()) enc zs trle fmt cur)
-                         (cursor-done)
-                         (when rects (update-snapshot fb snap rects)))
+                         (cursor-done))
                        (and (or rects cur) t)))))))))))
 
 ;;; A WAKE lets the compositor and the reader thread nudge a parked sender the
