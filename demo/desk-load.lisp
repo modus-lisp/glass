@@ -8,9 +8,9 @@
   (handler-bind ((warning #'muffle-warning))
     (funcall (read-from-string "ql:quickload") "glass/desk-serve" :silent t)))
 
-;;; Media is warp's player.  Optional: without it the Media window says so.  On modus it plays
-;;; with warp's message-passing engine (warp branch media-messages); an older warp loads, and
-;;; its tracks fail to start -- the desk logs that and carries on.
+;;; Media is warp's player.  Optional: without it the Media window says so.  On modus it needs
+;;; warp's message-passing engine (warp master since 2026-10-14); an older warp loads, and its
+;;; tracks fail to start -- the desk logs that and carries on.
 (defvar cl-user::*desk-media*
   (handler-case
       (let ((*standard-output* (make-broadcast-stream)))
