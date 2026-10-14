@@ -30,10 +30,19 @@
   (asdf:system-relative-pathname :scribe (format nil "fonts/~a" name)))
 
 (defun default-font (&optional bold)
-  "The default UI font (Liberation Sans), regular or BOLD."
-  (if bold
-      (or *font-bold*    (setf *font-bold*    (load-font (%scribe-font "LiberationSans-Bold.ttf"))))
-      (or *font-regular* (setf *font-regular* (load-font (%scribe-font "LiberationSans-Regular.ttf"))))))
+  "The default UI font (Liberation Sans), regular or BOLD.  Loaded once and cached -- except on
+   a modus thread other than main, whose font could not be stored in the shared cache: it gets
+   one of its own, uncached.  A host that draws text on another thread loads the faces on main
+   first (SERVE-DESK does)."
+  (flet ((cache (getter setter file)
+           (or (funcall getter)
+               (let ((f (load-font (%scribe-font file))))
+                 (if #+modus (sb-thread:main-thread-p) #-modus t
+                     (funcall setter f)
+                     f)))))
+    (if bold
+        (cache (lambda () *font-bold*) (lambda (f) (setf *font-bold* f)) "LiberationSans-Bold.ttf")
+        (cache (lambda () *font-regular*) (lambda (f) (setf *font-regular* f)) "LiberationSans-Regular.ttf"))))
 
 (defun text-width (string &key (size 13) (font (default-font)))
   "The advance width of STRING at SIZE px in FONT (for centring/layout).  Through the glyph
@@ -65,6 +74,17 @@
 ;;; rasterise as before.
 (defvar *glyph-cache* (make-hash-table :test 'equal #+sbcl :synchronized #+sbcl t))
 
+(defvar *glyph-cache-owned* nil
+  "True while *GLYPH-CACHE* is bound to a table the current thread made: a drawing thread binds
+   both (see WITH-OWN-GLYPH-CACHE) and then fills its own cache, on modus as anywhere.")
+
+(defmacro with-own-glyph-cache (() &body body)
+  "BODY with a glyph cache of this thread's own, and scribe's state too (SCRIBE:WITH-THREAD-STATE)
+   -- for a thread that draws text all the time (a compositor) where shared caches are main's
+   alone (modus)."
+  `(let ((*glyph-cache* (make-hash-table :test 'equal)) (*glyph-cache-owned* t))
+     (scribe:with-thread-state () ,@body)))
+
 (defun %cached-glyph (font gid size sub)
   "(values coverage w h left top advance) for GID, through *GLYPH-CACHE*."
   (let* ((q (/ (round (* sub 4)) 4d0))
@@ -73,7 +93,7 @@
     (if hit
         (values-list hit)
         (let ((r (multiple-value-list (scribe:rasterize-glyph font gid size :subpixel q))))
-          (when #+modus (sb-thread:main-thread-p) #-modus t
+          (when (or *glyph-cache-owned* #+modus (sb-thread:main-thread-p) #-modus t)
             (setf (gethash key *glyph-cache*) r))
           (values-list r)))))
 

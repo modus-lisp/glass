@@ -112,6 +112,15 @@ MAKE-FN contract as the full desktop's surface apps (mcclim-glass's REGISTER-APP
   :serial t
   :components ((:module "src" :serial t :components ((:file "desk")))))
 
+(asdf:defsystem :glass/desk-serve
+  :description "The desk served over RFB with a thread per concern: the calling thread is the
+network (SERVE-MULTI, every viewer), a second thread composites the desk.  Input crosses as
+messages, pixels through the shared screen framebuffer -- so it runs where threads share nothing
+(modus) as well as on SBCL."
+  :depends-on ("glass" "glass/desk")
+  :serial t
+  :components ((:module "src" :serial t :components ((:file "desk-apps") (:file "desk-serve")))))
+
 (asdf:defsystem :glass/audio
   :description "The session's sound: one mix, read by however many listeners a
 session has.  Sources are reed source-thunks; the mix runs on its OWN 20 ms clock

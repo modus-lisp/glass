@@ -18,7 +18,7 @@
    #:rgb #:+black+ #:+white+ #:+red+ #:+green+ #:+blue+
    #:+pixel-colour-space+
    ;; text (the :glass/text system; scribe-backed)
-   #:fb-text #:text-width #:load-font #:default-font
+   #:fb-text #:text-width #:load-font #:default-font #:with-own-glyph-cache
    ;; server: (serve fb port &key on-key on-pointer on-resize name once wake)
    ;; naming things people say out loud (wordlist.lisp)
    #:word-name #:*wordlist*

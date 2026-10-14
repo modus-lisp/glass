@@ -73,13 +73,9 @@
 ;;; The lock is feature-gated the way the framebuffer's is, so the same file loads on an
 ;;; implementation without sb-thread (modus, which supplies its own concurrency).
 
-;;; SHARING ACROSS THREADS.  modus threads share no state: a thread's objects live in its own
-;;; heap, and storing one into memory another thread owns is refused.  A value meant for other
-;;; threads is SENT -- copied into shared memory -- by MODUS:SHARE, which costs nothing for an
-;;; object that is already shared (or an immediate) and is the identity everywhere else.  Every
-;;; store below of a value that other threads will read goes through %SHARE.  A closure cannot be
-;;; copied, so a provider or a listener only works from the thread that owns the clipboard there.
-(defun %share (x) #+modus (modus:share x) #-modus x)
+;;; Values other threads read are stored through %SHARE (src/framebuffer.lisp).  A closure
+;;; cannot be shared, so a provider or a listener only works from the thread that owns the
+;;; clipboard on modus.
 
 #+sb-thread (defun %clip-make-lock () (sb-thread:make-mutex :name "glass-clipboard"))
 #-sb-thread (defun %clip-make-lock () nil)
