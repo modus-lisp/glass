@@ -46,7 +46,10 @@
 
 (defun %desk-compositor (fb inbox wake apps open)
   "The compositor thread: make the desk, then apply input and tick it until told to stop."
-  (glass:with-own-glyph-cache () (%desk-compositor-1 fb inbox wake apps open)))
+  ;; Caches the apps fill as they run are this thread's own: the glyph cache, scribe's state, and
+  ;; the Media library (a binding is per-thread on modus, so filling it stores nothing shared).
+  (let ((*media-library* nil))
+    (glass:with-own-glyph-cache () (%desk-compositor-1 fb inbox wake apps open))))
 
 (defun %desk-compositor-1 (fb inbox wake apps open)
   (let ((desk (make-desk fb)))

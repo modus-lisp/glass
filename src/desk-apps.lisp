@@ -203,7 +203,9 @@
 (defvar *media-root* nil
   "The folder MEDIA-APP's library plays from (a directory namestring), or NIL for none.")
 
-(defvar *media-library* nil "The library every Media window shares, made on first open.")
+(defvar *media-library* nil
+  "The library every Media window shares, made on first open.  SERVE-DESK's compositor binds it,
+   so the library belongs to the thread whose apps use it.")
 
 (defun media-app (fb)
   "Media: warp's player over *MEDIA-ROOT*.  Needs the warp-media-glass system loaded."
