@@ -187,6 +187,34 @@
           (close s)
           (ignore-errors (sb-thread:join-thread server)))))))
 
+(defun scenario-viewers (port n)
+  "N viewers at once on one SERVE-MULTI thread: each gets the full frame, then one change
+   reaches all of them incrementally, every client matching the server."
+  (let* ((w 160) (h 120) (fb (glass:make-framebuffer w h glass:+blue+)))
+    (glass:fb-rect fb 10 10 50 30 glass:+red+)
+    (let* ((server (sb-thread:make-thread
+                    (lambda () (ignore-errors (glass:serve-multi fb port :clients n)))
+                    :name "glass-multi"))
+           (views (loop repeat n
+                        collect (multiple-value-bind (s sw sh) (rfb-open port)
+                                  (check (and (= sw w) (= sh h)) "viewer dims ~ax~a" sw sh)
+                                  (set-encodings s 5 0)                       ; Hextile, Raw
+                                  (cons s (make-array (* w h) :initial-element 0))))))
+      (dolist (v views) (request (car v) 0 w h))
+      (dolist (v views) (read-update (car v) w (cdr v)))
+      (check (every (lambda (v) (equalp (cdr v) (glass:fb-pixels fb))) views)
+             "all ~a viewers match after the full frame" n)
+      (glass:fb-rect fb 100 70 16 16 glass:+green+)
+      (dolist (v views) (request (car v) 1 w h))
+      (dolist (v views)
+        (multiple-value-bind (nr total) (read-update (car v) w (cdr v))
+          (declare (ignore nr))
+          (check (< 0 total (* w h)) "incremental is partial: ~a px" total)))
+      (check (every (lambda (v) (equalp (cdr v) (glass:fb-pixels fb))) views)
+             "all ~a viewers match after the change" n)
+      (dolist (v views) (close (car v)))
+      (ignore-errors (sb-thread:join-thread server)))))
+
 (defun run-tests ()
   (setf *checks* 0 *fails* 0)
   (format t "~&[glass RFB oracle]~%")
@@ -197,6 +225,7 @@
     (format t "-- Raw, one thread --~%")     (scenario 5924 :raw)
     (format t "-- Hextile, one thread --~%") (scenario 5925 :hextile)
     (format t "-- ZRLE, one thread --~%")    (scenario 5926 :zrle))
+  (format t "-- three viewers, one thread --~%") (scenario-viewers 5927 3)
   (format t "----------------------------------~%")
   (format t "checks: ~d   failures: ~d   => ~a~%" *checks* *fails* (if (zerop *fails*) "PASS" "FAIL"))
   (zerop *fails*))

@@ -1264,62 +1264,123 @@ its bytes would land in the middle of a rect."
   "Serve exactly one client, then return (handy for tests)."
   (apply #'serve fb port :once t args))
 
-;;; ---- one client, one thread ---------------------------------------------------
+;;; ---- many clients, one thread ---------------------------------------------------
 ;;;
-;;; SERVE gives each client a reader thread and a sender thread that share the client's
-;;; state under a lock.  Some Lisps cannot share like that: on modus a thread may not
-;;; store its own objects into memory another thread owns -- threads share nothing and
-;;; talk by message.  SERVE-SINGLE is the same protocol on ONE thread: input is read
-;;; when the socket has some (LISTEN), and between reads the sender's turn runs.  One
-;;; viewer, and the caller's drawing happens on this thread too (TICK), so nothing
-;;; crosses a thread at all.  Same handlers, same encoder -- only the scheduling differs.
+;;; SERVE gives each client a reader thread and a sender thread.  SERVE-MULTI serves every
+;;; client from ONE thread: the network thread of a desktop that gives each concern its own
+;;; thread -- network, compositing, input -- rather than each viewer two.  Per turn it takes
+;;; new connections, reads whatever input each client has, lets TICK draw, and gives each
+;;; client's sender a turn; when nothing happened it waits for input.  The same handlers
+;;; and encoder as SERVE: a connection is its RFB-CONN and its RFB-CLIENT side by side, and
+;;; a message is applied the moment it is posted.  Nothing crosses a thread, so it is the
+;;; same code on modus (where threads share nothing) and SBCL.
+;;;
+;;; WAITING.  There is no portable poll over many descriptors, so the idle wait checks each
+;;; one and then sleeps in short slices on the listener -- cl-transport's WAIT-READABLE does
+;;; the same.  Input on a client can therefore wait up to one slice (*MULTI-SLICE*) when the
+;;; desktop is idle; a busy desktop never waits.
+;;;
+;;; A HANDSHAKE RUNS INLINE: a client that stalls in it stalls the others for as long.  Fine
+;;; for the local viewers this is for; a server on an open port wants SERVE.
 
-(defun client-loop-single (fb s on-key on-pointer on-resize
-                           &key (clipboard (session-clipboard)) tick (interval 1/60))
-  "Serve the client on stream S from this thread alone until it disconnects.  TICK, if
-   given, is called once per turn before the sender runs -- the place to draw."
-  (let* ((id (%next-conn-id))
-         (client (make-rfb-client :id id :last-size (cons (fb-width fb) (fb-height fb))))
-         (conn (make-rfb-conn :id id :post (lambda (m) (%rfb-apply client m fb))))
-         (fd (ignore-errors (sb-sys:fd-stream-fd s))))
-    (flet ((input-p (timeout)
-             ;; Bytes already buffered in the stream, or the descriptor readable.  LISTEN
-             ;; alone is not enough: it is false at end of file, so a viewer that closed
-             ;; would never be noticed -- poll reports EOF as readable, and READ-BYTE then
-             ;; returns :EOF.
-             (or (listen s)
-                 (if fd
-                     (sb-sys:wait-until-fd-usable fd :input timeout)
-                     (progn (sleep timeout) nil)))))
-      (loop while (rc-running client) do
-        (loop while (and (rc-running client) (input-p 0))
-              do (when (eq (%rfb-handle-message (read-byte s nil :eof) conn s
-                                                on-key on-pointer on-resize clipboard)
-                           :done)
-                   (setf (rc-running client) nil)))
-        (when (rc-running client)
-          (when tick (funcall tick))
-          ;; Idle by waiting for INPUT, not by sleeping: a keystroke is handled the
-          ;; moment it arrives instead of at the next tick.
-          (unless (%rfb-sender-step client fb s clipboard fd)
-            (input-p interval)))))))
+(defparameter *multi-slice* 1/200
+  "SERVE-MULTI's idle wait, in seconds: how long input can sit unread on a quiet desktop.")
 
-(defun serve-single (fb port &key on-key on-pointer on-resize tick (interval 1/60)
-                                  (name *desktop-name*) (address "127.0.0.1") listen
-                                  (password :inherit) (clipboard (session-clipboard)))
-  "Serve FB to ONE client on PORT, entirely on the calling thread, and return when it
-   disconnects.  ADDRESS defaults to loopback: one local viewer.  TICK (no arguments)
-   runs each turn, so an app can draw between updates without a thread of its own.
-   Otherwise as SERVE."
-  (let ((listen (or listen (tcp-listen port :address address))))
-    (format *error-output* "~&glass: RFB server (one client, one thread) on ~a (~dx~d)~%"
+(defstruct (rfb-peer (:conc-name peer-))
+  stream fd conn client)
+
+(defun %peer-input-p (peer)
+  (or (listen (peer-stream peer))
+      (let ((fd (peer-fd peer)))
+        (and fd (sb-sys:wait-until-fd-usable fd :input 0)))))
+
+(defun %listener-fd (listen)
+  (socket-fd (if (typep listen 'sb-bsd-sockets:socket) listen (listener-socket listen))))
+
+(defun serve-multi (fb port &key on-key on-pointer on-resize tick (interval 1/60)
+                                 (name *desktop-name*) (address "127.0.0.1") listen
+                                 (password :inherit) (clipboard (session-clipboard))
+                                 (max-clients 16) clients stop)
+  "Serve FB to every client that connects on PORT, all from the calling thread.  TICK (no
+   arguments) runs each turn, so an app can draw between updates on this thread.  CLIENTS,
+   if given, is how many connections to serve before returning (once the last has left);
+   STOP, if given, is a predicate polled each turn.  At most MAX-CLIENTS at once; a further
+   connection is closed at once.  ADDRESS defaults to loopback.  Otherwise as SERVE."
+  (let* ((listen (or listen (tcp-listen port :address address)))
+         (lfd (%listener-fd listen))
+         (peers '())
+         (served 0))
+    (format *error-output* "~&glass: RFB server (all clients, one thread) on ~a (~dx~d)~%"
             (listener-endpoint listen) (fb-width fb) (fb-height fb))
     (force-output *error-output*)
-    (unwind-protect
-         (let ((stream (accept-stream listen)))
-           (unwind-protect
-                (when (handshake fb stream name password)
-                  (client-loop-single fb stream on-key on-pointer on-resize
-                                      :clipboard clipboard :tick tick :interval interval))
-             (ignore-errors (close stream))))
-      (close-listener listen))))
+    (flet ((drop (peer)
+             (ignore-errors (close (peer-stream peer)))
+             (setf peers (remove peer peers)))
+           (finished-p ()
+             (or (and stop (funcall stop))
+                 (and clients (>= served clients) (null peers)))))
+      (unwind-protect
+           (loop until (finished-p) do
+             (let ((busy nil))
+               ;; 1. new connections
+               (when (and (or (null clients) (< served clients))
+                          (sb-sys:wait-until-fd-usable lfd :input 0))
+                 (let ((stream (accept-stream listen)))
+                   (when stream
+                     (setf busy t)
+                     (if (>= (length peers) max-clients)
+                         (ignore-errors (close stream))
+                         (let ((ok (ignore-errors (handshake fb stream name password))))
+                           (incf served)
+                           (if (not ok)
+                               (ignore-errors (close stream))
+                               (let* ((id (%next-conn-id))
+                                      (client (make-rfb-client
+                                               :id id :last-size (cons (fb-width fb) (fb-height fb))))
+                                      (conn (make-rfb-conn
+                                             :id id :post (lambda (m) (%rfb-apply client m fb)))))
+                                 (setf peers (append peers
+                                                     (list (make-rfb-peer
+                                                            :stream stream
+                                                            :fd (ignore-errors (sb-sys:fd-stream-fd stream))
+                                                            :conn conn :client client)))))))))))
+               ;; 2. input, from every client that has some
+               (dolist (peer peers)
+                 (loop while (and (rc-running (peer-client peer)) (%peer-input-p peer))
+                       do (setf busy t)
+                          (when (eq (handler-case
+                                        (%rfb-handle-message (read-byte (peer-stream peer) nil :eof)
+                                                             (peer-conn peer) (peer-stream peer)
+                                                             on-key on-pointer on-resize clipboard)
+                                      (error () :done))
+                                    :done)
+                            (setf (rc-running (peer-client peer)) nil)))
+                 (unless (rc-running (peer-client peer)) (drop peer)))
+               ;; 3. the app draws
+               (when tick (funcall tick))
+               ;; 4. every client's sender takes a turn
+               (dolist (peer peers)
+                 (when (%rfb-sender-step (peer-client peer) fb (peer-stream peer) clipboard
+                                         (peer-fd peer))
+                   (setf busy t))
+                 (unless (rc-running (peer-client peer)) (drop peer)))
+               ;; 5. idle: wait for input -- on the listener in slices, checking every
+               ;;    client between them -- for at most INTERVAL
+               (unless busy
+                 (let ((deadline (+ (get-internal-real-time)
+                                    (round (* interval internal-time-units-per-second)))))
+                   (loop
+                     (when (some #'%peer-input-p peers) (return))
+                     (when (or (null clients) (< served clients))
+                       (when (sb-sys:wait-until-fd-usable lfd :input 0) (return)))
+                     (when (>= (get-internal-real-time) deadline) (return))
+                     (if (or (null clients) (< served clients))
+                         (sb-sys:wait-until-fd-usable lfd :input *multi-slice*)
+                         (sleep *multi-slice*)))))))
+        (dolist (peer peers) (ignore-errors (close (peer-stream peer))))
+        (close-listener listen)))))
+
+(defun serve-single (fb port &rest args &key &allow-other-keys)
+  "Serve FB to ONE client on PORT, entirely on the calling thread, and return when it
+   disconnects: SERVE-MULTI with :CLIENTS 1."
+  (apply #'serve-multi fb port :clients 1 :max-clients 1 args))
