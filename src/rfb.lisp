@@ -841,15 +841,14 @@ its bytes would land in the middle of a rect."
           (handler-case (progn (send-cut-text s text) t)
             (error () (setf (rc-running client) nil) nil)))))))
 
-(defun rfb-sender-loop (client fb s wake &optional (clipboard (session-clipboard)))
-  "Fulfil the client's pending request the moment the fb changes (parked on WAKE,
-   ~60 Hz safety timeout).  Runs in its own thread; exits when the client stops."
-  (let ((fd (ignore-errors (sb-sys:fd-stream-fd s))))    ; for the socket-queue backlog
-  (loop while (rc-running client) do
+(defun %rfb-sender-step (client fb s clipboard fd)
+  "One turn of the sender: send the client's cut text if owed, then fulfil its parked
+   request if the fb has moved on.  Returns true when it sent an update -- the caller
+   parks when it did not."
     (send-pending-cut-text client s clipboard)
     (let ((req (sb-thread:with-mutex ((rc-lock client)) (rc-want client))))
       (cond
-        ((null req) (wake-wait wake 1/60))
+        ((null req) nil)
         ;; incremental request, but the fb hasn't changed since we last caught up:
         ;; nothing to do — skip the (whole-frame) diff entirely and park.
         ;; ...AND WE HAVE A SNAPSHOT TO HAVE CAUGHT UP *WITH*.  The generation test alone
@@ -867,7 +866,7 @@ its bytes would land in the middle of a rect."
         ((and (plusp (first req)) (= (fb-generation fb) (rc-last-gen client))
               (car (rc-snap-box client))
               (not (rc-resize-ack client)))
-         (wake-wait wake 1/60))
+         nil)
         (t
          ;; TAKE AND DIFF ARE ONE STEP.  The frame triple and the pixels are two
          ;; different locks, and the COPY only describes the pixels as they stood at
@@ -909,9 +908,17 @@ its bytes would land in the middle of a rect."
                            (sb-thread:with-mutex ((rc-lock client))
                              (when (eq (rc-want client) req) (setf (rc-want client) nil))))
                          sent))))))
-           ;; parking happens OFF the pixel lock — holding it here would stall every
-           ;; compositor for the whole timeout
-           (unless sent (wake-wait wake 1/60))))))))) ; nothing dirty (gen bumped, pixels same) — park
+           sent)))))
+
+(defun rfb-sender-loop (client fb s wake &optional (clipboard (session-clipboard)))
+  "Fulfil the client's pending request the moment the fb changes (parked on WAKE,
+   ~60 Hz safety timeout).  Runs in its own thread; exits when the client stops."
+  (let ((fd (ignore-errors (sb-sys:fd-stream-fd s))))    ; for the socket-queue backlog
+    (loop while (rc-running client) do
+      ;; parking happens OFF the pixel lock -- holding it here would stall every
+      ;; compositor for the whole timeout
+      (unless (%rfb-sender-step client fb s clipboard fd)
+        (wake-wait wake 1/60)))))
 
 (defconstant +enc-zrle2+ 24
   "RealVNC's proprietary ZRLE2.  We don't implement it, but a client that lists it
@@ -962,24 +969,10 @@ its bytes would land in the middle of a rect."
            (clipboard-paste :clipboard clipboard)                     ; types on its own thread
            t)))))
 
-(defun client-loop (fb s on-key on-pointer on-resize wake &optional (clipboard (session-clipboard)))
-  "Read RFB client messages, handling input (key/pointer) IMMEDIATELY; framebuffer
-   updates are produced by a companion sender thread, so input is never blocked on
-   a frame.  Only the sender writes pixels; this thread never writes to S."
-  (let* ((client (make-rfb-client :last-size (cons (fb-width fb) (fb-height fb))))
-         (sender (sb-thread:make-thread (lambda () (rfb-sender-loop client fb s wake clipboard))
-                                        :name "glass-sender")))
-    ;; A selection change should reach this client now, not at the next 1/60 safety tick — the
-    ;; same nudge the compositor gives the sender when it has drawn.  Keyed by the client, so a
-    ;; reconnect replaces its listener instead of stacking another one.
-    (clipboard-listen clipboard client
-                      (lambda (cb serial owner)
-                        (declare (ignore cb serial owner))
-                        (wake-signal wake)))
-    (unwind-protect
-         (loop
-           (let ((msg (read-byte s nil :eof)))
-             (case msg
+(defun %rfb-handle-message (msg client fb s on-key on-pointer on-resize wake clipboard)
+  "Handle one client->server message whose type byte MSG has just been read.  Returns
+   :DONE when the client is finished (EOF, or a message type we cannot parse)."
+  (case msg
                (0 (skip s 3)                               ; SetPixelFormat
                   (let* ((pf (r-bytes s 16)) (fmt (parse-pxfmt pf)))
                     (sb-thread:with-mutex ((rc-lock client))
@@ -1052,7 +1045,28 @@ its bytes would land in the middle of a rect."
                (t (unless (eq msg :eof)                    ; EOF = normal disconnect; anything else is notable
                     (format *trace-output* "~&glass: dropping client on unhandled message-type ~a~%" msg)
                     (force-output *trace-output*))
-                  (return)))))                             ; :eof or unknown -> done
+                  :done)))
+
+(defun client-loop (fb s on-key on-pointer on-resize wake &optional (clipboard (session-clipboard)))
+  "Read RFB client messages, handling input (key/pointer) IMMEDIATELY; framebuffer
+   updates are produced by a companion sender thread, so input is never blocked on
+   a frame.  Only the sender writes pixels; this thread never writes to S."
+  (let* ((client (make-rfb-client :last-size (cons (fb-width fb) (fb-height fb))))
+         (sender (sb-thread:make-thread (lambda () (rfb-sender-loop client fb s wake clipboard))
+                                        :name "glass-sender")))
+    ;; A selection change should reach this client now, not at the next 1/60 safety tick — the
+    ;; same nudge the compositor gives the sender when it has drawn.  Keyed by the client, so a
+    ;; reconnect replaces its listener instead of stacking another one.
+    (clipboard-listen clipboard client
+                      (lambda (cb serial owner)
+                        (declare (ignore cb serial owner))
+                        (wake-signal wake)))
+    (unwind-protect
+         (loop
+           (let ((msg (read-byte s nil :eof)))
+             (when (eq (%rfb-handle-message msg client fb s on-key on-pointer on-resize wake clipboard)
+                     :done)
+               (return))))                             ; :eof or unknown -> done
       (setf (rc-running client) nil)
       ;; The listener goes; the SELECTION does not.  A client that disconnects after copying
       ;; still leaves its text on the session clipboard — CLIPBOARD-DISOWN here would wipe the
@@ -1164,3 +1178,61 @@ its bytes would land in the middle of a rect."
 (defun serve-one (fb port &rest args)
   "Serve exactly one client, then return (handy for tests)."
   (apply #'serve fb port :once t args))
+
+;;; ---- one client, one thread ---------------------------------------------------
+;;;
+;;; SERVE gives each client a reader thread and a sender thread that share the client's
+;;; state under a lock.  Some Lisps cannot share like that: on modus a thread may not
+;;; store its own objects into memory another thread owns -- threads share nothing and
+;;; talk by message.  SERVE-SINGLE is the same protocol on ONE thread: input is read
+;;; when the socket has some (LISTEN), and between reads the sender's turn runs.  One
+;;; viewer, and the caller's drawing happens on this thread too (TICK), so nothing
+;;; crosses a thread at all.  Same handlers, same encoder -- only the scheduling differs.
+
+(defun client-loop-single (fb s on-key on-pointer on-resize
+                           &key (clipboard (session-clipboard)) tick (interval 1/60))
+  "Serve the client on stream S from this thread alone until it disconnects.  TICK, if
+   given, is called once per turn before the sender runs -- the place to draw."
+  (let ((client (make-rfb-client :last-size (cons (fb-width fb) (fb-height fb))))
+        (fd (ignore-errors (sb-sys:fd-stream-fd s))))
+    (flet ((input-p (timeout)
+             ;; Bytes already buffered in the stream, or the descriptor readable.  LISTEN
+             ;; alone is not enough: it is false at end of file, so a viewer that closed
+             ;; would never be noticed -- poll reports EOF as readable, and READ-BYTE then
+             ;; returns :EOF.
+             (or (listen s)
+                 (if fd
+                     (sb-sys:wait-until-fd-usable fd :input timeout)
+                     (progn (sleep timeout) nil)))))
+      (loop while (rc-running client) do
+        (loop while (and (rc-running client) (input-p 0))
+              do (when (eq (%rfb-handle-message (read-byte s nil :eof) client fb s
+                                                on-key on-pointer on-resize nil clipboard)
+                           :done)
+                   (setf (rc-running client) nil)))
+        (when (rc-running client)
+          (when tick (funcall tick))
+          ;; Idle by waiting for INPUT, not by sleeping: a keystroke is handled the
+          ;; moment it arrives instead of at the next tick.
+          (unless (%rfb-sender-step client fb s clipboard fd)
+            (input-p interval)))))))
+
+(defun serve-single (fb port &key on-key on-pointer on-resize tick (interval 1/60)
+                                  (name *desktop-name*) (address "127.0.0.1") listen
+                                  (password :inherit) (clipboard (session-clipboard)))
+  "Serve FB to ONE client on PORT, entirely on the calling thread, and return when it
+   disconnects.  ADDRESS defaults to loopback: one local viewer.  TICK (no arguments)
+   runs each turn, so an app can draw between updates without a thread of its own.
+   Otherwise as SERVE."
+  (let ((listen (or listen (tcp-listen port :address address))))
+    (format *error-output* "~&glass: RFB server (one client, one thread) on ~a (~dx~d)~%"
+            (listener-endpoint listen) (fb-width fb) (fb-height fb))
+    (force-output *error-output*)
+    (unwind-protect
+         (let ((stream (accept-stream listen)))
+           (unwind-protect
+                (when (handshake fb stream name password)
+                  (client-loop-single fb stream on-key on-pointer on-resize
+                                      :clipboard clipboard :tick tick :interval interval))
+             (ignore-errors (close stream))))
+      (close-listener listen))))

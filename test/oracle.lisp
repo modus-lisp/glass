@@ -11,6 +11,9 @@
 (in-package #:glass/test)
 
 (defvar *checks* 0) (defvar *fails* 0)
+(defvar *server* #'glass:serve-one
+  "How a scenario serves its framebuffer: the threaded server, or SERVE-SINGLE (one client,
+   one thread).  Both must pass the same checks -- they share every handler and the encoder.")
 (defvar *bytes* 0)                       ; wire bytes read (for compactness checks)
 (defun check (ok fmt &rest args)
   (incf *checks*) (unless ok (incf *fails*) (format t "  FAIL: ~?~%" fmt args)))
@@ -158,7 +161,7 @@
     (glass:fb-frame fb 0 0 w h glass:+white+ 2)
     (glass:fb-put fb 199 149 (glass:rgb 18 52 86))
     (let ((server (sb-thread:make-thread
-                   (lambda () (ignore-errors (glass:serve-one fb port))) :name "glass-server")))
+                   (let ((serve *server*)) (lambda () (ignore-errors (funcall serve fb port)))) :name "glass-server")))
       (multiple-value-bind (s sw sh) (rfb-open port)
         (check (and (= sw w) (= sh h)) "~a: dimensions ~ax~a" name sw sh)
         (case mode
@@ -190,6 +193,10 @@
   (format t "-- Raw --~%")     (scenario 5921 :raw)
   (format t "-- Hextile --~%") (scenario 5922 :hextile)
   (format t "-- ZRLE --~%")    (scenario 5923 :zrle)
+  (let ((*server* #'glass:serve-single))
+    (format t "-- Raw, one thread --~%")     (scenario 5924 :raw)
+    (format t "-- Hextile, one thread --~%") (scenario 5925 :hextile)
+    (format t "-- ZRLE, one thread --~%")    (scenario 5926 :zrle))
   (format t "----------------------------------~%")
   (format t "checks: ~d   failures: ~d   => ~a~%" *checks* *fails* (if (zerop *fails*) "PASS" "FAIL"))
   (zerop *fails*))
