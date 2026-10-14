@@ -651,15 +651,18 @@ network decides how much we READ; it must not decide how much we ALLOCATE."
                (read-sequence buf s :end k)
                (decf n k)))))
 
-(defun read-client-cut-text (client s &optional (clipboard (session-clipboard)))
+(defun read-client-cut-text (owner s &optional (clipboard (session-clipboard)))
   "ClientCutText (RFC 6143 §7.5.6): a 32-bit length, then that many Latin-1 bytes, which become
-CLIPBOARD's selection with this client as its owner.  CLIPBOARD defaults to the session's, which
+CLIPBOARD's selection with OWNER (this connection's id) as its owner.  CLIPBOARD defaults to the session's, which
 is what a one-seat desktop has; a multi-seat one hands each seat's transports that SEAT's
 clipboard, so two people copying do not clobber each other.
 
 The length is SIGNED, and a NEGATIVE one is not a length: it is the extended-clipboard
 pseudo-encoding (-1063) re-using message type 6, with |len| bytes of a capability-tagged,
-zlib-compressed payload — the route by which UTF-8 clipboard text travels.  We do not advertise
+zlib-compressed payload — the route by which UTF-8 clipboard text travels.
+
+OWNER is the connection's id, which is what the sender compares to avoid echoing a client's own
+text back to it.  We do not advertise
 -1063, so a well-behaved client never sends it, but reading that length as unsigned would try to
 allocate close to 4 GB on the strength of four bytes from the network.  Consume it and carry on;
 implementing it is the follow-on that makes this clipboard UTF-8 instead of Latin-1."
@@ -673,8 +676,8 @@ implementing it is the follow-on that makes this clipboard UTF-8 instead of Lati
          (format *trace-output* "~&glass: ClientCutText ~d bytes truncated to ~d~%"
                  len *max-cut-text*)
          (force-output *trace-output*)
-         (clipboard-own clipboard client :text (latin1-string keep) :name "vnc client")))
-      (t (clipboard-own clipboard client
+         (clipboard-own clipboard owner :text (latin1-string keep) :name "vnc client")))
+      (t (clipboard-own clipboard owner
                         :text (if (plusp len) (latin1-string (r-bytes s len)) "")
                         :name "vnc client")))))
 
@@ -718,6 +721,7 @@ its bytes would land in the middle of a rect."
   (want nil)                    ; latest pending request (inc x y w h), or NIL
   (last-gen -1)                 ; fb generation this client has already caught up to
   (last-frame -1)               ; fb composite-frame this client has already caught up to
+  (id 0)                        ; the connection's id: its identity as a clipboard owner
   (cut-serial 0)                ; clipboard serial this client has already been told about
   (shift nil)                   ; Shift latched, for the paste chord (a modifier is its own event)
   (running t)
@@ -837,7 +841,7 @@ its bytes would land in the middle of a rect."
     (when (> (clipboard-serial cb) (rc-cut-serial client))
       (multiple-value-bind (text serial owner) (clipboard-text cb)
         (setf (rc-cut-serial client) serial)             ; seen is seen, even when we don't send
-        (when (and text (not (eq owner client)))
+        (when (and text (not (eql owner (rc-id client))))
           (handler-case (progn (send-cut-text s text) t)
             (error () (setf (rc-running client) nil) nil)))))))
 
@@ -910,11 +914,16 @@ its bytes would land in the middle of a rect."
                          sent))))))
            sent)))))
 
-(defun rfb-sender-loop (client fb s wake &optional (clipboard (session-clipboard)))
+(defun rfb-sender-loop (client fb s wake &optional (clipboard (session-clipboard)) mailbox)
   "Fulfil the client's pending request the moment the fb changes (parked on WAKE,
-   ~60 Hz safety timeout).  Runs in its own thread; exits when the client stops."
+   ~60 Hz safety timeout).  Runs in its own thread, which OWNS CLIENT: everything the
+   reader learns arrives as messages in MAILBOX and is applied here.  Exits when the
+   client stops."
   (let ((fd (ignore-errors (sb-sys:fd-stream-fd s))))    ; for the socket-queue backlog
-    (loop while (rc-running client) do
+    (loop
+      (when mailbox
+        (dolist (m (mb-take mailbox)) (%rfb-apply client m fb)))
+      (unless (rc-running client) (return))
       ;; parking happens OFF the pixel lock -- holding it here would stall every
       ;; compositor for the whole timeout
       (unless (%rfb-sender-step client fb s clipboard fd)
@@ -954,7 +963,108 @@ its bytes would land in the middle of a rect."
    framebuffers with no window manager at all.  The key is CONSUMED when it fires — which is
    right, because Shift+Insert in the app underneath means exactly this.")
 
-(defun rfb-paste-chord (client down keysym &optional (clipboard (session-clipboard)))
+;;; ---- the reader and the sender: who owns what -------------------------------------
+;;;
+;;; A connection is two threads: the READER parses what the client sends, the SENDER encodes
+;;; frames.  The sender OWNS the client's state (the RFB-CLIENT: pixel format, encoding,
+;;; snapshot, zlib stream) -- it writes nearly all of it, and the big pieces.  The reader owns
+;;; an RFB-CONN (its id, the Shift latch, what it needs to answer the client) and tells the
+;;; sender everything else by MESSAGE.  Nothing is shared but the mailbox, so the same code is
+;;; right where threads share nothing (modus: a thread may not store its own objects into
+;;; memory another thread owns, and a message is SHARED -- copied -- on the way in) and where
+;;; they share everything (SBCL, where %SHARE is the identity).  SERVE-SINGLE runs both halves
+;;; on one thread and applies each message the moment it is posted.
+;;;
+;;; Messages: (:PIXEL-FORMAT bytes) (:ENCODINGS list) (:REQUEST inc x y w h)
+;;;           (:RESIZE-ACK result) (:STOP)
+
+(defstruct (rfb-conn (:conc-name cn-))
+  (id 0)            ; this connection's identity -- a fixnum, so EQL works across threads
+  (shift nil)       ; Shift latched, for the paste chord (a modifier is its own event)
+  (eds nil)         ; the client offered ExtendedDesktopSize: SetDesktopSize is owed a reply
+  (post nil))       ; (lambda (message)) -- to the sender
+
+(defvar *rfb-conn-count* 0)
+(defvar *rfb-conn-count-lock* (sb-thread:make-mutex :name "glass-rfb-conn-count"))
+(defun %next-conn-id ()
+  (sb-thread:with-mutex (*rfb-conn-count-lock*) (incf *rfb-conn-count*)))
+
+(defstruct (rfb-mailbox (:conc-name mb-))
+  (lock (sb-thread:make-mutex :name "glass-rfb-mailbox"))
+  (items '()))                      ; newest first
+
+(defun mb-post (mb msg)
+  "Queue MSG for the mailbox's owner.  The new cell and MSG are shared on the way in; the
+   rest of the list already is, so this copies one message, not the queue."
+  (sb-thread:with-mutex ((mb-lock mb))
+    (setf (mb-items mb) (%share (cons msg (mb-items mb)))))
+  msg)
+
+(defun mb-take (mb)
+  "Every queued message, oldest first, emptying the mailbox."
+  (sb-thread:with-mutex ((mb-lock mb))
+    (prog1 (reverse (mb-items mb)) (setf (mb-items mb) nil))))
+
+(defun %rfb-want-full-if-idle (client fb)
+  "Park a full-size incremental request when none is pending: replies that ride a
+   FramebufferUpdate (a size announcement, a SetDesktopSize result) need one to ride on."
+  (sb-thread:with-mutex ((rc-lock client))
+    (unless (rc-want client)
+      (setf (rc-want client) (list 1 0 0 (fb-width fb) (fb-height fb))))))
+
+(defun %rfb-apply (client msg fb)
+  "Apply one reader message to CLIENT, on the thread that owns it."
+  (case (first msg)
+    (:pixel-format
+     (let* ((pf (second msg)) (fmt (parse-pxfmt pf)))
+       (sb-thread:with-mutex ((rc-lock client))
+         ;; format change: full re-send (drop snapshot) and re-send the cursor in the
+         ;; new format.  Do NOT touch the ZRLE zlib stream: it is ONE persistent stream
+         ;; for the whole connection (RFC 6143), and clients keep their inflater across
+         ;; a SetPixelFormat — a fresh zlib header mid-stream desyncs them (RealVNC).
+         ;; Only the CPIXEL size inside the stream changes, which is fine.
+         (setf (rc-fmt client) fmt (car (rc-snap-box client)) nil
+               (rc-cursor-sent client) nil))
+       (format *trace-output* "~&glass: client SetPixelFormat bpp=~d depth=~d big-endian=~d true-colour=~d rgb-max=~d,~d,~d shift=~d,~d,~d -> ~a~%"
+               (aref pf 0) (aref pf 1) (aref pf 2) (aref pf 3)
+               (logior (ash (aref pf 4) 8) (aref pf 5)) (logior (ash (aref pf 6) 8) (aref pf 7))
+               (logior (ash (aref pf 8) 8) (aref pf 9)) (aref pf 10) (aref pf 11) (aref pf 12)
+               (if fmt (format nil "converted (~d-byte pixel, ~d-byte cpixel)" (pxfmt-pbytes fmt) (pxfmt-cbytes fmt)) "native"))
+       (force-output *trace-output*)))
+    (:encodings
+     (let ((encs (second msg)))
+       (sb-thread:with-mutex ((rc-lock client))
+         (setf (rc-enc client) (choose-encoding encs)
+               (rc-dss client) (and (or (member +pseudo-desktop-size+ encs)
+                                        (member +pseudo-extended-desktop-size+ encs))
+                                    t)
+               (rc-eds client) (and (member +pseudo-extended-desktop-size+ encs) t)
+               (rc-cursor client) (and (member +pseudo-cursor+ encs) t)
+               (rc-copyrect client) (and (member +enc-copyrect+ encs) t)
+               (rc-trle client) (and (member +enc-trle+ encs) t)))
+       ;; ANNOUNCE WITHOUT BEING ASKED.  The size rect rides a FramebufferUpdate, which the
+       ;; sender only builds when a request is parked — so a client that never requests
+       ;; pixels never learns it may ask for a size.  That is not hypothetical: the
+       ;; video-primary gateway deliberately swallows FramebufferUpdateRequests (the screen
+       ;; arrives as VP8 instead), so it swallows the very message that would have triggered
+       ;; this.  Park one ourselves; SEND-UPDATE answers it with the announcement and nothing
+       ;; else.
+       (when (rc-eds client) (%rfb-want-full-if-idle client fb))
+       (format *trace-output* "~&glass: client encodings — chosen=~a TRLE=~:[no~;YES~] CopyRect=~:[no~;YES~] (~d offered)~%"
+               (rc-enc client) (rc-trle client) (rc-copyrect client) (length encs))
+       (force-output *trace-output*)))
+    (:request
+     (sb-thread:with-mutex ((rc-lock client))   ; park the latest request
+       (setf (rc-want client) (rest msg))))
+    (:resize-ack
+     (sb-thread:with-mutex ((rc-lock client))
+       (setf (rc-resize-ack client) (second msg)))
+     ;; The reply rides a FramebufferUpdate, which the sender builds only for a parked
+     ;; request: park one if the client has none pending.
+     (%rfb-want-full-if-idle client fb))
+    (:stop (setf (rc-running client) nil))))
+
+(defun rfb-paste-chord (conn down keysym &optional (clipboard (session-clipboard)))
   "Track Shift and notice the paste chord.  Returns T if the key was consumed by a paste.
    Pastes from CLIPBOARD — this client's seat's selection, not necessarily the session's.
 
@@ -962,117 +1072,92 @@ its bytes would land in the middle of a rect."
    Shift has to be latched; it is passed through as well as latched, or the app underneath would
    lose track of it."
   (case keysym
-    ((#xffe1 #xffe2) (setf (rc-shift client) (plusp down)) nil)      ; Shift L/R
+    ((#xffe1 #xffe2) (setf (cn-shift conn) (plusp down)) nil)        ; Shift L/R
     (t (let ((chord *paste-chord*))
          (when (and chord (plusp down) (eql keysym (second chord))
-                    (or (not (eq (first chord) :shift)) (rc-shift client)))
+                    (or (not (eq (first chord) :shift)) (cn-shift conn)))
            (clipboard-paste :clipboard clipboard)                     ; types on its own thread
            t)))))
 
-(defun %rfb-handle-message (msg client fb s on-key on-pointer on-resize wake clipboard)
-  "Handle one client->server message whose type byte MSG has just been read.  Returns
-   :DONE when the client is finished (EOF, or a message type we cannot parse)."
-  (case msg
-               (0 (skip s 3)                               ; SetPixelFormat
-                  (let* ((pf (r-bytes s 16)) (fmt (parse-pxfmt pf)))
-                    (sb-thread:with-mutex ((rc-lock client))
-                      ;; format change: full re-send (drop snapshot) and re-send the cursor in the
-                      ;; new format.  Do NOT touch the ZRLE zlib stream: it is ONE persistent stream
-                      ;; for the whole connection (RFC 6143), and clients keep their inflater across
-                      ;; a SetPixelFormat — a fresh zlib header mid-stream desyncs them (RealVNC).
-                      ;; Only the CPIXEL size inside the stream changes, which is fine.
-                      (setf (rc-fmt client) fmt (car (rc-snap-box client)) nil
-                            (rc-cursor-sent client) nil))
-                    (format *trace-output* "~&glass: client SetPixelFormat bpp=~d depth=~d big-endian=~d true-colour=~d rgb-max=~d,~d,~d shift=~d,~d,~d -> ~a~%"
-                            (aref pf 0) (aref pf 1) (aref pf 2) (aref pf 3)
-                            (logior (ash (aref pf 4) 8) (aref pf 5)) (logior (ash (aref pf 6) 8) (aref pf 7))
-                            (logior (ash (aref pf 8) 8) (aref pf 9)) (aref pf 10) (aref pf 11) (aref pf 12)
-                            (if fmt (format nil "converted (~d-byte pixel, ~d-byte cpixel)" (pxfmt-pbytes fmt) (pxfmt-cbytes fmt)) "native"))
-                    (force-output *trace-output*)))
-               (2 (skip s 1)                               ; SetEncodings
-                  (let ((n (r-u16 s)) (encs '()))
-                    (dotimes (i n) (push (r-u32 s) encs))
-                    (sb-thread:with-mutex ((rc-lock client))
-                      (setf (rc-enc client) (choose-encoding encs)
-                            (rc-dss client) (or (member +pseudo-desktop-size+ encs)
-                                                (member +pseudo-extended-desktop-size+ encs))
-                            (rc-eds client) (and (member +pseudo-extended-desktop-size+ encs) t)
-                            (rc-cursor client) (and (member +pseudo-cursor+ encs) t)
-                            (rc-copyrect client) (and (member +enc-copyrect+ encs) t)
-                            (rc-trle client) (and (member +enc-trle+ encs) t)))
-                    ;; ANNOUNCE WITHOUT BEING ASKED.  The size rect rides a
-                    ;; FramebufferUpdate, which the sender only builds when a request is
-                    ;; parked — so a client that never requests pixels never learns it may
-                    ;; ask for a size.  That is not hypothetical: the video-primary gateway
-                    ;; deliberately swallows FramebufferUpdateRequests (the screen arrives
-                    ;; as VP8 instead), so it swallows the very message that would have
-                    ;; triggered this.  Park one ourselves; SEND-UPDATE answers it with the
-                    ;; announcement and nothing else.
-                    (when (rc-eds client)
-                      (sb-thread:with-mutex ((rc-lock client))
-                        (unless (rc-want client)
-                          (setf (rc-want client)
-                                (list 1 0 0 (fb-width fb) (fb-height fb))))))
-                    (format *trace-output* "~&glass: client encodings — chosen=~a TRLE=~:[no~;YES~] CopyRect=~:[no~;YES~] (~d offered)~%"
-                            (rc-enc client) (rc-trle client) (rc-copyrect client) n)
-                    (force-output *trace-output*)))
-               (3 (let ((inc (r-u8 s)) (x (r-u16 s)) (y (r-u16 s)) (w (r-u16 s)) (h (r-u16 s)))
-                    (sb-thread:with-mutex ((rc-lock client))   ; park the latest request
-                      (setf (rc-want client) (list inc x y w h)))
-                    (wake-signal wake)))                       ; nudge the sender to fulfil it now
-               (4 (let ((down (r-u8 s)))                   ; KeyEvent
-                    (skip s 2)
-                    (let ((key (r-u32 s)))
-                      (unless (rfb-paste-chord client down key clipboard)
-                        (when on-key (funcall on-key (plusp down) key))))))
-               (5 (let ((buttons (r-u8 s)) (x (r-u16 s)) (y (r-u16 s)))   ; PointerEvent
-                    (when on-pointer (funcall on-pointer buttons x y))))
-               (6 (skip s 3) (read-client-cut-text client s clipboard))   ; ClientCutText
-               (251 (skip s 1)                             ; SetDesktopSize (client wants a size)
-                    (let ((rw (r-u16 s)) (rh (r-u16 s)) (nscreens (r-u8 s)))
-                      (skip s 1)
-                      (dotimes (i nscreens) (r-bytes s 16))   ; per-screen layout (ignored)
-                      (let ((result (cond ((not (and (plusp rw) (plusp rh))) 3)   ; invalid layout
-                                          (t (when on-resize (funcall on-resize rw rh)) 0))))
-                        (when (rc-eds client)
-                          (sb-thread:with-mutex ((rc-lock client))
-                            (setf (rc-resize-ack client) result)
-                            ;; The reply rides a FramebufferUpdate, which the sender builds only
-                            ;; for a parked request: park one if the client has none pending.
-                            (unless (rc-want client)
-                              (setf (rc-want client) (list 1 0 0 (fb-width fb) (fb-height fb)))))
-                          (wake-signal wake)))))
-               (t (unless (eq msg :eof)                    ; EOF = normal disconnect; anything else is notable
-                    (format *trace-output* "~&glass: dropping client on unhandled message-type ~a~%" msg)
-                    (force-output *trace-output*))
-                  :done)))
+(defun %rfb-handle-message (msg conn s on-key on-pointer on-resize clipboard)
+  "Handle one client->server message whose type byte MSG has just been read, on the reader.
+   What the sender must know is posted to it (CN-POST).  Returns :DONE when the client is
+   finished (EOF, or a message type we cannot parse)."
+  (let ((post (cn-post conn)))
+    (case msg
+      (0 (skip s 3)                                ; SetPixelFormat
+         (funcall post (list :pixel-format (r-bytes s 16))))
+      (2 (skip s 1)                                ; SetEncodings
+         (let ((n (r-u16 s)) (encs '()))
+           (dotimes (i n) (push (r-u32 s) encs))
+           (setf (cn-eds conn) (and (member +pseudo-extended-desktop-size+ encs) t))
+           (funcall post (list :encodings encs))))
+      (3 (let ((inc (r-u8 s)) (x (r-u16 s)) (y (r-u16 s)) (w (r-u16 s)) (h (r-u16 s)))
+           (funcall post (list :request inc x y w h))))
+      (4 (let ((down (r-u8 s)))                    ; KeyEvent
+           (skip s 2)
+           (let ((key (r-u32 s)))
+             (unless (rfb-paste-chord conn down key clipboard)
+               (when on-key (funcall on-key (plusp down) key))))))
+      (5 (let ((buttons (r-u8 s)) (x (r-u16 s)) (y (r-u16 s)))   ; PointerEvent
+           (when on-pointer (funcall on-pointer buttons x y))))
+      (6 (skip s 3) (read-client-cut-text (cn-id conn) s clipboard))   ; ClientCutText
+      (251 (skip s 1)                              ; SetDesktopSize (client wants a size)
+           (let ((rw (r-u16 s)) (rh (r-u16 s)) (nscreens (r-u8 s)))
+             (skip s 1)
+             (dotimes (i nscreens) (r-bytes s 16))   ; per-screen layout (ignored)
+             (let ((result (cond ((not (and (plusp rw) (plusp rh))) 3)   ; invalid layout
+                                 (t (when on-resize (funcall on-resize rw rh)) 0))))
+               (when (cn-eds conn)
+                 (funcall post (list :resize-ack result))))))
+      (t (unless (eq msg :eof)                     ; EOF = normal disconnect; anything else is notable
+           (format *trace-output* "~&glass: dropping client on unhandled message-type ~a~%" msg)
+           (force-output *trace-output*))
+         :done))))
+
+(defun %rfb-sender-thread (id fb s wake clipboard mailbox)
+  "A connection's sender thread: makes the RFB-CLIENT it owns, then runs the loop."
+  (rfb-sender-loop (make-rfb-client :id id :last-size (cons (fb-width fb) (fb-height fb)))
+                   fb s wake clipboard mailbox))
 
 (defun client-loop (fb s on-key on-pointer on-resize wake &optional (clipboard (session-clipboard)))
   "Read RFB client messages, handling input (key/pointer) IMMEDIATELY; framebuffer
    updates are produced by a companion sender thread, so input is never blocked on
-   a frame.  Only the sender writes pixels; this thread never writes to S."
-  (let* ((client (make-rfb-client :last-size (cons (fb-width fb) (fb-height fb))))
-         (sender (sb-thread:make-thread (lambda () (rfb-sender-loop client fb s wake clipboard))
+   a frame.  Only the sender writes pixels; this thread never writes to S, and tells
+   the sender what it learns by message (see RFB-CONN)."
+  (let* ((id (%next-conn-id))
+         ;; SHARED FROM BIRTH: both threads must hold this very object, and a value handed
+         ;; to another thread is otherwise copied (see %SHARE).
+         (mailbox (%share (make-rfb-mailbox)))
+         (conn (make-rfb-conn :id id
+                              :post (lambda (m) (mb-post mailbox m) (wake-signal wake))))
+         ;; A global function and :ARGUMENTS, not a closure: a closure made on this thread
+         ;; cannot be handed to another one on modus (the arguments are copied instead).
+         (sender (sb-thread:make-thread #'%rfb-sender-thread
+                                        :arguments (list id fb s wake clipboard mailbox)
                                         :name "glass-sender")))
     ;; A selection change should reach this client now, not at the next 1/60 safety tick — the
-    ;; same nudge the compositor gives the sender when it has drawn.  Keyed by the client, so a
-    ;; reconnect replaces its listener instead of stacking another one.
-    (clipboard-listen clipboard client
+    ;; same nudge the compositor gives the sender when it has drawn.  Keyed by the connection,
+    ;; so a reconnect replaces its listener instead of stacking another one.  Not on modus: a
+    ;; listener is a closure and a closure cannot be handed to another thread there; the
+    ;; sender still sees the change on its next turn (SEND-PENDING-CUT-TEXT polls the serial).
+    #-modus
+    (clipboard-listen clipboard id
                       (lambda (cb serial owner)
                         (declare (ignore cb serial owner))
                         (wake-signal wake)))
     (unwind-protect
          (loop
-           (let ((msg (read-byte s nil :eof)))
-             (when (eq (%rfb-handle-message msg client fb s on-key on-pointer on-resize wake clipboard)
+           (when (eq (%rfb-handle-message (read-byte s nil :eof) conn s
+                                          on-key on-pointer on-resize clipboard)
                      :done)
-               (return))))                             ; :eof or unknown -> done
-      (setf (rc-running client) nil)
+             (return)))                            ; :eof or unknown -> done
+      (funcall (cn-post conn) (list :stop))
       ;; The listener goes; the SELECTION does not.  A client that disconnects after copying
       ;; still leaves its text on the session clipboard — CLIPBOARD-DISOWN here would wipe the
       ;; user's clipboard every time they closed a viewer tab, and the content is a plain string
       ;; that needs no owner to serve it.  Disowning is for an owner whose CONTENT dies with it.
-      (clipboard-unlisten clipboard client)
+      #-modus (clipboard-unlisten clipboard id)
       (ignore-errors (sb-thread:join-thread sender)))))
 
 ;;; ---- server -----------------------------------------------------------------
@@ -1193,8 +1278,10 @@ its bytes would land in the middle of a rect."
                            &key (clipboard (session-clipboard)) tick (interval 1/60))
   "Serve the client on stream S from this thread alone until it disconnects.  TICK, if
    given, is called once per turn before the sender runs -- the place to draw."
-  (let ((client (make-rfb-client :last-size (cons (fb-width fb) (fb-height fb))))
-        (fd (ignore-errors (sb-sys:fd-stream-fd s))))
+  (let* ((id (%next-conn-id))
+         (client (make-rfb-client :id id :last-size (cons (fb-width fb) (fb-height fb))))
+         (conn (make-rfb-conn :id id :post (lambda (m) (%rfb-apply client m fb))))
+         (fd (ignore-errors (sb-sys:fd-stream-fd s))))
     (flet ((input-p (timeout)
              ;; Bytes already buffered in the stream, or the descriptor readable.  LISTEN
              ;; alone is not enough: it is false at end of file, so a viewer that closed
@@ -1206,8 +1293,8 @@ its bytes would land in the middle of a rect."
                      (progn (sleep timeout) nil)))))
       (loop while (rc-running client) do
         (loop while (and (rc-running client) (input-p 0))
-              do (when (eq (%rfb-handle-message (read-byte s nil :eof) client fb s
-                                                on-key on-pointer on-resize nil clipboard)
+              do (when (eq (%rfb-handle-message (read-byte s nil :eof) conn s
+                                                on-key on-pointer on-resize clipboard)
                            :done)
                    (setf (rc-running client) nil)))
         (when (rc-running client)
