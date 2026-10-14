@@ -44,13 +44,39 @@
         (post (list :stop))
         (ignore-errors (sb-thread:join-thread compositor))))))
 
+(defun %desk-backtrace (fault &optional condition)
+  "Print the stack of the error being handled to *ERROR-OUTPUT*: the signalling frames when
+   called from a HANDLER-BIND (SB-DEBUG:PRINT-BACKTRACE, on SBCL and modus alike), or with FAULT
+   the frames of CONDITION's hardware fault, which modus records before unwinding
+   (MODUS:CONDITION-BACKTRACE)."
+  (ignore-errors
+   (let ((f (if fault
+                (and (find-package "MODUS") (find-symbol "CONDITION-BACKTRACE" "MODUS"))
+                (and (find-package "SB-DEBUG") (find-symbol "PRINT-BACKTRACE" "SB-DEBUG")))))
+     (when (and f (fboundp f))
+       (if fault
+           (funcall f condition *error-output*)
+           (funcall f :stream *error-output* :count 25))))))
+
 (defmacro %app-guard (what &body body)
-  "BODY, with an error in it logged and dropped -- NIL then -- rather than ending the thread."
-  `(handler-case (progn ,@body)
-     (error (e)
-       (ignore-errors (format *error-output* "~&glass desk: ~a: ~a~%" ,what e)
-                      (force-output *error-output*))
-       nil)))
+  "BODY, with an error in it logged with its backtrace and dropped -- NIL then -- rather than
+   ending the thread.  A signalled error is backtraced where it is signalled; a hardware fault
+   unwinds straight to the HANDLER-CASE, so it gets the frames the fault recorded instead."
+  (let ((traced (gensym "TRACED")))
+    `(let ((,traced nil))
+       (handler-case
+           (handler-bind ((error (lambda (e)
+                                   (ignore-errors
+                                    (format *error-output* "~&glass desk: ~a: ~a~%" ,what e))
+                                   (%desk-backtrace nil)
+                                   (setq ,traced t))))
+             (progn ,@body))
+         (error (e)
+           (unless ,traced
+             (ignore-errors (format *error-output* "~&glass desk: ~a: ~a (fault)~%" ,what e))
+             (%desk-backtrace t e))
+           (ignore-errors (force-output *error-output*))
+           nil)))))
 
 (defun %desk-compositor (fb inbox wake apps open)
   "The compositor thread: make the desk, then apply input and tick it until told to stop."
