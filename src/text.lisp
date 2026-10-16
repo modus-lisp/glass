@@ -30,10 +30,19 @@
   (asdf:system-relative-pathname :scribe (format nil "fonts/~a" name)))
 
 (defun default-font (&optional bold)
-  "The default UI font (Liberation Sans), regular or BOLD."
-  (if bold
-      (or *font-bold*    (setf *font-bold*    (load-font (%scribe-font "LiberationSans-Bold.ttf"))))
-      (or *font-regular* (setf *font-regular* (load-font (%scribe-font "LiberationSans-Regular.ttf"))))))
+  "The default UI font (Liberation Sans), regular or BOLD.  Loaded once and cached -- except on
+   a modus thread other than main, whose font could not be stored in the shared cache: it gets
+   one of its own, uncached.  A host that draws text on another thread loads the faces on main
+   first (SERVE-DESK does)."
+  (flet ((cache (getter setter file)
+           (or (funcall getter)
+               (let ((f (load-font (%scribe-font file))))
+                 (if #+modus (sb-thread:main-thread-p) #-modus t
+                     (funcall setter f)
+                     f)))))
+    (if bold
+        (cache (lambda () *font-bold*) (lambda (f) (setf *font-bold* f)) "LiberationSans-Bold.ttf")
+        (cache (lambda () *font-regular*) (lambda (f) (setf *font-regular* f)) "LiberationSans-Regular.ttf"))))
 
 (defun text-width (string &key (size 13) (font (default-font)))
   "The advance width of STRING at SIZE px in FONT (for centring/layout).  Through the glyph
@@ -62,6 +71,10 @@
 ;;; from where the exact offset would put it.  On modus, whose threads share no memory, only the
 ;;; main thread fills it (a worker storing into the shared table is refused); other threads
 ;;; rasterise as before.
+(defvar *glyph-cache-owned* nil
+  "True while *GLYPH-CACHE* is bound to a table the current thread made: a drawing thread binds
+   both (see WITH-OWN-GLYPH-CACHE) and then fills its own cache, on modus as anywhere.")
+
 (defvar *glyph-cache* (make-hash-table :test 'eq #+sbcl :synchronized #+sbcl t)
   "FONT -> ((size . table) ...), each TABLE eql-keyed by (+ (* gid 4) quarter) -> entry.  Keyed
    without consing: the old (list font gid size q) EQUAL key was 64 bytes of garbage a glyph,
@@ -73,7 +86,7 @@
     (if e
         (cdr e)
         (let ((tbl (make-hash-table :test 'eql #+sbcl :synchronized #+sbcl t)))
-          (when #+modus (sb-thread:main-thread-p) #-modus t
+          (when (or *glyph-cache-owned* #+modus (sb-thread:main-thread-p) #-modus t)
             (push (cons size tbl) (gethash font *glyph-cache*)))
           tbl))))
 
@@ -105,13 +118,20 @@
                                     (setf (aref v (* 2 i)) (ash c -8)
                                           (aref v (1+ (* 2 i))) (logand c 255))))))
                          (and adv (round (* adv 256))))))
-            (when #+modus (sb-thread:main-thread-p) #-modus t
+            (when (or *glyph-cache-owned* #+modus (sb-thread:main-thread-p) #-modus t)
               (setf (gethash key tbl) r))
             r)))))
 
 (defun %glyph-entry (font gid size quarter)
   "GID's cache entry at pen offset QUARTER/4 px (0..3); see %GLYPH-ENTRY-IN."
   (%glyph-entry-in (%glyph-table font size) font gid size quarter))
+
+(defmacro with-own-glyph-cache (() &body body)
+  "BODY with a glyph cache of this thread's own, and scribe's state too (SCRIBE:WITH-THREAD-STATE)
+   -- for a thread that draws text all the time (a compositor) where shared caches are main's
+   alone (modus)."
+  `(let ((*glyph-cache* (make-hash-table :test 'eq)) (*glyph-cache-owned* t))
+     (scribe:with-thread-state () ,@body)))
 
 (defun %cached-glyph (font gid size sub)
   "(values nil w h left top advance) for GID at pen offset SUB (0 <= SUB < 1), rounded to a

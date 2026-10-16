@@ -20,11 +20,11 @@
    #:rgb #:+black+ #:+white+ #:+red+ #:+green+ #:+blue+
    #:+pixel-colour-space+
    ;; text (the :glass/text system; scribe-backed)
-   #:fb-text #:text-width #:load-font #:default-font
+   #:fb-text #:text-width #:load-font #:default-font #:with-own-glyph-cache
    ;; server: (serve fb port &key on-key on-pointer on-resize name once wake)
    ;; naming things people say out loud (wordlist.lisp)
    #:word-name #:*wordlist*
-   #:serve #:serve-one #:*desktop-name* #:make-wake #:wake-signal
+   #:serve #:serve-one #:serve-single #:serve-multi #:*desktop-name* #:make-wake #:wake-signal
    ;; TRANSPORTS ARE NOT OURS ANY MORE.  Listeners, socket files, peer credentials and
    ;; the platform assumptions that come with them live in cl-transport now, beside DIAL
    ;; and EXPOSE, where "how do bytes travel" already lived.  None of it was ever about

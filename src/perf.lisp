@@ -25,7 +25,9 @@
   "Fold one delivered frame's backlog (now - MARK-TIME, ms) into *SEND-LAG*."
   (let ((ms (/ (* 1000d0 (- (get-internal-real-time) mark-time))
                (float internal-time-units-per-second 1d0))))
-    (setf *send-lag* (+ (* 0.8d0 *send-lag*) (* 0.2d0 (max 0d0 ms))))))
+    ;; A double is a boxed number made on the calling thread -- a sender -- so it is SHARED
+    ;; into the global (see %SHARE): on modus a thread's own objects may not be stored there.
+    (setf *send-lag* (%share (+ (* 0.8d0 *send-lag*) (* 0.2d0 (max 0d0 ms)))))))
 
 (defparameter *send-queue* 0.0d0
   "EWMA (KB) of the socket SEND-QUEUE backlog (SIOCOUTQ) — bytes we've written that
@@ -35,7 +37,7 @@
 (declaim (type double-float *send-queue*))
 (defun note-send-queue (bytes)
   "Fold one send's socket-queue depth (BYTES) into *SEND-QUEUE* (KB)."
-  (setf *send-queue* (+ (* 0.8d0 *send-queue*) (* 0.2d0 (/ (float bytes 1d0) 1024d0)))))
+  (setf *send-queue* (%share (+ (* 0.8d0 *send-queue*) (* 0.2d0 (/ (float bytes 1d0) 1024d0))))))
 (defvar *tx* nil
   "When bound to a (count) cons on the send path, the byte writers add to its car,
    so the sender can total the bytes it actually wrote for one frame.")

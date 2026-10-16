@@ -73,6 +73,10 @@
 ;;; The lock is feature-gated the way the framebuffer's is, so the same file loads on an
 ;;; implementation without sb-thread (modus, which supplies its own concurrency).
 
+;;; Values other threads read are stored through %SHARE (src/framebuffer.lisp).  A closure
+;;; cannot be shared, so a provider or a listener only works from the thread that owns the
+;;; clipboard on modus.
+
 #+sb-thread (defun %clip-make-lock () (sb-thread:make-mutex :name "glass-clipboard"))
 #-sb-thread (defun %clip-make-lock () nil)
 
@@ -148,9 +152,9 @@ compared without calling it, so it always counts as a change."
       (let ((new (or provider text)))
         (setf changed (not (and (stringp new) (stringp (clipboard-content cb))
                                 (string= new (clipboard-content cb)))))
-        (setf (clipboard-owner cb) owner
-              (clipboard-owner-name cb) (or name (clipboard-owner-name cb) "")
-              (clipboard-content cb) new)
+        (setf (clipboard-owner cb) (%share owner)
+              (clipboard-owner-name cb) (%share (or name (clipboard-owner-name cb) ""))
+              (clipboard-content cb) (%share new))
         (when changed
           (incf (clipboard-serial cb))
           (incf (clipboard-writes cb))
@@ -224,7 +228,7 @@ call the owner once."
              (%with-clip-locked (cb)
                ;; only memoize if the selection has not moved on under us
                (when (= (clipboard-serial cb) serial)
-                 (setf (clipboard-cached cb) text (clipboard-cached-serial cb) serial))))
+                 (setf (clipboard-cached cb) (%share text) (clipboard-cached-serial cb) serial))))
            (values (and (stringp text) text) serial owner))))))
 
 (defun clipboard-report (cb)
@@ -257,9 +261,9 @@ call the owner once."
 racing at startup get the same selection, not one each."
   #+sb-thread
   (sb-thread:with-mutex (*session-clipboard-lock*)
-    (or *session-clipboard* (setf *session-clipboard* (make-clipboard))))
+    (or *session-clipboard* (setf *session-clipboard* (%share (make-clipboard)))))
   #-sb-thread
-  (or *session-clipboard* (setf *session-clipboard* (make-clipboard))))
+  (or *session-clipboard* (setf *session-clipboard* (%share (make-clipboard)))))
 
 ;;; ---- Latin-1, the eight-bit wire format ------------------------------------
 

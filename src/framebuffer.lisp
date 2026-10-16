@@ -66,6 +66,14 @@ would not have to visit every call site in the tree."
 ;;; where sb-thread is absent (e.g. modus, which will supply its own concurrency
 ;;; model).  Everything else in this file — and in the text primitive — is pure
 ;;; Common Lisp with no FFI, so the drawing path drops onto any CL.
+;;; SHARING ACROSS THREADS.  modus threads share no state: a thread's objects live in its own
+;;; heap, and storing one into memory another thread owns is refused.  A value meant for other
+;;; threads is SENT -- copied into shared memory -- by MODUS:SHARE, which costs nothing for an
+;;; object that is already shared (or an immediate) and is the identity everywhere else.  Every
+;;; store below of a value that other threads will read goes through %SHARE.  A closure cannot be
+;;; copied: on modus a closure stays with the thread that made it.
+(defun %share (x) #+modus (modus:share x) #-modus x)
+
 #+sb-thread (defun %fb-make-lock (&optional (name "framebuffer"))
               (sb-thread:make-mutex :name name))
 #-sb-thread (defun %fb-make-lock (&optional name) (declare (ignore name)) nil)
@@ -204,8 +212,9 @@ would not have to visit every call site in the tree."
   (%with-frame-lock (fb)
     (when (null (fb-damage fb))           ; first change since the sender's last take: start the
       (setf (fb-mark-time fb) (get-internal-real-time)))  ; backlog clock for this batch
-    (setf (fb-damage fb) (%fb-damage-union (fb-damage fb) damage)
-          (fb-copy fb)   (%fb-copy-compose (fb-copy fb) copy)
+    ;; Shared: the compositor that marks is often not the sender that takes (%SHARE).
+    (setf (fb-damage fb) (%share (%fb-damage-union (fb-damage fb) damage))
+          (fb-copy fb)   (%share (%fb-copy-compose (fb-copy fb) copy))
           (fb-frameno fb) (logand (1+ (fb-frameno fb)) most-positive-fixnum))))
 
 (defun fb-take-frame (fb)
@@ -240,7 +249,8 @@ would not have to visit every call site in the tree."
    clip.  fb-fill/fb-rect/blit-fb honour it; used for damage-limited compositing."
   (let ((g (gensym)) (old (gensym)))
     `(let* ((,g ,fb) (,old (fb-clip ,g)))
-       (setf (fb-clip ,g) (%clip-intersect ,old ,x ,y (+ ,x ,w) (+ ,y ,h)))
+       ;; Shared: the thread that clips is often not the one that made FB (%SHARE).
+       (setf (fb-clip ,g) (%share (%clip-intersect ,old ,x ,y (+ ,x ,w) (+ ,y ,h))))
        (unwind-protect (progn ,@body) (setf (fb-clip ,g) ,old)))))
 
 #+sb-thread (defmacro with-fb-locked ((fb) &body body)
