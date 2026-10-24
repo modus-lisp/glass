@@ -133,8 +133,7 @@ quietly admitting people as somebody else.")
   "The box's x-only public key, 64 hex, or NIL without an identity."
   (when (box-identity-p)
     (ignore-errors
-     (string-downcase (cl-nostr.keys:public-hex
-                       (cl-nostr.keys:keypair-from-secret *box-secret*))))))
+     (string-downcase (cl-nostr.util:bytes->hex (cl-nostr.keys:public-key-of-secret *box-secret*))))))
 
 (defun box-npub ()
   "The box's npub — its public name — or NIL without an identity."
