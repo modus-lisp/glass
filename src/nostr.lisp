@@ -2306,9 +2306,12 @@ still a desktop, and a desktop that did not start is not."
         (cl-nostr.pool:pool-subscribe
          pool
          ;; :LIMIT caps the initial backlog — this pubkey has days of old wraps on the relays.
-         ;; Live DMs still stream after EOSE.
+         ;; Live DMs still stream after EOSE.  :SINCE: only the last 48 hours, the customary
+         ;; NIP-59 window (a wrap is back-dated by up to two days, so a live one is inside it);
+         ;; anything older is a decrypt (seconds, on a Zero) of a command we would ignore.
          (list (cl-nostr.filter:make-filter :kinds '(1059)
                                             :tags (list (cons "p" (list pub)))
+                                            :since (- (unix-now) 172800)
                                             :limit 20))
          :on-event (lambda (wrap relay)
                      (declare (ignore relay))
