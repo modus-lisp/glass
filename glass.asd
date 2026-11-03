@@ -290,7 +290,7 @@ no X.  (sb-ext:run-program + one winsize ioctl are the platform seam.)"
   ;; carried Linux's and so gave macOS a terminal with no echo.
   :depends-on ("glass" "glass/text" "scribe" "sb-posix")
   :serial t
-  :components ((:module "src" :serial t :components ((:file "term")))))
+  :components ((:module "src" :serial t :components ((:file "term") (:file "term-pty")))))
 
 (asdf:defsystem :glass/repl
   :description "The terminal with a Lisp listener on the other end instead of a

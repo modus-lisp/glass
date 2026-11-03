@@ -104,6 +104,8 @@
   (dec-saved nil)                       ; DECSC cursor+attrs save
   (mouse-mode nil) (mouse-sgr nil)      ; mouse tracking: nil/:normal/:button/:any, SGR (1006)?
   (mouse-buttons 0) (mouse-col 0) (mouse-row 0)   ; last mouse state (for diffing)
+  (drawn-chars nil) (drawn-colors nil)  ; the grid as last drawn: RENDER redraws only what differs
+  (drawn-cx -1) (drawn-cy -1) (drawn-vis nil)
   (dirty t))                            ; fb changed since the compositor last consumed it?
 
 (declaim (inline tidx tchar tcolor))
@@ -299,6 +301,10 @@
     (#\M (del-lines tm (p tm 0 1)))                    ; DL
     (#\S (dotimes (k (p tm 0 1)) (scroll-up tm)))      ; SU
     (#\T (dotimes (k (p tm 0 1)) (scroll-down tm)))    ; SD
+    (#\n (case (p tm 0 0)                              ; DSR: status, and where the cursor is
+           (5 (term-send tm (format nil "~c[0n" (code-char 27))))
+           (6 (term-send tm (format nil "~c[~d;~dR" (code-char 27)
+                                    (1+ (terminal-cy tm)) (1+ (terminal-cx tm)))))))
     (t nil)))                                          ; ignore the rest
 
 (defun feed-char (tm c)
@@ -429,22 +435,34 @@
 (defun over (dst8 fg8 a ia)
   (scribe:linear->srgb (+ (* ia (scribe:srgb->linear dst8)) (* a (scribe:srgb->linear fg8)))))
 
+(defun %cov12 (cov)
+  "Coverage (doubles, 0..1) as fixnum 4096ths: what BLIT-MONO blends with."
+  (and cov (map 'vector (lambda (c) (min 4096 (max 0 (round (* c 4096))))) cov)))
+
 (defun blit-mono (fb cov gw gh ox oy fg)
-  "Blend monochrome coverage COV (gw x gh) in colour FG at (OX,OY), gamma-correct."
+  "Blend coverage COV (gw x gh, in 4096ths: %COV12) in colour FG at (OX,OY), gamma-correct in
+   integers, as glass's FB-TEXT does: in double floats every intermediate is a heap object on
+   modus, and a cell cost milliseconds on a Pi Zero."
   (let ((dpx (glass:fb-pixels fb)) (fw (glass:fb-width fb)) (fh (glass:fb-height fb))
-        (fr (ldb (byte 8 16) fg)) (fgc (ldb (byte 8 8) fg)) (fbc (ldb (byte 8 0) fg)))
+        (lr (aref glass::*srgb->lin12* (ldb (byte 8 16) fg)))
+        (lg (aref glass::*srgb->lin12* (ldb (byte 8 8) fg)))
+        (lb (aref glass::*srgb->lin12* (ldb (byte 8 0) fg)))
+        (solid (logand fg #xffffff)))
     (dotimes (yy gh)
       (let ((yv (+ oy yy)))
         (when (< -1 yv fh)
           (let ((row (* yv fw)))
             (dotimes (xx gw)
-              (let ((cvv (aref cov (+ (* yy gw) xx))) (xv (+ ox xx)))
-                (when (and (> cvv 0d0) (< -1 xv fw))
-                  (let* ((i (+ row xv)) (d (aref dpx i)) (a (min 1d0 cvv)) (ia (- 1d0 a)))
-                    (setf (aref dpx i)
-                          (logior (ash (over (ldb (byte 8 16) d) fr a ia) 16)
-                                  (ash (over (ldb (byte 8 8) d) fgc a ia) 8)
-                                  (over (ldb (byte 8 0) d) fbc a ia)))))))))))))
+              (let ((a (aref cov (+ (* yy gw) xx))) (xv (+ ox xx)))
+                (when (and (> a 0) (< -1 xv fw))
+                  (let ((i (+ row xv)))
+                    (if (>= a 4096)
+                        (setf (aref dpx i) solid)
+                        (let ((d (aref dpx i)) (ia (- 4096 a)))
+                          (setf (aref dpx i)
+                                (logior (ash (glass::%over12 (ldb (byte 8 16) d) lr a ia) 16)
+                                        (ash (glass::%over12 (ldb (byte 8 8) d) lg a ia) 8)
+                                        (glass::%over12 (ldb (byte 8 0) d) lb a ia)))))))))))))))
 
 (defun blit-color (fb rgb alpha gw gh ox oy)
   "Composite a premultiplied-RGB + ALPHA colour glyph (gw x gh) at (OX,OY): the
@@ -478,7 +496,7 @@
         (ef (terminal-emoji-font tm)) (nerd (terminal-nerd-font tm)))
     (cond
       ((scribe:font-covers-p primary code)
-       (list* :mono (multiple-value-list
+       (%mono-entry (multiple-value-list
                      (scribe:rasterize-glyph primary (scribe:font-glyph-index primary code) ppem))))
       ((and nerd (scribe:font-covers-p nerd code))     ; Nerd Font symbols: powerline, dev icons, etc.
        (nerd-glyph nerd code ppem (terminal-cell-w tm) (terminal-cell-h tm)))
@@ -489,7 +507,11 @@
                 (g (scribe:font-glyph-index f code)))
            (if (and g (plusp g) (scribe:color-glyph-p f g))   ; scribe's emoji fallback is now COLR
                (list* :color (multiple-value-list (scribe:rasterize-color-glyph f g ppem)))
-               (list* :mono (multiple-value-list (scribe:rasterize-glyph f g ppem)))))))))
+               (%mono-entry (multiple-value-list (scribe:rasterize-glyph f g ppem)))))))))
+
+(defun %mono-entry (raster)
+  "(:MONO cov w h left top adv ...) from RASTERIZE-GLYPH's values, coverage in 4096ths."
+  (list* :mono (%cov12 (first raster)) (rest raster)))
 
 (defun nerd-glyph (nerd code ppem cw ch)
   "Rasterise a Nerd symbol scaled to FIT the cell and return a :SYM glyph whose
@@ -501,7 +523,7 @@
       (when (or (> gw cw) (> gh ch))                    ; ink overhangs the cell -> shrink to fit
         (let ((np2 (max 4 (floor (* (min ppem cw) (min (/ cw (max 1 gw)) (/ ch (max 1 gh))))))))
           (multiple-value-setq (cov gw gh) (scribe:rasterize-glyph nerd g np2))))
-      (list :sym cov gw gh (floor (- cw gw) 2) (floor (- ch gh) 2)))))
+      (list :sym (%cov12 cov) gw gh (floor (- cw gw) 2) (floor (- ch gh) 2)))))
 
 (defun glyph (tm code)
   (or (gethash code (terminal-glyphs tm))
@@ -544,12 +566,34 @@
                 (when (< -1 dx dw) (setf (aref dp (+ drow dx)) (aref sp (+ srow xx))))))))))))
 
 (defun render (tm)
+  "Draw what changed since the last RENDER: cells whose character or colours differ from the
+   copy kept of what was drawn, and the cells the cursor left and entered.  Everything when
+   there are sixel images (they lie over cells) or nothing has been drawn yet."
   (glass:with-fb-locked ((terminal-fb tm))
-    (dotimes (y (terminal-rows tm))
-      (dotimes (x (terminal-cols tm)) (draw-cell tm x y)))
-    (dolist (g (reverse (terminal-graphics tm)))       ; sixel images on top, oldest first
-      (blit-image (cddr g) (car g) (cadr g) (terminal-fb tm))))
-  (setf (terminal-dirty tm) t))
+    (let* ((cols (terminal-cols tm)) (rows (terminal-rows tm)) (n (* cols rows))
+           (chars (terminal-chars tm)) (colors (terminal-colors tm))
+           (dc (terminal-drawn-chars tm)) (dco (terminal-drawn-colors tm))
+           (full (or (null dc) (/= (length dc) n) (terminal-graphics tm)))
+           (vis (terminal-cursor-vis tm)) (cx (terminal-cx tm)) (cy (terminal-cy tm))
+           (ocx (terminal-drawn-cx tm)) (ocy (terminal-drawn-cy tm)) (ovis (terminal-drawn-vis tm))
+           (any nil))
+      (when (or (null dc) (/= (length dc) n))
+        (setf dc (make-array n :element-type '(unsigned-byte 32))
+              dco (make-array n :element-type '(unsigned-byte 64))
+              (terminal-drawn-chars tm) dc (terminal-drawn-colors tm) dco))
+      (dotimes (y rows)
+        (dotimes (x cols)
+          (let ((i (+ (* y cols) x)))
+            (when (or full
+                      (/= (aref chars i) (aref dc i)) (/= (aref colors i) (aref dco i))
+                      (and (= x cx) (= y cy) (or vis ovis))
+                      (and (= x ocx) (= y ocy) ovis))
+              (draw-cell tm x y)
+              (setf (aref dc i) (aref chars i) (aref dco i) (aref colors i) any t)))))
+      (setf (terminal-drawn-cx tm) cx (terminal-drawn-cy tm) cy (terminal-drawn-vis tm) vis)
+      (dolist (g (reverse (terminal-graphics tm)))       ; sixel images on top, oldest first
+        (blit-image (cddr g) (car g) (cadr g) (terminal-fb tm)))
+      (when any (setf (terminal-dirty tm) t)))))
 
 (defun terminal-take-dirty (tm)
   "T if the terminal's fb changed since the last call (and clear the flag) — lets
@@ -578,19 +622,25 @@
                            (string (code-char (logand keysym #x1f)))     ; Ctrl-A..Z
                            (string (code-char keysym))))
                       (t nil))))
-         (when bytes
-           (write-string bytes (terminal-pty tm)) (force-output (terminal-pty tm)))))))
+         (when bytes (term-send tm bytes))))))
+
+(defun term-send (tm string)
+  "STRING to whatever is on the other end: TERMINAL-PTY is a character stream, or a function
+   of one string (a terminal with no stream under it -- an SSH channel, a listener in the
+   image on a Lisp that has no Gray streams)."
+  (let ((p (terminal-pty tm)))
+    (if (functionp p)
+        (funcall p string)
+        (progn (write-string string p) (force-output p)))))
 
 (defun mouse-send (tm cb col row press-p)
-  (let ((out (terminal-pty tm)))
-    (if (terminal-mouse-sgr tm)
-        (format out "~c[<~d;~d;~d~a" (code-char 27) cb col row (if press-p "M" "m"))
-        (let ((b (if press-p cb 3)))                       ; legacy X10: release is button 3
-          (write-char (code-char 27) out) (write-char #\[ out) (write-char #\M out)
-          (write-char (code-char (min 255 (+ b 32))) out)
-          (write-char (code-char (min 255 (+ col 32))) out)
-          (write-char (code-char (min 255 (+ row 32))) out)))
-    (force-output out)))
+  (term-send tm
+             (if (terminal-mouse-sgr tm)
+                 (format nil "~c[<~d;~d;~d~a" (code-char 27) cb col row (if press-p "M" "m"))
+                 (let ((b (if press-p cb 3)))                 ; legacy X10: release is button 3
+                   (coerce (list (code-char 27) #\[ #\M (code-char (min 255 (+ b 32)))
+                                 (code-char (min 255 (+ col 32))) (code-char (min 255 (+ row 32))))
+                           'string)))))
 
 (defun on-mouse (tm mask lx ly)
   "Feed a pointer event (RFB button MASK; content-pixel LX,LY).  If the app has
@@ -616,60 +666,10 @@
 
 ;;; ---- PTY + run --------------------------------------------------------------
 
-(defconstant +tiocswinsz+
-  #+darwin #x80087467                   ; BSD encodes direction and size in the request
-  #-darwin #x5414                       ; Linux numbers its tty ioctls sequentially
-  "TIOCSWINSZ, which is not the same number on every kernel.
-
-   Linux numbers its tty ioctls sequentially; BSD encodes the direction and the
-   argument size into the request, so the same operation is #x5414 there and
-   #x80087467 here.  The Linux value used to be hard-coded, so on macOS this failed —
-   silently, inside IGNORE-ERRORS — and every program in the terminal was told nothing
-   about the window size.  A shell copes; anything that draws does not.
-
-   Fixing the number was not sufficient on its own: see SET-WINSIZE for the variadic
-   calling convention that was failing underneath it.")
-
-(defun set-winsize (stream rows cols)
-  "TIOCSWINSZ on the pty master so programs know the size (best-effort)."
-  (ignore-errors
-   (sb-alien:with-alien ((ws (sb-alien:array sb-alien:unsigned-short 4)))
-     (setf (sb-alien:deref ws 0) rows (sb-alien:deref ws 1) cols
-           (sb-alien:deref ws 2) 0 (sb-alien:deref ws 3) 0)
-     ;; THROUGH SB-POSIX, not a bare EXTERN-ALIEN.  ioctl(2) is variadic, and on
-     ;; arm64 Darwin variadic arguments are passed on the STACK while fixed ones go in
-     ;; registers — so declaring it as a plain three-argument function hands the
-     ;; pointer to a register ioctl never reads, and every call returns -1.  Measured:
-     ;; the same call is 0 through SB-POSIX and -1 through EXTERN-ALIEN, on the same
-     ;; fd, with either kernel's request number.  SBCL provides a non-variadic entry
-     ;; point precisely for this.
-     (sb-posix::ioctl-with-pointer-arg
-      (sb-sys:fd-stream-fd stream) +tiocswinsz+ (sb-alien:addr ws)))))
-
-(defun enable-echo (stream)
-  "Turn ECHO on for the pty.
-
-   SBCL's :pty t leaves the line discipline in -echo, so a shell reading in canonical
-   mode never echoes your keystrokes: you type blind, the command runs, and the command
-   line never appears.
-
-   THROUGH SB-POSIX, not a raw ioctl.  This used to poke TCGETS/TCSETS (0x5401/0x5402)
-   and set bit 3 of byte 12, which is Linux's request numbering and Linux's struct
-   termios — where c_lflag is a 4-byte field at offset 12.  On Darwin the requests are
-   TIOCGETA/TIOCSETA (0x40487413/0x40487414), tcflag_t is EIGHT bytes, and c_lflag is
-   at offset 24.  The ioctl therefore failed on macOS, inside IGNORE-ERRORS, and the
-   terminal had no local echo with nothing said about why.  The docstring admitted it
-   was Linux-only; the caller did not, and neither did the behaviour.
-
-   SB-POSIX already knows all of that per platform.  There was never a reason to
-   restate it here, and restating it is what made it wrong in one place."
-  (ignore-errors
-    (let* ((fd (sb-sys:fd-stream-fd stream))
-           (tio (sb-posix:tcgetattr fd)))
-      (setf (sb-posix:termios-lflag tio)
-            (logior (sb-posix:termios-lflag tio) sb-posix:echo))
-      (sb-posix:tcsetattr fd sb-posix:tcsanow tio)
-      t)))
+;; The pty's two ioctls (window size, echo) are term-pty.lisp's: they need SB-POSIX's termios
+;; and SB-ALIEN, which a Lisp without a pty need not have.  It sets these; NIL does nothing.
+(defvar *pty-set-winsize* nil "(FUNCTION STREAM ROWS COLS): tell the pty its size, or NIL.")
+(defvar *pty-enable-echo* nil "(FUNCTION STREAM): turn the pty's echo on, or NIL.")
 
 ;; Colour emoji come from scribe's bundled COLR fallback (Twemoji) by default;
 ;; :emoji-font is an optional override (a path to another COLR font).
@@ -682,7 +682,7 @@
   (glass:load-font (asdf:system-relative-pathname :glass/term (format nil "fonts/~a" name))))
 
 (defun make-terminal (&key (cols 80) (rows 24) (ppem 16) (shell "/bin/bash") emoji-font
-                           pty)
+                           pty font (nerd-font nil nerd-given))
   "A terminal.  With PTY, talk to THAT bidirectional character stream instead of
    spawning SHELL on a pseudo-terminal.
 
@@ -690,9 +690,14 @@
    anything that can be read and written a character at a time can sit on the
    other end.  glass/repl puts a Lisp listener there, which is what this was for
    before it grew a shell -- and on modus there is no shell, no pty and no
-   process to run in one, so the stream is the only end that will exist."
-  (let* ((font (%term-font "JetBrainsMono-Regular.ttf"))
-         (nerd (ignore-errors (%term-font "SymbolsNerdFontMono-Regular.ttf")))
+   process to run in one, so the stream is the only end that will exist.  PTY may also be a
+   function of one string (see TERM-SEND), for a Lisp without Gray streams.
+
+   FONT (a scribe font) replaces the bundled JetBrains Mono, and NERD-FONT the symbol font
+   (NIL for none): for an image with no glass/fonts/ directory beside it."
+  (let* ((nerd (if nerd-given nerd-font
+                   (and (null font) (ignore-errors (%term-font "SymbolsNerdFontMono-Regular.ttf")))))
+         (font (or font (%term-font "JetBrainsMono-Regular.ttf")))
          (upem (scribe:font-units-per-em font))
          ;; ROUND the advance (not CEILING) — ceiling adds up to ~1px of slack per
          ;; cell, which read as "a little wide"; round tracks the design advance.
@@ -728,8 +733,8 @@
     ;; pty and to nothing else.  A stream-backed terminal has no fd, no winsize
     ;; and no termios -- and needs none: its other end is in this image.
     (when proc
-      (set-winsize pty rows cols)
-      (enable-echo pty))                    ; SBCL's pty comes up -echo; the shell needs it on
+      (when *pty-set-winsize* (funcall *pty-set-winsize* pty rows cols))
+      (when *pty-enable-echo* (funcall *pty-enable-echo* pty)))   ; SBCL's pty comes up -echo
     tm))))
 
 (defun kill-terminal (tm)
@@ -758,8 +763,10 @@
             (terminal-cy tm) (min (terminal-cy tm) (1- rows))
             (terminal-top tm) 0 (terminal-bot tm) (1- rows))))
     (glass:fb-resize (terminal-fb tm) (* cols (terminal-cell-w tm)) (* rows (terminal-cell-h tm))))
+  (setf (terminal-drawn-chars tm) nil)                      ; everything moved: draw it all
   (render tm)                                                ; show the preserved content now
-  (set-winsize (terminal-pty tm) rows cols)
+  (when (and *pty-set-winsize* (streamp (terminal-pty tm)))
+    (funcall *pty-set-winsize* (terminal-pty tm) rows cols))
   (setf (terminal-dirty tm) t))
 
 (defun resize-terminal-px (tm px-w px-h)
