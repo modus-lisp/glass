@@ -104,6 +104,10 @@
   (dec-saved nil)                       ; DECSC cursor+attrs save
   (mouse-mode nil) (mouse-sgr nil)      ; mouse tracking: nil/:normal/:button/:any, SGR (1006)?
   (mouse-buttons 0) (mouse-col 0) (mouse-row 0)   ; last mouse state (for diffing)
+  (app-cursor nil)                      ; DECCKM (?1): arrows as ESC O x, as terminfo's smkx asks
+  (autowrap t)                          ; DECAWM (?7): off, the last column is overwritten
+  (g0-graphics nil)                     ; G0 is DEC special graphics (ESC ( 0): box drawing
+  (last-char 32)                        ; the last graphic character, for REP (CSI b)
   (drawn-chars nil) (drawn-colors nil)  ; the grid as last drawn: RENDER redraws only what differs
   (drawn-cx -1) (drawn-cy -1) (drawn-vis nil)
   (dirty t))                            ; fb changed since the compositor last consumed it?
@@ -138,11 +142,22 @@
         (bg (resolve-bg (terminal-bg tm))))
     (if (terminal-reverse tm) (cons bg fg) (cons fg bg))))
 
+(defparameter *dec-graphics*
+  ;; DEC special graphics for #x60..#x7E (ESC ( 0): what curses draws boxes with (acsc)
+  #(#x25C6 #x2592 #x2409 #x240C #x240D #x240A #x00B0 #x00B1 #x2424 #x240B #x2518 #x2510
+    #x250C #x2514 #x253C #x23BA #x23BB #x2500 #x23BC #x23BD #x251C #x2524 #x2534 #x252C
+    #x2502 #x2264 #x2265 #x03C0 #x2260 #x00A3 #x00B7))
+
 (defun put-char (tm ch)
+  (when (and (terminal-g0-graphics tm) (<= #x60 ch #x7E))
+    (setf ch (aref *dec-graphics* (- ch #x60))))
+  (setf (terminal-last-char tm) ch)
   (let ((w (char-width ch)))
     (when (zerop w) (return-from put-char))          ; combining/zero-width: v1 drops it
     (when (> (+ (terminal-cx tm) w) (terminal-cols tm))   ; wrap if it won't fit
-      (setf (terminal-cx tm) 0) (line-feed tm))
+      (if (terminal-autowrap tm)
+          (progn (setf (terminal-cx tm) 0) (line-feed tm))
+          (setf (terminal-cx tm) (max 0 (- (terminal-cols tm) w)))))   ; no wrap: overwrite the end
     (destructuring-bind (fg . bg) (eff-colors tm)
       (let ((col (mkcolor fg bg)) (cx (terminal-cx tm)) (cy (terminal-cy tm)))
         (setf (tchar tm cx cy) (mkchar ch (terminal-bold tm) :wide (= w 2))
@@ -150,7 +165,9 @@
         (when (= w 2)
           (setf (tchar tm (1+ cx) cy) (mkchar 0 (terminal-bold tm) :spacer t)
                 (tcolor tm (1+ cx) cy) col))))
-    (incf (terminal-cx tm) w)))
+    (setf (terminal-cx tm) (if (terminal-autowrap tm)
+                               (+ (terminal-cx tm) w)
+                               (min (+ (terminal-cx tm) w) (1- (terminal-cols tm)))))))
 
 (defun scroll-up (tm)
   (let ((cols (terminal-cols tm)))
@@ -222,6 +239,8 @@
   "DEC private mode set/reset (CSI ? Pn h / l)."
   (dolist (n (or (terminal-params tm) '(0)))
     (case n
+      (1 (setf (terminal-app-cursor tm) set-p))           ; DECCKM application cursor keys
+      (7 (setf (terminal-autowrap tm) set-p))             ; DECAWM auto-wrap
       (25 (setf (terminal-cursor-vis tm) set-p))          ; DECTCEM cursor visibility
       ((47 1047 1049) (set-alt tm set-p))                 ; alternate screen
       (1000 (setf (terminal-mouse-mode tm) (and set-p :normal)))  ; mouse: press/release
@@ -301,6 +320,12 @@
     (#\M (del-lines tm (p tm 0 1)))                    ; DL
     (#\S (dotimes (k (p tm 0 1)) (scroll-up tm)))      ; SU
     (#\T (dotimes (k (p tm 0 1)) (scroll-down tm)))    ; SD
+    (#\E (setf (terminal-cx tm) 0) (incf (terminal-cy tm) (p tm 0 1)) (clampc tm))   ; CNL
+    (#\F (setf (terminal-cx tm) 0) (decf (terminal-cy tm) (p tm 0 1)) (clampc tm))   ; CPL
+    (#\b (dotimes (k (min (p tm 0 1) (* (terminal-cols tm) (terminal-rows tm))))   ; REP
+           (put-char tm (terminal-last-char tm))))
+    (#\c (when (zerop (p tm 0 0))                       ; DA: a VT100 with advanced video
+           (term-send tm (format nil "~c[?1;2c" (code-char 27)))))
     (#\n (case (p tm 0 0)                              ; DSR: status, and where the cursor is
            (5 (term-send tm (format nil "~c[0n" (code-char 27))))
            (6 (term-send tm (format nil "~c[~d;~dR" (code-char 27)
@@ -325,7 +350,8 @@
          (#\] (setf (terminal-pstate tm) :osc))         ; OSC (window title etc.): swallow to ST/BEL
          (#\P (setf (terminal-pstate tm) :dcs           ; DCS (sixel graphics): collect to ST
                     (terminal-dcs tm) (make-array 64 :element-type 'character :adjustable t :fill-pointer 0)))
-         ((#\( #\)) (setf (terminal-pstate tm) :charset))
+         (#\( (setf (terminal-pstate tm) :charset0))      ; G0: 0 = DEC graphics, else ASCII
+         (#\) (setf (terminal-pstate tm) :charset))       ; G1: not used by xterm's terminfo
          (#\7 (decsc tm) (setf (terminal-pstate tm) :ground))          ; DECSC save cursor
          (#\8 (decrc tm) (setf (terminal-pstate tm) :ground))          ; DECRC restore cursor
          (#\D (line-feed tm) (setf (terminal-pstate tm) :ground))      ; IND index
@@ -334,6 +360,7 @@
               (setf (terminal-pstate tm) :ground))
          (t (setf (terminal-pstate tm) :ground))))
       (:charset (setf (terminal-pstate tm) :ground))
+      (:charset0 (setf (terminal-g0-graphics tm) (char= c #\0) (terminal-pstate tm) :ground))
       (:osc (when (or (= code 7) (= code 27)) (setf (terminal-pstate tm) :ground)))
       (:dcs (if (= code 27) (setf (terminal-pstate tm) :dcs-esc)   ; maybe ST (ESC \)
                 (vector-push-extend c (terminal-dcs tm))))
@@ -343,12 +370,15 @@
       (:csi
        (cond
          ((char= c #\?) (setf (terminal-ppriv tm) t))
+         ((char= c #\>) (setf (terminal-ppriv tm) :gt))
          ((digit-char-p c) (setf (terminal-pcur tm) (+ (* (or (terminal-pcur tm) 0) 10) (digit-char-p c))))
          ((char= c #\;) (setf (terminal-params tm) (append (terminal-params tm) (list (or (terminal-pcur tm) 0)))
                               (terminal-pcur tm) nil))
          ((<= 64 code 126)
           (when (terminal-pcur tm) (setf (terminal-params tm) (append (terminal-params tm) (list (terminal-pcur tm)))))
-          (cond ((and (terminal-ppriv tm) (member c '(#\h #\l))) (private-mode tm (char= c #\h)))
+          (cond ((and (eq (terminal-ppriv tm) t) (member c '(#\h #\l))) (private-mode tm (char= c #\h)))
+                ((and (eq (terminal-ppriv tm) :gt) (char= c #\c))          ; secondary DA
+                 (term-send tm (format nil "~c[>0;10;1c" (code-char 27))))
                 ((not (terminal-ppriv tm)) (csi-dispatch tm c)))
           (setf (terminal-pstate tm) :ground)))))))
 
@@ -611,11 +641,29 @@
     (#xff50 . ,(format nil "~c[H" (code-char 27))) (#xff57 . ,(format nil "~c[F" (code-char 27)))
     (#xff55 . ,(format nil "~c[5~~" (code-char 27))) (#xff56 . ,(format nil "~c[6~~" (code-char 27)))))
 
+(defparameter *function-keys*
+  ;; F1..F12 (keysyms #xffbe..#xffc9), as xterm sends them
+  (let ((e (string (code-char 27))))
+    (vector (concatenate 'string e "OP") (concatenate 'string e "OQ") (concatenate 'string e "OR")
+            (concatenate 'string e "OS") (concatenate 'string e "[15~") (concatenate 'string e "[17~")
+            (concatenate 'string e "[18~") (concatenate 'string e "[19~") (concatenate 'string e "[20~")
+            (concatenate 'string e "[21~") (concatenate 'string e "[23~") (concatenate 'string e "[24~"))))
+
+(defun %app-key (tm keysym)
+  "In application cursor mode (DECCKM) the arrows, Home and End are ESC O x."
+  (and (terminal-app-cursor tm)
+       (let ((final (case keysym (#xff52 #\A) (#xff54 #\B) (#xff53 #\C) (#xff51 #\D)
+                                 (#xff50 #\H) (#xff57 #\F))))
+         (and final (format nil "~cO~c" (code-char 27) final)))))
+
 (defun on-key (tm down keysym)
   (cond
     ((member keysym '(#xffe3 #xffe4)) (setf (terminal-ctrl tm) down))   ; Control L/R
     ((not down) nil)
     (t (let ((bytes (cond
+                      ((%app-key tm keysym))
+                      ((<= #xffbe keysym #xffc9) (aref *function-keys* (- keysym #xffbe)))
+                      ((= keysym #xff63) (format nil "~c[2~~" (code-char 27)))      ; Insert
                       ((cdr (assoc keysym *keymap*)))
                       ((or (<= #x20 keysym #x7e) (<= #xa0 keysym #xff))
                        (if (and (terminal-ctrl tm) (<= #x40 (logand keysym #xdf) #x5f))
