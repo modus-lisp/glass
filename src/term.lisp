@@ -517,6 +517,11 @@
    at small ppem — terminals are exactly its sweet spot).  NIL = geometric outlines
    with analytic AA (softer).")
 
+(defun %font-covers-p (font code)
+  "FONT has a real glyph for CODE.  scribe's FONT-COVERS-P says the same but lives beside its
+   fallback-font matching, which an image without the bundled fallback faces need not carry."
+  (and font (let ((g (ignore-errors (scribe:font-glyph-index font code)))) (and g (plusp g)))))
+
 (defun render-glyph (tm code)
   "Render CODE: colour (COLR emoji) -> (:color rgb alpha w h left top adv), else
    monochrome coverage -> (:mono cov w h left top adv), picking the primary mono
@@ -525,10 +530,10 @@
         (primary (terminal-font tm)) (ppem (terminal-ppem tm))
         (ef (terminal-emoji-font tm)) (nerd (terminal-nerd-font tm)))
     (cond
-      ((scribe:font-covers-p primary code)
+      ((%font-covers-p primary code)
        (%mono-entry (multiple-value-list
                      (scribe:rasterize-glyph primary (scribe:font-glyph-index primary code) ppem))))
-      ((and nerd (scribe:font-covers-p nerd code))     ; Nerd Font symbols: powerline, dev icons, etc.
+      ((and nerd (%font-covers-p nerd code))     ; Nerd Font symbols: powerline, dev icons, etc.
        (nerd-glyph nerd code ppem (terminal-cell-w tm) (terminal-cell-h tm)))
       ((and ef (let ((g (scribe:font-glyph-index ef code))) (and g (plusp g) (scribe:color-glyph-p ef g))))
        (list* :color (multiple-value-list
