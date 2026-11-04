@@ -159,7 +159,7 @@ quietly admitting people as somebody else.")
 ;;; PERSISTED, KEYED BY THE SEAT'S NAME, because a seat that got a new npub on every
 ;;; restart would be a destination nobody could write down — which is the whole objection
 ;;; to addressing a transport.  The store is this file's because the KEYS are: core glass
-;;; carries no crypto (cl-nostr and ironclad are dependencies of :glass/nostr alone), so
+;;; carries no crypto (cl-nostr and natrium are dependencies of :glass/nostr alone), so
 ;;; the backend holds an opaque slot and asks for one of these by name.
 ;;;
 ;;; NOTHING HERE SIGNS ANYTHING, and that is a decision rather than an omission.  Identity
@@ -412,18 +412,24 @@ day, renewed by use) — so the failure of a short renewal is invisible, gradual
 of behaviour change that should be somebody's decision rather than a side effect of tightening
 links.  Raise it toward *ENROLMENT-TTL* if you want `via=code' on a next-day cold load.")
 
+(defun %login-u8 (n) (make-array n :element-type '(unsigned-byte 8)))
+
+(defun %login-hex (bytes) (format nil "~(~{~2,'0x~}~)" (coerce bytes 'list)))
+
 (defun %secret-bytes (secret)
   "SECRET as 64-hex string, byte vector, or integer -> (unsigned-byte 8) vector."
   (etypecase secret
-    (string (ironclad:hex-string-to-byte-array secret))
-    (integer (ironclad:integer-to-octets secret :n-bits 256))
-    (sequence (coerce secret '(vector (unsigned-byte 8))))))
+    (string (let ((v (%login-u8 (floor (length secret) 2))))
+              (dotimes (i (length v) v)
+                (setf (aref v i) (parse-integer secret :start (* 2 i) :end (+ 2 (* 2 i)) :radix 16)))))
+    (integer (let ((v (%login-u8 32)))             ; 256 bits, big-endian
+               (dotimes (i 32 v) (setf (aref v (- 31 i)) (ldb (byte 8 (* 8 i)) secret)))))
+    (sequence (coerce secret '(simple-array (unsigned-byte 8) (*))))))
 
 (defun %token-mac (secret nonce exp)
-  (let ((m (ironclad:make-mac :hmac (%secret-bytes secret) :sha256)))
-    (ironclad:update-mac m (ironclad:ascii-string-to-byte-array
-                            (format nil "glass-login|~a|~a" nonce exp)))
-    (ironclad:byte-array-to-hex-string (ironclad:produce-mac m))))
+  (%login-hex (natrium:hmac-sha256 (%secret-bytes secret)
+                             (map '(simple-array (unsigned-byte 8) (*)) #'char-code
+                                  (format nil "glass-login|~a|~a" nonce exp)))))
 
 (defun %constant-time-equal (a b)
   "Constant-time string compare — a MAC checked with STRING= is a timing oracle for that MAC."
@@ -454,7 +460,7 @@ its reply, because a person who taps an older link afterwards is going to be ref
 place that can be explained is the message carrying the replacement."
   (when secret
     (ignore-errors
-     (let* ((nonce (ironclad:byte-array-to-hex-string (ironclad:random-data 16)))
+     (let* ((nonce (%login-hex (natrium:random-bytes 16)))
             (exp (+ (unix-now) ttl))
             (token (format nil "~a.~a.~a" nonce exp (%token-mac secret nonce exp))))
        ;; recorded AFTER the token exists and before it is handed out.  If the store cannot be
