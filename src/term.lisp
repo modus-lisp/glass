@@ -478,6 +478,7 @@
         (lg (aref glass::*srgb->lin12* (ldb (byte 8 8) fg)))
         (lb (aref glass::*srgb->lin12* (ldb (byte 8 0) fg)))
         (solid (logand fg #xffffff)))
+    (declare (type (simple-array (unsigned-byte 32) (*)) dpx))   ; a window's pixels: see FB-TEXT
     (dotimes (yy gh)
       (let ((yv (+ oy yy)))
         (when (< -1 yv fh)
@@ -498,6 +499,7 @@
   "Composite a premultiplied-RGB + ALPHA colour glyph (gw x gh) at (OX,OY): the
    straight-over of premultiplied colour on the existing pixel."
   (let ((dpx (glass:fb-pixels fb)) (fw (glass:fb-width fb)) (fh (glass:fb-height fb)))
+    (declare (type (simple-array (unsigned-byte 32) (*)) dpx))
     (dotimes (yy gh)
       (let ((yv (+ oy yy)))
         (when (< -1 yv fh)
@@ -592,6 +594,7 @@
   "Composite glass fb SRC into DST at (OX,OY)."
   (let* ((sw (glass:fb-width src)) (sh (glass:fb-height src)) (sp (glass:fb-pixels src))
          (dp (glass:fb-pixels dst)) (dw (glass:fb-width dst)) (dh (glass:fb-height dst)))
+    (declare (type (simple-array (unsigned-byte 32) (*)) sp dp))
     (dotimes (yy sh)
       (let ((dy (+ oy yy)))
         (when (< -1 dy dh)

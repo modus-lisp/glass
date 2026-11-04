@@ -216,12 +216,16 @@
                                     (setf (aref yp idx) (ash (+ (* (aref yp idx) ia) (* ty a) 2048) -12)
                                           (aref up ci) (ash (+ (* (aref up ci) iq) (* tu q) 2048) -12)
                                           (aref vp ci) (ash (+ (* (aref vp ci) iq) (* tv q) 2048) -12)))
-                                  (setf (aref px idx)
-                                        (if (>= a 4096)
-                                            solid   ; full coverage: the colour, no blend
-                                            (let ((dst (aref px idx)))
-                                              (logior (ash (%over12 (ldb (byte 8 16) dst) fr a ia) 16)
-                                                      (ash (%over12 (ldb (byte 8 8) dst) fg a ia) 8)
-                                                      (%over12 (ldb (byte 8 0) dst) fbb a ia))))))))))))))))
+                                  ;; the pixel vector's type, stated: unstated, a packed vector (modus)
+                                  ;; is read and written through the generic dispatch, 5x the cost
+                                  (let ((px px))
+                                    (declare (type (simple-array (unsigned-byte 32) (*)) px))
+                                    (setf (aref px idx)
+                                          (if (>= a 4096)
+                                              solid   ; full coverage: the colour, no blend
+                                              (let ((dst (aref px idx)))
+                                                (logior (ash (%over12 (ldb (byte 8 16) dst) fr a ia) 16)
+                                                        (ash (%over12 (ldb (byte 8 8) dst) fg a ia) 8)
+                                                        (%over12 (ldb (byte 8 0) dst) fbb a ia)))))))))))))))))
           (incf pen (or adv256 (* 256 size))))))
     (ash pen -8)))
