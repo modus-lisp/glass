@@ -37,26 +37,39 @@
    path (inlined CPIX); non-NIL = the client's format (PUT-CPIX)."
   `(setf ,i (if ,fmt (put-cpix ,buf ,i ,p ,fmt) (cpix ,buf ,i ,p))))
 
+(declaim (inline %pal-find))
+(defun %pal-find (palette psize c)
+  "C's index in PALETTE[0,PSIZE), or -1."
+  (declare (type (simple-array (unsigned-byte 32) (*)) palette) (fixnum psize)
+           (optimize (speed 3) (safety 0)))
+  (dotimes (k psize -1)
+    (when (= (aref palette k) c) (return k))))
+
 (defun zrle-tile (buf i px fw ax ay tw th index palette &optional fmt)
   "Pack one tile into BUF at index I (returning the next index): solid (subenc 1),
-   a <=16-colour packed palette (2..16), or raw (0).  INDEX (hash) and PALETTE
-   (16-elt vector) are scratch, reused across tiles.  FMT NIL = native CPIXELs;
-   otherwise the client pixel format drives CPIXEL size/layout."
+   a <=16-colour packed palette (2..16), or raw (0).  PALETTE (16-elt vector) is
+   scratch, reused across tiles; a colour's index is found by a scan of at most 16
+   entries, after the previous pixel's -- runs make that the usual hit.  (INDEX is
+   unused: a hash lookup per pixel was most of a modus desk's encode time.)
+   FMT NIL = native CPIXELs; otherwise the client pixel format drives CPIXEL
+   size/layout."
   (declare (type (simple-array (unsigned-byte 8) (*)) buf)
            (type (simple-array (unsigned-byte 32) (*)) px palette)
-           (type fixnum i fw ax ay tw th) (optimize (speed 3) (safety 0)))
-  (clrhash index)
-  (let ((psize 0) (over nil))
-    (declare (fixnum psize))
+           (type fixnum i fw ax ay tw th) (optimize (speed 3) (safety 0))
+           (ignore index))
+  (let ((psize 0) (over nil) (last -1))
+    (declare (fixnum psize last))
     (block scan
       (dotimes (ly th)
         (let ((row (* (+ ay ly) fw)))
           (declare (fixnum row))
           (dotimes (lx tw)
             (let ((c (aref px (+ row ax lx))))
-              (unless (nth-value 1 (gethash c index))
-                (when (>= psize 16) (setf over t) (return-from scan))
-                (setf (gethash c index) psize (aref palette psize) c) (incf psize)))))))
+              (unless (= c last)
+                (setf last c)
+                (when (< (%pal-find palette psize c) 0)
+                  (when (>= psize 16) (setf over t) (return-from scan))
+                  (setf (aref palette psize) c) (incf psize))))))))
     (cond
       (over                                              ; subencoding 0: raw CPIXELs
        (setf (aref buf i) 0) (incf i)
@@ -66,15 +79,18 @@
       ((= psize 1)                                       ; subencoding 1: solid
        (setf (aref buf i) 1) (incf i) (%wcpix buf i (aref palette 0) fmt))
       (t                                                 ; subencoding 2..16: packed palette
-       (let ((bpp (cond ((<= psize 2) 1) ((<= psize 4) 2) (t 4))))
-         (declare (fixnum bpp))
+       (let ((bpp (cond ((<= psize 2) 1) ((<= psize 4) 2) (t 4)))
+             (last -1) (lastk 0))
+         (declare (fixnum bpp last lastk))
          (setf (aref buf i) psize) (incf i)
          (dotimes (k psize) (%wcpix buf i (aref palette k) fmt))
          (dotimes (ly th)
            (let ((row (* (+ ay ly) fw)) (acc 0) (nbits 0))
              (declare (fixnum row acc nbits))
              (dotimes (lx tw)
-               (setf acc (logior (ash acc bpp) (the fixnum (gethash (aref px (+ row ax lx)) index))))
+               (let ((c (aref px (+ row ax lx))))
+                 (unless (= c last) (setf last c lastk (%pal-find palette psize c)))
+                 (setf acc (logior (ash acc bpp) lastk)))
                (incf nbits bpp)
                (loop while (>= nbits 8) do (decf nbits 8)
                  (setf (aref buf i) (logand (ash acc (- nbits)) #xff)) (incf i)
@@ -102,7 +118,7 @@
    calls on disjoint rects/rows run in parallel."
   (let* ((px (fb-pixels fb)) (fw (fb-width fb))
          (buf (or buf (make-array (zrle-rect-cap w h tile) :element-type '(unsigned-byte 8))))
-         (i 0) (index (make-hash-table :size 32))
+         (i 0) (index nil)
          (palette (make-array 16 :element-type '(unsigned-byte 32))))
     (declare (type (simple-array (unsigned-byte 8) (*)) buf) (fixnum i tile))
     (loop for ty from 0 below h by tile for th = (min tile (- h ty)) do
