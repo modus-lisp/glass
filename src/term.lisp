@@ -11,6 +11,10 @@
   (:use #:cl)
   (:export #:run #:make-terminal #:terminal #:terminal-fb #:on-key #:on-mouse #:start-pump
            #:terminal-take-dirty #:kill-terminal #:resize-terminal #:resize-terminal-px
+           ;; a terminal owned by one thread, polled rather than pumped (a window manager's app)
+           #:terminal-poll #:terminal-exited #:terminal-write #:terminal-text #:render #:term-fonts
+           #:terminal-cols #:terminal-rows #:terminal-cell-w #:terminal-cell-h
+           #:terminal-app
            ;; tabbed terminal (multiple shells, a tab bar)
            #:make-tabbed-terminal #:tabterm-fb #:tabterm-on-key #:tabterm-on-mouse #:tabterm-new
            #:tabterm-take-dirty #:tabterm-kill))
@@ -110,6 +114,8 @@
   (last-char 32)                        ; the last graphic character, for REP (CSI b)
   (drawn-chars nil) (drawn-colors nil)  ; the grid as last drawn: RENDER redraws only what differs
   (drawn-cx -1) (drawn-cy -1) (drawn-vis nil)
+  (alt-key nil)                         ; keyboard: Alt / Meta held (sends ESC first)?
+  (exited nil)                          ; the pty reached EOF: the shell is gone
   (dirty t))                            ; fb changed since the compositor last consumed it?
 
 (declaim (inline tidx tchar tcolor))
@@ -665,29 +671,59 @@
          (and final (format nil "~cO~c" (code-char 27) final)))))
 
 (defun on-key (tm down keysym)
+  "An RFB key event: DOWN, the X11 KEYSYM.  Control and Alt/Meta are tracked from their own
+   events (RFB sends modifiers as keys); Control makes @, A-Z, [, \\, ], ^, _ and Space their C0
+   codes, Alt sends ESC before the key (what xterm's metaSendsEscape does, and what bash and
+   Emacs read as Meta)."
   (cond
     ((member keysym '(#xffe3 #xffe4)) (setf (terminal-ctrl tm) down))   ; Control L/R
+    ((member keysym '(#xffe9 #xffea #xffe7 #xffe8)) (setf (terminal-alt-key tm) down))  ; Alt, Meta
     ((not down) nil)
     (t (let ((bytes (cond
                       ((%app-key tm keysym))
                       ((<= #xffbe keysym #xffc9) (aref *function-keys* (- keysym #xffbe)))
                       ((= keysym #xff63) (format nil "~c[2~~" (code-char 27)))      ; Insert
+                      ((= keysym #xff8d) (string (code-char 13)))                  ; KP_Enter
                       ((cdr (assoc keysym *keymap*)))
+                      ((and (terminal-ctrl tm) (= keysym #x20)) (string (code-char 0)))   ; C-Space
                       ((or (<= #x20 keysym #x7e) (<= #xa0 keysym #xff))
                        (if (and (terminal-ctrl tm) (<= #x40 (logand keysym #xdf) #x5f))
                            (string (code-char (logand keysym #x1f)))     ; Ctrl-A..Z
                            (string (code-char keysym))))
+                      ((<= #x1000100 keysym #x110ffff)                   ; a Unicode keysym
+                       (string (code-char (- keysym #x1000000))))
                       (t nil))))
-         (when bytes (term-send tm bytes))))))
+         (when bytes
+           (term-send tm (if (terminal-alt-key tm)
+                             (concatenate 'string (string (code-char 27)) bytes)
+                             bytes)))))))
+
+(defun %utf8-octet-string (string)
+  "STRING with every character past ASCII replaced by its UTF-8 bytes, each as a Latin-1
+   character: what a pty stream opened :LATIN-1 (raw bytes, decoded by FEED-BYTE) must be
+   written, so a shell reading UTF-8 sees an e-acute as two bytes and not as one invalid one."
+  (if (every (lambda (c) (< (char-code c) #x80)) string)
+      string
+      (with-output-to-string (o)
+        (loop for c across string
+              for code = (char-code c)
+              do (flet ((b (x) (write-char (code-char x) o)))
+                   (cond ((< code #x80) (b code))
+                         ((< code #x800) (b (logior #xC0 (ash code -6))) (b (logior #x80 (logand code #x3F))))
+                         ((< code #x10000) (b (logior #xE0 (ash code -12)))
+                          (b (logior #x80 (logand (ash code -6) #x3F))) (b (logior #x80 (logand code #x3F))))
+                         (t (b (logior #xF0 (ash code -18))) (b (logior #x80 (logand (ash code -12) #x3F)))
+                            (b (logior #x80 (logand (ash code -6) #x3F))) (b (logior #x80 (logand code #x3F))))))))))
 
 (defun term-send (tm string)
-  "STRING to whatever is on the other end: TERMINAL-PTY is a character stream, or a function
-   of one string (a terminal with no stream under it -- an SSH channel, a listener in the
-   image on a Lisp that has no Gray streams)."
+  "STRING to whatever is on the other end: TERMINAL-PTY is a character stream (written as UTF-8
+   bytes: a pty is opened :LATIN-1, raw), or a function of one string (a terminal with no stream
+   under it -- an SSH channel, a Lisp listener -- which gets the characters as they are)."
   (let ((p (terminal-pty tm)))
-    (if (functionp p)
-        (funcall p string)
-        (progn (write-string string p) (force-output p)))))
+    (cond ((functionp p) (funcall p string))
+          ((terminal-exited tm) nil)
+          (t (handler-case (progn (write-string (%utf8-octet-string string) p) (force-output p))
+               (stream-error () (setf (terminal-exited tm) t)))))))
 
 (defun mouse-send (tm cb col row press-p)
   (term-send tm
@@ -737,68 +773,108 @@
    Font — WezTerm's default set; colour emoji comes from scribe's Twemoji fallback)."
   (glass:load-font (asdf:system-relative-pathname :glass/term (format nil "fonts/~a" name))))
 
-(defun make-terminal (&key (cols 80) (rows 24) (ppem 16) (shell "/bin/bash") emoji-font
-                           pty font (nerd-font nil nerd-given))
-  "A terminal.  With PTY, talk to THAT bidirectional character stream instead of
-   spawning SHELL on a pseudo-terminal.
+(defvar *term-fonts* nil "(REGULAR . NERD): the bundled faces, once loaded on a thread that may cache.")
 
-   The stream is the whole seam: ON-KEY writes to it and PUMP reads from it, so
-   anything that can be read and written a character at a time can sit on the
-   other end.  glass/repl puts a Lisp listener there, which is what this was for
-   before it grew a shell -- and on modus there is no shell, no pty and no
-   process to run in one, so the stream is the only end that will exist.  PTY may also be a
-   function of one string (see TERM-SEND), for a Lisp without Gray streams.
+(defun term-fonts ()
+  "The bundled faces as (REGULAR . NERD-OR-NIL), loaded once and cached -- as GLASS:DEFAULT-FONT
+   does, except on a modus thread other than main, whose font could not be stored in the shared
+   cache: it gets faces of its own, uncached.  A host whose terminals open on another thread
+   calls this on main first (SERVE-WM does), so they share one copy."
+  (or *term-fonts*
+      (let ((f (cons (%term-font "JetBrainsMono-Regular.ttf")
+                     (ignore-errors (%term-font "SymbolsNerdFontMono-Regular.ttf")))))
+        (if #+modus (sb-thread:main-thread-p) #-modus t
+            (setf *term-fonts* f)
+            f))))
 
-   FONT (a scribe font) replaces the bundled JetBrains Mono, and NERD-FONT the symbol font
-   (NIL for none): for an image with no glass/fonts/ directory beside it."
-  (let* ((nerd (if nerd-given nerd-font
-                   (and (null font) (ignore-errors (%term-font "SymbolsNerdFontMono-Regular.ttf")))))
-         (font (or font (%term-font "JetBrainsMono-Regular.ttf")))
-         (upem (scribe:font-units-per-em font))
+(defun %cell-metrics (font ppem)
+  "(values cell-w cell-h ascent) of FONT at PPEM."
+  (let* ((upem (scribe:font-units-per-em font))
          ;; ROUND the advance (not CEILING) — ceiling adds up to ~1px of slack per
          ;; cell, which read as "a little wide"; round tracks the design advance.
          (cell-w (max 1 (round (nth-value 5 (scribe:rasterize-glyph font (scribe:font-glyph-index font (char-code #\M)) ppem)))))
          (asc (round (* (scribe:font-ascent font) ppem) upem))
-         (desc (round (* (- (scribe:font-descent font)) ppem) upem))
-         (cell-h (+ asc desc 1))
-         ;; setsid -c makes the pty the controlling terminal: real job control,
-         ;; no "cannot set process group" warning, and readline echoes normally.
-         ;; It is util-linux, so it is simply absent on macOS and the BSDs; there
-         ;; we exec the shell directly and lose only the job-control niceties
-         ;; (bash may say "cannot set terminal process group" — the pty still
-         ;; reads and writes normally).  A missing setsid used to be a hard
-         ;; error, which took the whole desktop down with it.
-         (setsid (unless pty (find-if #'probe-file '("/usr/bin/setsid" "/bin/setsid"))))
-         (argv (if setsid (list "-c" shell "--norc" "-i") (list "--norc" "-i")))
-         (proc (unless pty
-                 (sb-ext:run-program (or setsid shell) argv
-                                   :pty t :wait nil
-                                   :external-format :latin-1   ; read raw bytes; we UTF-8 decode
-                                   :environment (list "TERM=xterm-256color" "PS1=\\w $ "
-                                                      "PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-                                                      (format nil "COLUMNS=~d" cols) (format nil "LINES=~d" rows)
-                                                      (format nil "HOME=~a" (or (sb-ext:posix-getenv "HOME") "/root"))))))
-         (pty (or pty (sb-ext:process-pty proc))))
-    (multiple-value-bind (gch gco) (make-grid cols rows)
-     (let ((tm (%make-terminal :cols cols :rows rows :chars gch :colors gco
-                            :bot (1- rows) :pty pty :proc proc :font font :nerd-font nerd :ppem ppem
-                            :emoji-font (load-emoji-font emoji-font)
-                            :cell-w cell-w :cell-h cell-h :ascent asc
-                            :fb (glass:make-framebuffer (* cols cell-w) (* rows cell-h) glass:+black+))))
-    ;; Both of these are ioctls on a file descriptor, so they apply to a real
-    ;; pty and to nothing else.  A stream-backed terminal has no fd, no winsize
-    ;; and no termios -- and needs none: its other end is in this image.
-    (when proc
-      (when *pty-set-winsize* (funcall *pty-set-winsize* pty rows cols))
-      (when *pty-enable-echo* (funcall *pty-enable-echo* pty)))   ; SBCL's pty comes up -echo
-    tm))))
+         (desc (round (* (- (scribe:font-descent font)) ppem) upem)))
+    (values cell-w (+ asc desc 1) asc)))
+
+(defun %shell-argv (shell)
+  "(values PROGRAM ARGS) that run SHELL interactively as the session leader of its pty.
+
+   setsid -c makes the pty the controlling terminal: real job control, no `cannot set process
+   group' warning.  It is util-linux, so it is absent on macOS and the BSDs; there the shell is
+   run directly and loses only the job-control niceties.  (A missing setsid used to be a hard
+   error, which took the whole desktop down with it.)
+
+   `stty echo' FIRST, in the child, before the shell starts.  SBCL's :PTY comes up -echo, and
+   turning echo on from here (ENABLE-ECHO) races the shell: readline decides at start-up whether
+   it echoes, from the termios it finds, and a shell that looked first never echoed a key --
+   reproducibly whenever the first key was typed before bash was ready."
+  (let ((setsid (find-if #'probe-file '("/usr/bin/setsid" "/bin/setsid")))
+        (sh (list "/bin/sh" "-c" "stty echo 2>/dev/null; exec \"$0\" --norc -i" shell)))
+    (if setsid
+        (values setsid (list* "-c" sh))
+        (values (first sh) (rest sh)))))
+
+(defun make-terminal (&key (cols 80) (rows 24) (ppem 16) (shell "/bin/bash") emoji-font
+                           pty font (nerd-font nil nerd-given) fb)
+  "A terminal.  With PTY, talk to THAT bidirectional character stream instead of
+   spawning SHELL on a pseudo-terminal.
+
+   The stream is the whole seam: ON-KEY writes to it and TERMINAL-POLL reads from it, so
+   anything that can be read and written a character at a time can sit on the
+   other end.  PTY may also be a function of one string (see TERM-SEND): then nothing is
+   read, and the far end puts its output on the screen with TERMINAL-WRITE -- glass/repl's
+   listener does.
+
+   FONT (a scribe font) replaces the bundled JetBrains Mono, and NERD-FONT the symbol font
+   (NIL for none): for an image with no glass/fonts/ directory beside it.  FB, if given, is the
+   framebuffer to draw into (resized to the grid) instead of a new one: a window's own."
+  (let* ((bundled (and (null font) (term-fonts)))
+         (nerd (if nerd-given nerd-font (cdr bundled)))
+         (font (or font (car bundled))))
+    (multiple-value-bind (cell-w cell-h asc) (%cell-metrics font ppem)
+      (let* ((proc (unless pty
+                     (multiple-value-bind (program args) (%shell-argv shell)
+                       (sb-ext:run-program program args
+                                           :pty t :wait nil
+                                           :external-format :latin-1   ; raw bytes; FEED-BYTE decodes
+                                           :environment (list "TERM=xterm-256color" "PS1=\\w $ "
+                                                              "PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+                                                              (format nil "COLUMNS=~d" cols) (format nil "LINES=~d" rows)
+                                                              (format nil "HOME=~a" (or (sb-ext:posix-getenv "HOME") "/root")))))))
+             (pty (or pty (sb-ext:process-pty proc)))
+             (fb (if fb
+                     (progn (glass:fb-resize fb (* cols cell-w) (* rows cell-h) glass:+black+) fb)
+                     (glass:make-framebuffer (* cols cell-w) (* rows cell-h) glass:+black+))))
+        (multiple-value-bind (gch gco) (make-grid cols rows)
+          (let ((tm (%make-terminal :cols cols :rows rows :chars gch :colors gco
+                                    :bot (1- rows) :pty pty :proc proc :font font :nerd-font nerd :ppem ppem
+                                    :emoji-font (load-emoji-font emoji-font)
+                                    :cell-w cell-w :cell-h cell-h :ascent asc :fb fb)))
+            ;; Both of these are ioctls on a file descriptor, so they apply to a real
+            ;; pty and to nothing else.  A stream-backed terminal has no fd, no winsize
+            ;; and no termios -- and needs none: its other end is in this image.
+            (when proc
+              (when *pty-set-winsize* (funcall *pty-set-winsize* pty rows cols))
+              (when *pty-enable-echo* (funcall *pty-enable-echo* pty)))   ; SBCL's pty comes up -echo
+            tm))))))
 
 (defun kill-terminal (tm)
   "Close the terminal: SIGHUP the shell's whole process group (so children die
-   too) and close the pty; the pump thread then sees EOF and exits."
-  (when (terminal-proc tm)
-    (ignore-errors (sb-ext:process-kill (terminal-proc tm) 1 :process-group)))  ; SIGHUP the group
-  (ignore-errors (close (terminal-pty tm))))
+   too) and close the pty; a pump then sees EOF and stops.  Then collect the
+   shell's exit -- waiting a moment for it, and SIGKILLing the group if it
+   ignored the hangup -- so a Lisp with no SIGCHLD handler (modus) keeps no
+   zombie per closed window."
+  (let ((proc (terminal-proc tm)))
+    (setf (terminal-exited tm) t)
+    (when proc
+      (ignore-errors (sb-ext:process-kill proc 1 :process-group)))  ; SIGHUP the group
+    (ignore-errors (close (terminal-pty tm)))
+    (when proc
+      (ignore-errors
+       (unless (loop repeat 50 do (if (sb-ext:process-alive-p proc) (sleep 1/100) (return t)))
+         (sb-ext:process-kill proc 9 :process-group))
+       (sb-ext:process-wait proc)))))
 
 (defun resize-terminal (tm cols rows)
   "Resize the terminal to COLS x ROWS cells, PRESERVING the visible content
@@ -831,22 +907,83 @@
   (resize-terminal tm (max 1 (floor px-w (terminal-cell-w tm)))
                       (max 1 (floor px-h (terminal-cell-h tm)))))
 
-(defun pump (tm)
-  "Read shell output, feed the parser, render.  Returns when the shell exits."
-  (loop
-    (let ((got nil))
+(defun terminal-poll (tm &optional (budget 65536))
+  "Read what the shell has written, without waiting: at most BUDGET bytes, fed to the parser,
+   then RENDER.  T if anything arrived.  At end of file (the shell exited) the terminal says so
+   on its last line and TERMINAL-EXITED becomes true; it is not read again.  This is the whole
+   of the pty's input path: a window manager calls it from its app's DIRTY-P, on the thread
+   that owns the terminal, so nothing else ever touches the grid."
+  (let ((p (terminal-pty tm)) (got nil))
+    (unless (or (terminal-exited tm) (not (streamp p)))
       (handler-case
-          (loop repeat 200000 for c = (read-char-no-hang (terminal-pty tm) nil :eof)
-                do (cond ((null c) (return)) ((eq c :eof) (return-from pump))
+          (loop repeat budget for c = (read-char-no-hang p nil :eof)
+                do (cond ((null c) (return))
+                         ((eq c :eof) (%note-exit tm) (setf got t) (return))
                          (t (feed-byte tm (char-code c)) (setf got t))))
-        (stream-error () (return-from pump)))
-      (when got (render tm))
-      (sleep 1/60))))
+        (stream-error () (%note-exit tm) (setf got t)))
+      (when got (render tm)))
+    got))
+
+(defun %note-exit (tm)
+  (unless (terminal-exited tm)
+    (setf (terminal-exited tm) t)
+    (when (terminal-proc tm) (ignore-errors (sb-ext:process-wait (terminal-proc tm))))
+    (terminal-write tm (format nil "~&~%[process exited]"))))
+
+(defun terminal-write (tm string)
+  "Put STRING on the screen as if the far end had written it: control sequences are obeyed, and
+   a bare newline also returns the carriage (there is no tty discipline here to do it).  Then
+   RENDER."
+  (loop for c across string
+        do (when (char= c #\Newline) (feed-char tm #\Return))
+           (feed-cp tm (char-code c)))
+  (render tm))
+
+(defun terminal-text (tm)
+  "The screen as text: one string per row, trailing blanks trimmed."
+  (loop for y below (terminal-rows tm)
+        collect (string-right-trim
+                 " " (coerce (loop for x below (terminal-cols tm)
+                                   for c = (ch-code (tchar tm x y))
+                                   collect (if (< 31 c #x110000) (code-char c) #\Space))
+                             'string))))
+
+(defun pump (tm)
+  "Poll the shell's output until it exits: TERMINAL-POLL on a thread of its own."
+  (loop until (terminal-exited tm)
+        do (terminal-poll tm)
+           (sleep 1/60)))
 
 (defun start-pump (tm)
   "Spawn the shell-output pump thread; it renders into (terminal-fb TM).  Use
-   when embedding a terminal (e.g. as a WM window) rather than the standalone RUN."
+   when embedding a terminal (e.g. as a WM window) rather than the standalone RUN.
+   (A host with one thread per app -- modus, where threads share nothing -- calls
+   TERMINAL-POLL itself instead; see TERMINAL-APP.)"
   (sb-thread:make-thread (lambda () (ignore-errors (pump tm))) :name "glass-term-pump"))
+
+;;; ---- a terminal as a window manager application ---------------------------
+
+(defparameter *app-ppem* 14 "TERMINAL-APP's text size.")
+
+(defun terminal-app (fb)
+  "Terminal: bash on a pseudo-terminal, as a glass application (the contract glass.wm and
+   glass.desk call: the window's content FB in, (values ON-KEY ON-POINTER DIRTY-P COPY-P CLOSE-FN
+   RESIZE-FN TEXT-P) out).  The grid is drawn into FB itself, snapped to whole cells; the shell's
+   output is read in DIRTY-P, on the caller's thread, so the terminal has no thread of its own --
+   which is what lets it run where threads share nothing (modus).  Resizing re-cells the grid and
+   tells the shell (TIOCSWINSZ, so it gets SIGWINCH); closing hangs the shell up."
+  (multiple-value-bind (cw ch) (%cell-metrics (car (term-fonts)) *app-ppem*)
+    (let ((tm (make-terminal :cols (max 2 (floor (glass:fb-width fb) cw))
+                             :rows (max 1 (floor (glass:fb-height fb) ch))
+                             :ppem *app-ppem* :fb fb)))
+      (render tm)
+      (values (lambda (down keysym) (on-key tm down keysym))
+              (lambda (mask x y) (on-mouse tm mask x y))
+              (lambda () (terminal-poll tm) (terminal-take-dirty tm))
+              nil
+              (lambda () (kill-terminal tm))
+              (lambda (w h) (resize-terminal-px tm w h))
+              t))))
 
 ;;; ---- tabbed terminal --------------------------------------------------------
 ;;; One window, several shells: a tab bar across the top, the active shell below.
