@@ -133,8 +133,9 @@ messages, pixels through the shared screen framebuffer -- so it runs where threa
   :description "The McCLIM desktop's window manager without McCLIM: OPEN LOOK chrome, raise and
 focus, a drag that moves by CopyRect and goes wireframe when the link lags, resize, the root and
 window menus -- one seat, surface windows only, served by SERVE-WM in SERVE-DESK's shape (a
-network thread and one compositor thread that owns every window), so it runs on modus."
-  :depends-on ("glass" "glass/text" "glass/desk-apps")
+network thread and one compositor thread that owns every window), so it runs on modus.  Its
+root menu adds a Lisp listener (glass/repl) and a Terminal (glass/term) to the desk's apps."
+  :depends-on ("glass" "glass/text" "glass/desk-apps" "glass/term" "glass/repl")
   :serial t
   :components ((:module "src/wm" :serial t
                 :components ((:file "package") (:file "chrome") (:file "wm") (:file "serve")))))
@@ -312,15 +313,13 @@ no X.  (sb-ext:run-program + one winsize ioctl are the platform seam.)"
 
 (asdf:defsystem :glass/repl
   :description "The terminal with a Lisp listener on the other end instead of a
-shell.  glass/term's grid, VT parser and scribe rendering are portable Common
-Lisp; the pty, the shell and two ioctls were the only Unix in it, and on a Lisp
-machine none of those exist.  TERMINAL-PTY is just a bidirectional character
-stream, so this is a stream pair and a read-eval-print loop on the far end -- no
-pty, no fork, no shell, no FFI."
+shell: REPL-APP, a window that edits a line and sends each form to a listener on
+the image's main thread (RUN-LISTENER), by messages -- share-nothing, so it runs
+on modus.  glass/term's grid, VT parser and scribe rendering draw it."
   :version "0.0.1"
   :author "ynniv"
   :license "MIT"
-  :depends-on ("glass/term")   ; sb-gray is in SBCL itself, not a module
+  :depends-on ("glass" "glass/term")   ; sb-gray is in SBCL itself (and modus), not a module
   :serial t
   :components ((:module "src" :serial t :components ((:file "repl")))))
 

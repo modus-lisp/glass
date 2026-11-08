@@ -1294,9 +1294,15 @@ its bytes would land in the middle of a rect."
   stream fd conn client)
 
 (defun %peer-input-p (peer)
-  (or (listen (peer-stream peer))
-      (let ((fd (peer-fd peer)))
-        (and fd (sb-sys:wait-until-fd-usable fd :input 0)))))
+  "Has PEER sent something?  A connection the client RESET answers T: LISTEN signals on it
+   (SBCL: `couldn't read ... Connection reset by peer'), and that signal used to escape
+   SERVE-MULTI and end the whole desktop because one viewer closed with bytes unread; the
+   read that follows fails inside its handler and drops just that peer."
+  (handler-case
+      (or (listen (peer-stream peer))
+          (let ((fd (peer-fd peer)))
+            (and fd (sb-sys:wait-until-fd-usable fd :input 0))))
+    (error () t)))
 
 (defun %listener-fd (listen)
   (socket-fd (if (typep listen 'sb-bsd-sockets:socket) listen (listener-socket listen))))
