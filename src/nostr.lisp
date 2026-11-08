@@ -2258,6 +2258,32 @@ live credential minted for a request nobody made.")
       (:denied (incf (nostr-bot-denied bot)))
       (:ignored (incf (nostr-bot-ignored bot))))))
 
+(defun %bot-publish (bot wrap what)
+  "Publish WRAP on BOT's relays, and log what each relay did with it: one line per relay that
+answers, saying ACCEPTED or REJECTED with the relay's own reason.  Returns the urls of the relays
+it was handed to -- NIL when none was connected, which is said out loud too.
+
+POOL-PUBLISH IS FIRE AND FORGET, and the bot's log used to say `-> replied' on the strength of it.
+A reply a relay refused (rate limit, clock skew, policy), or that went to a relay whose socket had
+died, read exactly like one that was delivered -- so `the box said it replied and nothing came' had
+nowhere to be diagnosed from.  The relay's OK is the only evidence an event was published (see
+CL-NOSTR.POOL:POOL-PUBLISH-SYNC); this waits for nothing, it only writes the evidence down when it
+arrives.  WHAT names the message in those lines."
+  (let* ((pool (nostr-bot-pool bot))
+         (id8 (subseq (or (ignore-errors (cl-nostr.event:event-id wrap)) "????????") 0 8))
+         (live (loop for relay in (cl-nostr.pool::%relays pool)
+                     when (cl-nostr.relay:relay-connected-p relay)
+                       collect (cl-nostr.relay:relay-url relay))))
+    (cl-nostr.pool:pool-publish
+     pool wrap
+     :on-ok (lambda (relay accepted msg)
+              (%bot-say bot "~a (~a): ~:[REJECTED by~;accepted by~] ~a~@[ — ~a~]"
+                        what id8 accepted (ignore-errors (cl-nostr.relay:relay-url relay))
+                        (and (stringp msg) (plusp (length msg)) msg))))
+    (unless live
+      (%bot-say bot "~a (~a): NOT SENT — no relay is connected" what id8))
+    live))
+
 (defun %bot-handle (bot wrap)
   "One gift wrap.  Never signals: a bad DM is a log line, not a bot that stops listening."
   (handler-case
@@ -2282,16 +2308,19 @@ live credential minted for a request nobody made.")
                (%bot-say bot "~(~a~) DENIED ~a… (~:[not authorised~;device: management is allowlist-only~])"
                          verb (subseq sender 0 8) (eq role :device)))
               (t
-               (cl-nostr.pool:pool-publish
-                (nostr-bot-pool bot)
-                ;; :AFTER — stamp the reply strictly later than the DM it answers.  We often reply
-                ;; inside the same second and the box's clock need not agree with the phone's;
-                ;; either way the answer would otherwise sort ABOVE the question in the recipient's
-                ;; client, which reads as the box talking to itself.
-                (cl-nostr.nip59:build-giftwrap (nostr-bot-keypair bot) sender reply :after rumor-at))
-               (%bot-count bot :answered)
-               (%bot-say bot "~(~a~) from ~a… (~(~a~)) -> replied"
-                         verb (subseq sender 0 8) (or role :unknown)))))))
+               (let ((via (%bot-publish
+                           bot
+                           ;; :AFTER — stamp the reply strictly later than the DM it answers.  We
+                           ;; often reply inside the same second and the box's clock need not agree
+                           ;; with the phone's; either way the answer would otherwise sort ABOVE the
+                           ;; question in the recipient's client, which reads as the box talking to
+                           ;; itself.
+                           (cl-nostr.nip59:build-giftwrap (nostr-bot-keypair bot) sender reply
+                                                          :after rumor-at)
+                           (format nil "~(~a~) reply to ~a…" verb (subseq sender 0 8)))))
+                 (%bot-count bot :answered)
+                 (%bot-say bot "~(~a~) from ~a… (~(~a~)) -> replied~:[ — but NO relay was connected~; via ~:*~{~a~^, ~}~]"
+                           verb (subseq sender 0 8) (or role :unknown) via)))))))
     (serious-condition (e) (%bot-say bot "dm: ~a" e))))
 
 (defun start-nostr-bot (&key (relays *nostr-relays*) log (install t))
@@ -2370,15 +2399,16 @@ still has the generic default, which would name nothing."
             (let ((url (format nil "~a#~a" *login-url-base* (login-link-fragment token))))
               (handler-case
                   (progn
-                    (cl-nostr.pool:pool-publish
-                     (nostr-bot-pool bot)
+                    (%bot-publish
+                     bot
                      (cl-nostr.nip59:build-giftwrap
                       (nostr-bot-keypair bot) pubkey
                       (format nil "Your glass desktop~@[ ~a~] is up (expires in ~a min):~%~%~a~@[~%~%~a~]"
                               (%session-name-for-dm)
                               (max 1 (round ttl 60)) url
                               (and (integerp killed) (plusp killed)
-                                   "This replaces any earlier link I sent you."))))
+                                   "This replaces any earlier link I sent you.")))
+                     (format nil "login link to ~a…" (subseq pubkey 0 8)))
                     (format *error-output* "~&@@ link: DM'd to ~a…~%" (subseq pubkey 0 8))
                     (finish-output *error-output*)
                     url)

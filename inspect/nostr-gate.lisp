@@ -1243,6 +1243,41 @@ wherever it matters, because the file is the half that survives a restart."
                        said))))
 
 ;;; ==============================================================================
+(banner "a reply says what the relays did with it")
+;;; ==============================================================================
+;;; POOL-PUBLISH is fire and forget, and the bot used to log `-> replied' on the strength of the
+;;; call returning.  A refusal (rate limit, clock skew) read exactly like a delivery.  No relay
+;;; here: a relay object that is "connected" but has no socket, and the relay's OK fed to it the
+;;; way its reader would.
+
+(let* ((said '())
+       (kp (cl-nostr.keys:keypair-from-secret *secret*))
+       (relay (cl-nostr.relay::%make-relay :url "wss://relay.test"))
+       (pool (cl-nostr.pool::%make-pool))
+       (bot (glass::%make-nostr-bot :pool pool :keypair kp :log (lambda (m) (push m said))))
+       (wrap (cl-nostr.nip59:build-giftwrap kp (cl-nostr.keys:public-hex kp) "hello")))
+  (ok "with no relay connected, nothing is handed over -- and the log says NOT SENT"
+      (and (null (glass::%bot-publish bot wrap "test reply"))
+           (search "NOT SENT" (or (first said) ""))))
+  (setf (cl-nostr.relay::relay-connected-p relay) t
+        (cl-nostr.pool::pool-relays pool) (list relay)
+        said '())
+  (ok "with one connected, it is the relay the reply was handed to"
+      (equal (glass::%bot-publish bot wrap "test reply") '("wss://relay.test")))
+  (cl-nostr.relay::%dispatch relay (format nil "[\"OK\",\"~a\",false,\"rate-limited: slow down\"]"
+                                           (cl-nostr.event:event-id wrap)))
+  (ok "a refusal is logged as one, with the relay and its reason"
+      (let ((l (first said)))
+        (and l (search "REJECTED by wss://relay.test" l) (search "rate-limited" l)))
+      (first said))
+  (setf said '())
+  (glass::%bot-publish bot wrap "test reply")
+  (cl-nostr.relay::%dispatch relay (format nil "[\"OK\",\"~a\",true,\"\"]" (cl-nostr.event:event-id wrap)))
+  (ok "an acceptance is logged as one"
+      (let ((l (first said))) (and l (search "accepted by wss://relay.test" l)))
+      (first said)))
+
+;;; ==============================================================================
 (banner "the live enrolment file was never opened")
 ;;; ==============================================================================
 
