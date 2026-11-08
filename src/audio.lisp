@@ -579,6 +579,15 @@ sends silence for that slot and keeps its own clock, which is what its packets' 
 webrtc-media's :source, or anything else that asks for the next frame."
   (lambda () (sink-next-frame s)))
 
+;;; ---- decoding off the loading thread ---------------------------------------------
+
+(defun call-with-decoder-tables (fn)
+  "Call FN with reed's lazily built decoder tables (Opus's FFT, AAC's Huffman, ...) private to
+   this thread, for as long as FN runs.  A thread that is not the one that loaded reed and decodes
+   -- a desktop's compositor playing Media -- runs inside this: on modus the tables it would build
+   could not be stored in reed's globals, which belong to the loading thread."
+  (reed:with-thread-state () (funcall fn)))
+
 ;;; ---- the session's mixer ---------------------------------------------------
 ;;;
 ;;; A session has ONE sound, so the process running the desktop has one mixer, and the things

@@ -10,7 +10,8 @@
 
 (in-package #:glass.desk)
 
-(export '(clock-app notes-app paint-app media-app *media-root* *standard-apps*))
+(export '(clock-app notes-app paint-app media-app *media-root* *media-mixer* *standard-apps*
+          call-with-media-thread))
 
 (defun clock-app (fb)
   "Clock: the time, redrawn once a second, and the date under it."
@@ -213,6 +214,30 @@
   "The library every Media window shares, made on first open.  SERVE-DESK's compositor binds it,
    so the library belongs to the thread whose apps use it.")
 
+(defvar *media-mixer* nil
+  "The mixer the Media player is a source on, or NIL to play with no sound (the picture and the
+   position then go by the wall clock).  Bound by the compositor that owns it: under SERVE-WM it
+   is the compositor's own clockless mixer (glass.wm's sound), ticked by the compositor's loop.")
+
+(defparameter *media-cooperative* t
+  "Decode on the compositor's thread (warp-media's *COOPERATIVE*), between composites, rather than
+   on a decoder thread of warp's own.  The compositor owns the player; on modus a decoder thread
+   would have to share it, and that is the thing threads there cannot do.")
+
+(defun call-with-media-thread (fn)
+  "Call FN with this thread set up to own Media players: its own library cache, warp's decoder
+   running cooperatively on it, and reed's decoder tables its own (GLASS:CALL-WITH-DECODER-TABLES).
+   Every desktop's compositor thread runs inside this."
+  (let* ((*media-library* nil)
+         (coop (and (find-package "WARP-MEDIA") (find-symbol "*COOPERATIVE*" "WARP-MEDIA")))
+         (tables (find-symbol "CALL-WITH-DECODER-TABLES" "GLASS"))      ; glass/audio's, if loaded
+         (body (if coop
+                   (lambda () (progv (list coop) (list *media-cooperative*) (funcall fn)))
+                   fn)))
+    (if (and coop tables (fboundp tables))
+        (funcall tables body)
+        (funcall body))))
+
 (defun media-app (fb)
   "Media: warp's player over *MEDIA-ROOT*.  Needs the warp-media-glass system loaded."
   (let ((make-lib (and (find-package "WARP-MEDIA") (find-symbol "MAKE-LIBRARY" "WARP-MEDIA")))
@@ -223,7 +248,8 @@
                (glass:fb-text fb 16 20 "Media needs warp-media-glass loaded." :size 14 :color #xe6ebf2)
                (values nil nil (let ((once t)) (lambda () (prog1 once (setf once nil))))))
         (let ((lib (or *media-library*
-                       (setf *media-library* (funcall make-lib :root (or *media-root* "./"))))))
+                       (setf *media-library* (funcall make-lib :root (or *media-root* "./")
+                                                         :mixer *media-mixer*)))))
           ;; FIVE values, then no RESIZE-FN and no TEXT-P: the player's sixth value is its
           ;; consumer, which a desktop would read as RESIZE-FN (and once read as TEXT-P, raising a
           ;; keyboard for it -- kiln found that).

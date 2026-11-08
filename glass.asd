@@ -140,6 +140,15 @@ root menu adds a Lisp listener (glass/repl) and a Terminal (glass/term) to the d
   :components ((:module "src/wm" :serial t
                 :components ((:file "package") (:file "chrome") (:file "wm") (:file "serve")))))
 
+(asdf:defsystem :glass/wm-sound
+  :description "The window manager's sound, with no thread of its own: the compositor mixes its
+apps' sources on a clockless glass mixer, ticked by its loop, and the network thread serves the mix
+as glass-audio/1 (SERVE-WM :AUDIO-PORT) -- START-AUDIO-STREAM's wire, so the WebRTC gateway hears
+it as it heard the McCLIM desktop."
+  :depends-on ("glass/wm" "glass/audio" "glass/audio-stream")
+  :serial t
+  :components ((:module "src/wm" :serial t :components ((:file "sound")))))
+
 (asdf:defsystem :glass/audio
   :description "The session's sound: one mix, read by however many listeners a
 session has.  Sources are reed source-thunks; the mix runs on its OWN 20 ms clock

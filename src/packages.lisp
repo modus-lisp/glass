@@ -66,7 +66,7 @@
    #:mix #:mix-p #:make-mix #:remove-mix #:as-mix #:mix-name #:mix-bus #:mix-seq #:mix-level
    #:mix-sinks #:mix-source-gain #:mix-mute #:mix-unmute #:mix-hears-p #:mix-report
    #:mixer-default-mix #:mixer-default #:mixer-mixes #:mixer-find-source #:mixer-capacity
-   #:*mixer-rate* #:*mixer-frame-ms* #:session-mixer #:*session-mixer* #:mixer-add-file
+   #:*mixer-rate* #:*mixer-frame-ms* #:session-mixer #:*session-mixer* #:mixer-add-file #:call-with-decoder-tables
    ;; the mix over a socket (the :glass/audio-stream system) — server and listener
    #:start-audio-stream #:stop-audio-stream #:audio-stream #:audio-stream-p #:audio-stream-report
    #:audio-stream-port #:audio-stream-mixer #:audio-stream-mix #:audio-stream-running
