@@ -7,7 +7,8 @@
 ;;;;
 ;;;; AN APPLICATION IS THE SAME CONTRACT THE WM'S SURFACE APPS USE, so one written for the full
 ;;;; desktop runs here unchanged: a MAKE-FN called with the window's content framebuffer, returning
-;;;; (values ON-KEY ON-POINTER DIRTY-P [COPY-P CLOSE-FN TEXT-P]).  ON-KEY (down keysym) and ON-POINTER
+;;;; (values ON-KEY ON-POINTER DIRTY-P [COPY-P CLOSE-FN RESIZE-FN TEXT-P]) -- the window manager's
+;;;; order, RESIZE-FN sixth; the desk has no resize corner and ignores it.  ON-KEY (down keysym) and ON-POINTER
 ;;;; (mask x y) take window-local coordinates; DIRTY-P is polled every tick and answers whether
 ;;;; the content changed; CLOSE-FN, if given, runs when the window closes.  TEXT-P says the app
 ;;;; takes typing: while its window has the focus (it was opened, or last tapped into) the host's
@@ -104,8 +105,9 @@
                (n (desk-cascade desk))
                (x (+ *border* (mod (* n 24) (max 1 (- sw w (* 2 *border*))))))
                (y (+ *title-h* *border* (mod (* n 24) (max 1 (- sh h *title-h* (* 2 *border*)))))))
-          (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn text-p) (funcall make-fn fb)
-            (declare (ignore copy-p))
+          (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn resize-fn text-p)
+              (funcall make-fn fb)
+            (declare (ignore copy-p resize-fn))
             (incf (desk-cascade desk))
             (let ((win (make-window :title lbl :x x :y y :w w :h h :fb fb :on-key on-key
                                     :on-pointer on-pointer :dirty-p dirty-p :close-fn close-fn

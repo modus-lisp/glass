@@ -893,7 +893,11 @@ its bytes would land in the middle of a rect."
                      ;; box diffs only that and trusts the copy; a :FULL mark (or full request) is a
                      ;; whole-screen diff with no copy.
                      (multiple-value-bind (frame damage copy mark-time) (fb-take-frame fb)
-                       (when (and damage (plusp mark-time)) (note-send-lag mark-time))  ; backlog clock
+                       ;; backlog clock -- INCREMENTAL requests only.  A full request is a client
+                       ;; (re)starting, and the change it takes may have been marked long before
+                       ;; anybody connected: folding that in read a fresh viewer as seconds behind
+                       ;; (3.2 s measured) and sent its first drag wireframe.
+                       (when (and damage (plusp mark-time) incremental) (note-send-lag mark-time))
                        (let* ((region (if (and incremental (consp damage)) damage :full))
                               (copy   (and incremental (consp damage) copy))
                               (tx (list 0)) (t0 (get-internal-real-time))

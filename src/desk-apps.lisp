@@ -1,8 +1,10 @@
 ;;;; desk-apps.lisp — the desk's own applications: Clock, Notes, Paint, and Media from warp.
 ;;;;
 ;;;; Each is a desk application (DESK-REGISTER-APP's MAKE-FN: called with the window's content
-;;;; framebuffer, returning ON-KEY ON-POINTER DIRTY-P [COPY-P CLOSE-FN TEXT-P]) and a GLOBAL
-;;;; FUNCTION, so SERVE-DESK can hand it to its compositor thread by name.  Clock and Notes
+;;;; framebuffer, returning ON-KEY ON-POINTER DIRTY-P [COPY-P CLOSE-FN RESIZE-FN TEXT-P]) and a
+;;;; GLOBAL FUNCTION, so SERVE-DESK and SERVE-WM can hand it to their compositor thread by name.
+;;;; RESIZE-FN (w h) resizes the content -- the app FB-RESIZEs its own framebuffer -- and is what
+;;;; gives a window the window manager's resize corner; the desk ignores it.  Clock and Notes
 ;;;; came from kiln's phone desk (kiln-android boot/app.lisp), unchanged but for the names
 ;;;; and the Clock's second line.
 
@@ -178,6 +180,7 @@
                 (when (logbitp 0 mask) (place (row-at-y y) x)))
               (lambda () (when dirty (setf dirty nil) (redraw) t))
               nil nil
+              (lambda (w h) (glass:fb-resize fb w h paper) (changed))   ; re-wrap at the new width
               t))))                       ; it takes typing: focusing it brings up the keyboard
 
 (defun paint-app (fb)
@@ -193,7 +196,10 @@
        (when down
          (glass:fb-rect fb (- x 3) (- y 3) 6 6 #x1d3557)
          (setf dirty t)))
-     (lambda () (prog1 dirty (setf dirty nil))))))
+     (lambda () (prog1 dirty (setf dirty nil)))
+     nil nil
+     ;; a new size is a new canvas: FB-RESIZE does not keep pixels, and neither does Paint
+     (lambda (w h) (glass:fb-resize fb w h #xf4f1ea) (setf dirty t)))))
 
 ;;; ---- Media, from warp --------------------------------------------------------------------------
 ;;;
@@ -209,7 +215,7 @@
 
 (defun media-app (fb)
   "Media: warp's player over *MEDIA-ROOT*.  Needs the warp-media-glass system loaded."
-  (let ((make-lib (find-symbol "MAKE-LIBRARY" "WARP-MEDIA"))
+  (let ((make-lib (and (find-package "WARP-MEDIA") (find-symbol "MAKE-LIBRARY" "WARP-MEDIA")))
         (make-win (and (find-package "WARP-MEDIA-GLASS")
                        (find-symbol "MAKE-MEDIA-WINDOW" "WARP-MEDIA-GLASS"))))
     (if (not (and make-lib make-win))
@@ -218,10 +224,11 @@
                (values nil nil (let ((once t)) (lambda () (prog1 once (setf once nil))))))
         (let ((lib (or *media-library*
                        (setf *media-library* (funcall make-lib :root (or *media-root* "./"))))))
-          ;; FIVE values, then NIL: the player's sixth value is its consumer, which the desk
-          ;; would read as TEXT-P and raise a keyboard for (kiln found this).
+          ;; FIVE values, then no RESIZE-FN and no TEXT-P: the player's sixth value is its
+          ;; consumer, which a desktop would read as RESIZE-FN (and once read as TEXT-P, raising a
+          ;; keyboard for it -- kiln found that).
           (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn) (funcall make-win fb lib)
-            (values on-key on-pointer dirty-p copy-p close-fn nil))))))
+            (values on-key on-pointer dirty-p copy-p close-fn nil nil))))))
 
 (defparameter *standard-apps*
   '(("Clock" clock-app :width 260 :height 110)

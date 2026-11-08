@@ -115,7 +115,7 @@
   (glass.desk:desk-register-app d "K" (lambda (fb) (declare (ignore fb))
                                         (values (lambda (down ks) (when down (push ks keys)))
                                                 (lambda (m x y) (declare (ignore m x y)))
-                                                (lambda () nil) nil nil t))
+                                                (lambda () nil) nil nil nil t))
                                 :width 200 :height 100)
   (glass.desk:desk-register-app d "L" (lambda (fb) (declare (ignore fb)) (values nil nil (lambda () nil)))
                                 :width 200 :height 100)

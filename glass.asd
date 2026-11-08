@@ -112,14 +112,32 @@ MAKE-FN contract as the full desktop's surface apps (mcclim-glass's REGISTER-APP
   :serial t
   :components ((:module "src" :serial t :components ((:file "desk")))))
 
+(asdf:defsystem :glass/desk-apps
+  :description "The desktop's standard applications -- Clock, Notes, Paint, Media -- as global
+functions over the app contract both desktops host (glass/desk and glass/wm), and
+*STANDARD-APPS*, the menu they make."
+  :depends-on ("glass/desk" "glass/text")
+  :serial t
+  :components ((:module "src" :serial t :components ((:file "desk-apps")))))
+
 (asdf:defsystem :glass/desk-serve
   :description "The desk served over RFB with a thread per concern: the calling thread is the
 network (SERVE-MULTI, every viewer), a second thread composites the desk.  Input crosses as
 messages, pixels through the shared screen framebuffer -- so it runs where threads share nothing
 (modus) as well as on SBCL."
-  :depends-on ("glass" "glass/desk")
+  :depends-on ("glass" "glass/desk-apps")
   :serial t
-  :components ((:module "src" :serial t :components ((:file "desk-apps") (:file "desk-serve")))))
+  :components ((:module "src" :serial t :components ((:file "desk-serve")))))
+
+(asdf:defsystem :glass/wm
+  :description "The McCLIM desktop's window manager without McCLIM: OPEN LOOK chrome, raise and
+focus, a drag that moves by CopyRect and goes wireframe when the link lags, resize, the root and
+window menus -- one seat, surface windows only, served by SERVE-WM in SERVE-DESK's shape (a
+network thread and one compositor thread that owns every window), so it runs on modus."
+  :depends-on ("glass" "glass/text" "glass/desk-apps")
+  :serial t
+  :components ((:module "src/wm" :serial t
+                :components ((:file "package") (:file "chrome") (:file "wm") (:file "serve")))))
 
 (asdf:defsystem :glass/audio
   :description "The session's sound: one mix, read by however many listeners a
