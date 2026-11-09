@@ -25,11 +25,15 @@
            #:desk-fb #:desk-windows #:desk-apps #:desk-redraw #:desk-keyboard-fn
            ;; sizes a host may set for its screen: a phone at one desk pixel per point wants
            ;; touch-sized bars and rows (44 is iOS's minimum touch target)
-           #:*title-h* #:*menu-item-h* #:*menu-w* #:*font-size*))
+           #:*title-h* #:*menu-item-h* #:*menu-w* #:*font-size* #:*desk-copy*))
 
 (in-package #:glass.desk)
 
 (defparameter *title-h* 24 "Title bar height.")
+(defparameter *copy-w* 52 "Width of the title bar's copy box, left of the close box.")
+(defvar *desk-copy* nil
+  "The host's copy: a function of a string, given the text a window's copy box copies (the
+   host puts it on its clipboard).  NIL: the copy box does nothing.")
 (defparameter *border* 1)
 (defparameter *menu-item-h* 30)
 (defparameter *menu-w* 180)
@@ -49,7 +53,7 @@
 
 (defstruct (window (:conc-name win-))
   title x y w h            ; content size; the frame adds the title bar and border
-  fb on-key on-pointer dirty-p close-fn
+  fb on-key on-pointer dirty-p close-fn copy-fn
   (text-p nil)             ; the app takes typing: focusing it brings up the keyboard
   (pressed nil))           ; the content holds the pointer (down landed in it)
 
@@ -107,11 +111,11 @@
                (y (+ *title-h* *border* (mod (* n 24) (max 1 (- sh h *title-h* (* 2 *border*)))))))
           (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn resize-fn text-p)
               (funcall make-fn fb)
-            (declare (ignore copy-p resize-fn))
+            (declare (ignore resize-fn))
             (incf (desk-cascade desk))
             (let ((win (make-window :title lbl :x x :y y :w w :h h :fb fb :on-key on-key
                                     :on-pointer on-pointer :dirty-p dirty-p :close-fn close-fn
-                                    :text-p text-p)))
+                                    :text-p text-p :copy-fn copy-p)))
               (let ((old-top (first (desk-windows desk))))
                 (push win (desk-windows desk))
                 (when old-top (%damage-frame desk old-top)))   ; its title bar dims
@@ -150,6 +154,7 @@
       (when (and (<= fx x) (< x (+ fx fw)) (<= fy y) (< y (+ fy fh)))
         (return
           (values w (cond ((>= y (win-y w)) :content)
+                          ((and (win-copy-fn w) (>= x (- (+ fx fw) *title-h* *copy-w*)) (< x (- (+ fx fw) *title-h*))) :copy)
                           ((>= x (- (+ fx fw) *title-h*)) :close)
                           (t :title))))))))
 
@@ -212,6 +217,9 @@
             (multiple-value-bind (mx my mw mh) (%menu-box desk)
               (%damage desk (1- mx) (1- my) (+ mw 2) (+ mh 2))))
            ((eq part :close) (%close desk win))
+           ((eq part :copy)
+            (let ((text (funcall (win-copy-fn win))))
+              (when (and text *desk-copy*) (funcall *desk-copy* text))))
            ((eq part :title)
             ;; dragging the focused window keeps its typing; picking up another one takes it away
             (unless (eq win (desk-focus desk)) (%focus desk nil))
@@ -266,6 +274,12 @@
     (let ((cx (- (+ fx fw) *title-h*)) (cy fy))
       (glass:fb-text fb (+ cx (floor (- *title-h* (glass:text-width "x" :size *font-size*)) 2))
                      (%text-top cy *title-h*) "x" :size *font-size* :color *title-fg*))
+    ;; the copy box, left of the close box, when the app has text to give
+    (when (win-copy-fn win)
+      (let* ((x0 (- (+ fx fw) *title-h* *copy-w*))
+             (tw (glass:text-width "copy" :size *font-size*)))
+        (glass:fb-text fb (+ x0 (floor (- *copy-w* tw) 2)) (%text-top fy *title-h*) "copy"
+                       :size *font-size* :color *title-fg*)))
     (%blit fb (win-fb win) (win-x win) (win-y win))))
 
 (defun %draw-menu (desk)
