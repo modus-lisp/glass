@@ -57,6 +57,14 @@
            (type (simple-array (unsigned-byte 32) (*)) px palette)
            (type fixnum i fw ax ay tw th) (optimize (speed 3) (safety 0))
            (ignore index))
+  ;; modus: a solid tile is one native compare per row (x86-64's KERNEL); the scan below keeps
+  ;; its variables in frame slots there, and most of a desk frame's tiles are solid
+  #+modus
+  (when (fboundp 'modus.runtime::%u32-rect-uniform-p)
+    (let ((c0 (aref px (+ (* ay fw) ax))))
+      (when (modus.runtime::%u32-rect-uniform-p px fw ax ay tw th c0)
+        (setf (aref buf i) 1) (incf i) (%wcpix buf i c0 fmt)
+        (return-from zrle-tile i))))
   (let ((psize 0) (over nil) (last -1))
     (declare (fixnum psize last))
     (block scan
@@ -73,6 +81,12 @@
     (cond
       (over                                              ; subencoding 0: raw CPIXELs
        (setf (aref buf i) 0) (incf i)
+       ;; modus: a row of native CPIXELs is one native copy (x86-64's BULK-MOVE)
+       #+modus
+       (when (and (null fmt) (fboundp 'modus.runtime::%u32-to-cpixels))
+         (dotimes (ly th)
+           (setf i (modus.runtime::%u32-to-cpixels buf i px (+ (* (+ ay ly) fw) ax) tw)))
+         (return-from zrle-tile i))
        (dotimes (ly th)
          (let ((row (* (+ ay ly) fw))) (declare (fixnum row))
            (dotimes (lx tw) (%wcpix buf i (aref px (+ row ax lx)) fmt)))))
