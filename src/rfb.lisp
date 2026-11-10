@@ -275,6 +275,15 @@
 
 ;;; ---- snapshots + dirty-tile detection --------------------------------------
 
+(defun copy-pixels-into (fb old)
+  "A copy of FB's pixels, into OLD when OLD is the same size: a full-frame snapshot replaces the
+   previous one whole, so its array can be reused.  A fresh 1.2 MB array per full frame was most of
+   a modus desk's ZRLE allocation."
+  (let ((p (fb-pixels fb)))
+    (if (and old (= (length old) (length p)))
+        (progn (replace old p) old)
+        (copy-pixels fb))))
+
 (defun copy-pixels (fb)
   (let* ((p (fb-pixels fb))
          (c (make-array (length p) :element-type '(unsigned-byte 32))))
@@ -395,20 +404,47 @@
       (snapshot-scroll snap fbw sy dy h)
       (snapshot-move snap fbw sx sy dx dy w h)))
 
+(defparameter *raw-chunk-bytes* 40960
+  "Raw rects are streamed through one buffer of about this many bytes: big enough that each
+   write goes straight to the stream's page path (past its 16 KB output buffer), small enough
+   to stay in cache.  A whole-band buffer was a fresh 164 KB array per band, and its traffic
+   through the cache cost more than the copy it saved.")
+
+(defun raw-fill-rows (buf px fw x y0 w n)
+  "BUF := the native (B,G,R,0) bytes of N rows of PX from row Y0, columns X..X+W, from the start of BUF."
+  (declare (type (simple-array (unsigned-byte 8) (*)) buf) (type (simple-array (unsigned-byte 32) (*)) px)
+           (fixnum fw x y0 w n) (optimize (speed 3) (safety 0)))
+  (let ((o 0))
+    (declare (fixnum o))
+    (loop for yy fixnum from y0 below (+ y0 n) for row fixnum = (* yy fw) do
+      (loop for xx fixnum from x below (+ x w) for p of-type (unsigned-byte 32) = (aref px (+ row xx)) do
+        (setf (aref buf o) (logand p #xff)
+              (aref buf (+ o 1)) (logand (ash p -8) #xff)
+              (aref buf (+ o 2)) (logand (ash p -16) #xff)
+              (aref buf (+ o 3)) 0)
+        (setf o (the fixnum (+ o 4)))))
+    buf))
+
 (defun write-rect-raw (s fb x y w h &optional fmt)
   (w-u16 s x) (w-u16 s y) (w-u16 s w) (w-u16 s h) (w-u32 s +enc-raw+)
-  (let* ((px (fb-pixels fb)) (fw (fb-width fb)) (pb (if fmt (pxfmt-pbytes fmt) 4))
-         (buf (make-array (* w h pb) :element-type '(unsigned-byte 8))) (o 0))
-    (loop for yy from y below (+ y h) for row = (* yy fw) do
-      (loop for xx from x below (+ x w) for p = (aref px (+ row xx)) do
-        (if fmt
-            (setf o (put-px buf o p fmt))
-            (progn (setf (aref buf o)       (logand p #xff)             ; B (little-endian)
-                         (aref buf (+ o 1)) (logand (ash p -8) #xff)    ; G
-                         (aref buf (+ o 2)) (logand (ash p -16) #xff)   ; R
-                         (aref buf (+ o 3)) 0)                           ; X
-                   (incf o 4)))))
-    (w-bytes s buf)))
+  ;; modus: the pixels go straight through the socket's I/O page, one store each (no byte array)
+  #+modus
+  (when (and (null fmt) (modus.runtime::%fs-write-pixel-rows s (fb-pixels fb) (fb-width fb) x y w h))
+    (return-from write-rect-raw nil))
+  (if fmt
+      (let* ((px (fb-pixels fb)) (fw (fb-width fb)) (pb (pxfmt-pbytes fmt))
+             (buf (make-array (* w h pb) :element-type '(unsigned-byte 8))) (o 0))
+        (loop for yy from y below (+ y h) for row = (* yy fw) do
+          (loop for xx from x below (+ x w) for p = (aref px (+ row xx)) do
+            (setf o (put-px buf o p fmt))))
+        (w-bytes s buf))
+      (let* ((px (fb-pixels fb)) (fw (fb-width fb)) (rowbytes (* 4 w))
+             (rows (max 1 (floor *raw-chunk-bytes* (max 1 rowbytes))))
+             (buf (make-array (* rows rowbytes) :element-type '(unsigned-byte 8))))
+        (loop for y0 from y below (+ y h) by rows do
+          (let ((n (min rows (- (+ y h) y0))))
+            (raw-fill-rows buf px fw x y0 w n)
+            (write-sequence buf s :end (* n rowbytes)))))))
 
 ;;; ---- Hextile encoding (RFC 6143 §7.7.4) ------------------------------------
 ;;; Each 16x16 tile: a solid tile costs a byte (or a byte + colour); a tile of a
@@ -504,7 +540,7 @@
    ZRLE client, and nearly as fast, so it's the universal big-frame path.  Kept as
    a flag in case a specific client benefits and is known to decode our TRLE.")
 
-(defun emit-rect (s fb x y w h enc zs trle &optional fmt)
+(defun emit-rect (s fb x y w h enc zs trle &optional fmt pbox)
   "Write one rect, choosing the cheapest encoding a large rect's client can take.
    Big ZRLE rect -> STORED-block ZRLE (~5x cheaper than full deflate, still ordinary
    ZRLE, so every client decodes it); TRLE only if explicitly enabled AND negotiated.
@@ -513,7 +549,7 @@
     ((and *use-trle* trle (= enc +enc-zrle+) (>= (* w h) *trle-threshold*))
      (write-rect-trle s fb x y w h fmt))                   ; opt-in TRLE (off by default)
     ((and (= enc +enc-zrle+) (>= (* w h) *zrle-stored-threshold*))
-     (write-rect-zrle s fb x y w h zs t fmt))              ; big ZRLE: stored fast path (universal)
+     (write-rect-zrle s fb x y w h zs t fmt pbox))         ; big ZRLE: stored fast path (universal)
     (t (write-rect s fb x y w h enc zs fmt))))
 
 (defparameter *max-band-rows* 64
@@ -532,7 +568,7 @@
             else nconc (loop for yy from y below (+ y h) by *max-band-rows*
                              collect (list x yy w (min *max-band-rows* (- (+ y h) yy)))))))
 
-(defun send-rects (s fb rects enc zs &optional trle fmt cursor)
+(defun send-rects (s fb rects enc zs &optional trle fmt cursor pbox)
   "One FramebufferUpdate carrying RECTS (tall ones banded).  ENC is the client's
    chosen encoding; ZS its persistent ZRLE zlib stream; TRLE whether it also
    accepts TRLE (used for big rects); FMT the client's pixel format (NIL = native).
@@ -541,7 +577,7 @@
   (let ((rects (band-rects rects)))
     (w-u8 s 0) (w-u8 s 0) (w-u16 s (+ (if cursor 1 0) (length rects)))   ; msg-type, pad, #rects
     (when cursor (emit-cursor-rect s fmt))
-    (dolist (r rects) (destructuring-bind (x y w h) r (emit-rect s fb x y w h enc zs trle fmt)))
+    (dolist (r rects) (destructuring-bind (x y w h) r (emit-rect s fb x y w h enc zs trle fmt pbox)))
     (force-output s)))
 
 ;;; ---- desktop resize (RFC 6143 §7.8) -----------------------------------------
@@ -717,6 +753,7 @@ its bytes would land in the middle of a rect."
   resize-ack                    ; a SetDesktopSize is owed a reply: NIL, or the RESULT code to send (0 = ok)
   (fmt nil)                     ; client pixel format (a PXFMT), or NIL = our native 32bpp
   (snap-box (list nil)) (zs (cram:make-zstream))
+  (pbox (list nil))             ; the packed-tile buffer ZRLE reuses for this client (see %ZRLE-PACK-BUF)
   last-size                     ; (cons w h) — fb size last announced to this client
   (want nil)                    ; latest pending request (inc x y w h), or NIL
   (last-gen -1)                 ; fb generation this client has already caught up to
@@ -780,8 +817,8 @@ its bytes would land in the middle of a rect."
               ;; seen this frame -- the next diff then finds nothing, the request stays parked
               ;; and the client never gets that change.  Copied before, a change that lands
               ;; during the send just goes out again next time.
-              (setf (car snap-box) (copy-pixels fb))
-              (send-rects s fb (list (clip-rect fb x y w h)) enc zs trle fmt cur)
+              (setf (car snap-box) (copy-pixels-into fb (car snap-box)))
+              (send-rects s fb (list (clip-rect fb x y w h)) enc zs trle fmt cur (rc-pbox client))
               (cursor-done)
               t)
             (with-fb-locked (fb)                                     ; incremental: dirty tiles
@@ -798,14 +835,14 @@ its bytes would land in the middle of a rect."
                        (w-u8 s 0) (w-u8 s 0) (w-u16 s (+ (if cur 1 0) 1 (length rects)))  ; cursor? + CopyRect + exposed
                        (when cur (emit-cursor-rect s fmt))
                        (write-rect-copy s dx dy w h sx sy)
-                       (dolist (r rects) (destructuring-bind (rx ry rw rh) r (emit-rect s fb rx ry rw rh enc zs trle fmt)))
+                       (dolist (r rects) (destructuring-bind (rx ry rw rh) r (emit-rect s fb rx ry rw rh enc zs trle fmt (rc-pbox client))))
                        (force-output s)
                        (cursor-done)
                        t)))
                   (t (let ((rects (dirty-rects fb snap (and (consp region) region))))
                        (when (or rects cur)                          ; send if there's dirt OR a pending cursor
                          (when rects (update-snapshot fb snap rects)) ; before sending -- see above
-                         (send-rects s fb (or rects '()) enc zs trle fmt cur)
+                         (send-rects s fb (or rects '()) enc zs trle fmt cur (rc-pbox client))
                          (cursor-done))
                        (and (or rects cur) t)))))))))))
 

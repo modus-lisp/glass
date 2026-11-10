@@ -126,7 +126,16 @@
         (setf i (zrle-tile buf i px fw (+ x tx) (+ y ty) tw th index palette fmt))))
     (values buf i)))
 
-(defun write-rect-zrle (s fb x y w h zs &optional stored fmt)
+(defun %zrle-pack-buf (pbox w h)
+  "PBOX's packed-tile buffer, grown to hold a W x H rect, or NIL (PACK-RECT then allocates).  The
+   buffer is reused: it is compressed into the stream before the next rect is packed."
+  (when pbox
+    (let ((need (zrle-rect-cap w h)) (b (car pbox)))
+      (if (and b (>= (length b) need))
+          b
+          (setf (car pbox) (make-array need :element-type '(unsigned-byte 8)))))))
+
+(defun write-rect-zrle (s fb x y w h zs &optional stored fmt pbox)
   "Write one ZRLE rectangle: header, then [u32 length][zlib data] over the
    per-client stream ZS (sync-flushed so the client can decode it immediately
    while the compression window carries into the next rectangle).  STORED emits
@@ -135,7 +144,7 @@
    client (e.g. TigerVNC, which won't negotiate TRLE) decodes it unchanged.
    FMT NIL = native CPIXELs; otherwise the client's requested pixel format."
   (w-u16 s x) (w-u16 s y) (w-u16 s w) (w-u16 s h) (w-u32 s +enc-zrle+)
-  (multiple-value-bind (buf len) (pack-rect fb x y w h nil *zrle-tile* fmt)
+  (multiple-value-bind (buf len) (pack-rect fb x y w h (%zrle-pack-buf pbox w h) *zrle-tile* fmt)
     (cram:compress zs buf :end len)
     (let ((z (if stored (cram:sync-flush-stored zs) (cram:sync-flush zs))))
       (w-u32 s (length z))
