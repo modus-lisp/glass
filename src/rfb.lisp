@@ -771,6 +771,7 @@ its bytes would land in the middle of a rect."
    exposed area, instead of re-encoding the moved pixels.  Returns T if bytes
    were written, NIL if there was nothing to send."
   (destructuring-bind (inc x y w h) req
+   (let ((sized nil))   ; a size rect went out; the frame still follows -- see below
     (let ((ls (rc-last-size client)))                                ; resize takes priority
       ;; EVERY SetDesktopSize IS ANSWERED, with reason 1 ("because you asked").  noVNC latches
       ;; _pendingRemoteResize when it asks and clears it ONLY on a reason-1 rect, so a server that
@@ -787,7 +788,14 @@ its bytes would land in the middle of a rect."
               (setf (car ls) (fb-width fb) (cdr ls) (fb-height fb)
                     (car (rc-snap-box client)) nil))
             (setf (rc-eds-announced client) t)
-            (return-from send-update t))))
+            ;; ...AND THE FRAME STILL FOLLOWS, as its own FramebufferUpdate.  Returning here
+            ;; answered the client's update request with the size rect alone.  noVNC asks for
+            ;; a size again whenever its window and the framebuffer differ (a fixed 640x480
+            ;; desktop always does), at most every 100 ms -- so past a 100 ms round trip
+            ;; (a phone through TURN) EVERY request came paired with a resize, every answer
+            ;; was a 36-byte ack, and no pixel was ever sent: a blank page.  Under 100 ms the
+            ;; rate limit let a frame slip between acks, which is why it worked on a LAN.
+            (setq sized t))))
       (when (rc-dss client)
         (with-fb-locked (fb)
           ;; ANNOUNCE ONCE even when the size has not changed.  LAST-SIZE starts at the
@@ -802,7 +810,8 @@ its bytes would land in the middle of a rect."
             (setf (car ls) (fb-width fb) (cdr ls) (fb-height fb)
                   (rc-eds-announced client) t
                   (car (rc-snap-box client)) nil)
-            (return-from send-update t)))))
+            (setq sized t)))))                       ; and the frame follows, as above
+    (or
     (let ((snap-box (rc-snap-box client)) (enc (rc-enc client)) (zs (rc-zs client))
           (trle (rc-trle client)) (fmt (rc-fmt client))
           ;; cursor shape rides ALONG with a frame update (as its leading rect), never
@@ -844,7 +853,8 @@ its bytes would land in the middle of a rect."
                          (when rects (update-snapshot fb snap rects)) ; before sending -- see above
                          (send-rects s fb (or rects '()) enc zs trle fmt cur (rc-pbox client))
                          (cursor-done))
-                       (and (or rects cur) t)))))))))))
+                       (and (or rects cur) t)))))))))
+     sized))))
 
 ;;; A WAKE lets the compositor and the reader thread nudge a parked sender the
 ;;; instant there's something to send, instead of it polling every ~16ms — the
