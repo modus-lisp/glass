@@ -21,7 +21,7 @@
 
 (defpackage #:glass.desk
   (:use #:cl)
-  (:export #:make-desk #:desk-register-app #:desk-open #:desk-pointer #:desk-key #:desk-tick
+  (:export #:make-desk #:desk-register-app #:desk-register-action #:desk-open #:desk-pointer #:desk-key #:desk-tick
            #:desk-fb #:desk-windows #:desk-apps #:desk-redraw #:desk-keyboard-fn
            ;; sizes a host may set for its screen: a phone at one desk pixel per point wants
            ;; touch-sized bars and rows (44 is iOS's minimum touch target)
@@ -60,7 +60,7 @@
 (defstruct (desk (:constructor %make-desk))
   fb
   (windows '())            ; topmost first
-  (apps '())               ; ((label make-fn w h) ...), in menu order
+  (apps '())               ; ((label make-fn w h) ...), in menu order; an action is (label fn :action nil)
   (menu nil)               ; NIL, or (x y) of the open root menu
   (drag nil)               ; (window dx dy) while a title bar is held
   (cascade 0)
@@ -82,6 +82,15 @@
   (when (desk-menu desk) (setf (desk-dirty desk) t))
   label)
 
+(defun desk-register-action (desk label fn)
+  "Put LABEL on the root menu; choosing it calls FN, with no arguments, and opens no window -- for what draws
+   itself, like a host's native views over the desk."
+  (setf (desk-apps desk)
+        (append (remove label (desk-apps desk) :key #'first :test #'string=)
+                (list (list label fn :action nil))))
+  (when (desk-menu desk) (setf (desk-dirty desk) t))
+  label)
+
 (defun desk-redraw (desk) (setf (desk-dirty desk) t))
 
 (defun %damage (desk x y w h)
@@ -98,8 +107,12 @@
           (+ (win-w w) (* 2 *border*)) (+ (win-h w) *title-h* (* 2 *border*))))
 
 (defun desk-open (desk label)
-  "Open the application LABEL in a new window, on top.  Returns the window."
+  "Open the application LABEL in a new window, on top.  Returns the window.  An action (DESK-REGISTER-ACTION)
+   is run instead, and opens none."
   (let ((app (find label (desk-apps desk) :key #'first :test #'string=)))
+    (when (and app (eq (third app) :action))
+      (funcall (second app))
+      (setf app nil))
     (when app
       (destructuring-bind (lbl make-fn w h) app
         (let* ((sw (glass:fb-width (desk-fb desk))) (sh (glass:fb-height (desk-fb desk)))
