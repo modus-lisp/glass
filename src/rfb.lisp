@@ -769,7 +769,8 @@ its bytes would land in the middle of a rect."
    or :FULL) confines an incremental diff to what the compositor just changed.
    COPY = (sx sy dx dy w h) means a window moved: emit a CopyRect + only the
    exposed area, instead of re-encoding the moved pixels.  Returns T if bytes
-   were written, NIL if there was nothing to send."
+   were written, NIL if there was nothing to send -- and as a second value, whether
+   a FRAME went out (pixels or a cursor), as against a size rect alone."
   (destructuring-bind (inc x y w h) req
    (let ((sized nil))   ; a size rect went out; the frame still follows -- see below
     (let ((ls (rc-last-size client)))                                ; resize takes priority
@@ -811,7 +812,7 @@ its bytes would land in the middle of a rect."
                   (rc-eds-announced client) t
                   (car (rc-snap-box client)) nil)
             (setq sized t)))))                       ; and the frame follows, as above
-    (or
+    (let ((frame
     (let ((snap-box (rc-snap-box client)) (enc (rc-enc client)) (zs (rc-zs client))
           (trle (rc-trle client)) (fmt (rc-fmt client))
           ;; cursor shape rides ALONG with a frame update (as its leading rect), never
@@ -853,8 +854,8 @@ its bytes would land in the middle of a rect."
                          (when rects (update-snapshot fb snap rects)) ; before sending -- see above
                          (send-rects s fb (or rects '()) enc zs trle fmt cur (rc-pbox client))
                          (cursor-done))
-                       (and (or rects cur) t)))))))))
-     sized))))
+                       (and (or rects cur) t)))))))))))
+      (values (or frame sized) frame)))))
 
 ;;; A WAKE lets the compositor and the reader thread nudge a parked sender the
 ;;; instant there's something to send, instead of it polling every ~16ms — the
@@ -948,8 +949,12 @@ its bytes would land in the middle of a rect."
                        (let* ((region (if (and incremental (consp damage)) damage :full))
                               (copy   (and incremental (consp damage) copy))
                               (tx (list 0)) (t0 (get-internal-real-time))
+                              (framed nil)
                               (sent (let ((*tx* tx))
-                                      (handler-case (send-update client fb s req region copy)
+                                      (handler-case (multiple-value-bind (any pixels)
+                                                        (send-update client fb s req region copy)
+                                                      (setq framed pixels)
+                                                      any)
                                         (error (e)
                                           (format *error-output*
                                                   "~&glass: SEND-UPDATE died, client dropped: ~a~%" e)
@@ -959,7 +964,16 @@ its bytes would land in the middle of a rect."
                            (perf-record-send (- (get-internal-real-time) t0) region copy (car tx))
                            (when fd (note-send-queue (socket-unsent-bytes fd))))  ; real downstream backlog
                          (setf (rc-last-gen client) gen (rc-last-frame client) frame)
-                         (when sent
+                         ;; A SIZE RECT ALONE DOES NOT SPEND THE REQUEST.  noVNC asks for a
+                         ;; size again whenever its window and the framebuffer differ, and each
+                         ;; ask is answered at once -- so the parked request was usually spent
+                         ;; on a 36-byte answer moments before the input it was waiting for
+                         ;; arrived, and the frame that input drew then waited for the client
+                         ;; to receive the answer and ask again: a second round trip on every
+                         ;; change (rtt100: answer at 70 ms, frame at 195 ms, every drag step).
+                         ;; The request stays parked for the frame; the client's next request,
+                         ;; prompted by the answer, only replaces it.
+                         (when framed
                            (sb-thread:with-mutex ((rc-lock client))
                              (when (eq (rc-want client) req) (setf (rc-want client) nil))))
                          sent))))))
