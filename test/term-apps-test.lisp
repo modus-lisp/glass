@@ -139,7 +139,13 @@
 (let* ((l (glass-repl:make-listener)))
   (setf glass-repl:*listener* l)
   (let ((th (sb-thread:make-thread 'compositor :arguments (list l) :name "test-compositor")))
-    (glass-repl:run-listener l)
+    ;; GLASS_TEST_TURN=1: main serves the listener the way a one-process card does -- a loop of
+    ;; its own (a gateway's relay pump) calling LISTENER-TURN between other work -- rather than
+    ;; RUN-LISTENER
+    (if (equal (sb-ext:posix-getenv "GLASS_TEST_TURN") "1")
+        (loop (when (eq (glass-repl:listener-turn l) :stop) (return))
+              (sleep 0.002))
+        (glass-repl:run-listener l))
     (let ((results (sb-thread:join-thread th)))
       (if (listp results)
           (dolist (r results) (check (car r) (cdr r)))

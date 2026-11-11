@@ -164,20 +164,28 @@
       (glass::mb-post (svref (listener-replies l) slot)
                       (list :done token (svref (listener-packages l) slot))))))
 
+(defun listener-turn (l)
+  "Serve what REPL windows have sent L so far, without waiting: evaluate each form, one at a
+   time, in the order sent.  :STOP once STOP-LISTENER has been called, else NIL.  For a thread
+   with a loop of its own to run -- a gateway's relay pump -- that must also be the listener's,
+   because on modus only the main thread evaluates."
+  (dolist (m (glass::mb-take (listener-requests l)))
+    (case (first m)
+      (:stop (return-from listener-turn :stop))
+      (:open (destructuring-bind (slot token) (rest m)
+               (setf (svref (listener-packages l) slot) "COMMON-LISP-USER")
+               (glass::mb-post (svref (listener-replies l) slot)
+                               (list :done token "COMMON-LISP-USER"))))
+      (:eval (destructuring-bind (slot token text) (rest m)
+               (when (eql (svref (listener-owner l) slot) token)
+                 (%listener-eval l slot token text))))))
+  nil)
+
 (defun run-listener (l)
   "Serve REPL windows from this thread until STOP-LISTENER: evaluate each form a window sends,
    one at a time, in the order sent."
   (loop
-    (dolist (m (glass::mb-take (listener-requests l)))
-      (case (first m)
-        (:stop (return-from run-listener nil))
-        (:open (destructuring-bind (slot token) (rest m)
-                 (setf (svref (listener-packages l) slot) "COMMON-LISP-USER")
-                 (glass::mb-post (svref (listener-replies l) slot)
-                                 (list :done token "COMMON-LISP-USER"))))
-        (:eval (destructuring-bind (slot token text) (rest m)
-                 (when (eql (svref (listener-owner l) slot) token)
-                   (%listener-eval l slot token text))))))
+    (when (eq (listener-turn l) :stop) (return nil))
     (glass::wake-wait (listener-wake l) 1/4)))
 
 (defun listener-interrupt (l)

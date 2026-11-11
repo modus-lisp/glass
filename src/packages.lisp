@@ -171,5 +171,5 @@
 
 (defpackage #:glass-repl
   (:use #:cl)
-  (:export #:repl-app #:*listener* #:make-listener #:run-listener #:stop-listener
+  (:export #:repl-app #:*listener* #:make-listener #:run-listener #:listener-turn #:stop-listener
            #:listener-interrupt #:evaluate-text #:form-complete-p))

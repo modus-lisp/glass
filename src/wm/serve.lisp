@@ -23,8 +23,8 @@
             ("Terminal" glass-term:terminal-app :width 640 :height 400)))
   "SERVE-WM's root menu: the desk's applications, a Lisp listener and a shell terminal.")
 
-(defun serve-wm (port &key (width 800) (height 600) (apps *wm-apps*) (open '("Clock"))
-                           (address "127.0.0.1") clients stop audio-port audio-path)
+(defun serve-wm (port &rest args &key width height apps open address clients stop audio-port
+                                      audio-path)
   "Serve the window manager WIDTH x HEIGHT on PORT: a network thread (every viewer), a
    compositor thread, and this thread the Lisp listener REPL windows evaluate on.  APPS is a
    list of (LABEL MAKE-FN &key WIDTH HEIGHT), MAKE-FN a symbol or global function returning the
@@ -32,6 +32,23 @@
    SERVE-MULTI's.  AUDIO-PORT (or AUDIO-PATH, a UNIX socket) serves the desktop's sound as
    glass-audio/1 -- the McCLIM desktop's convention is PORT + 10, where the WebRTC gateway
    looks -- and needs glass/wm-sound loaded (sound.lisp).  Returns when the network side does."
+  (declare (ignore width height apps open address clients stop audio-port audio-path))
+  (multiple-value-bind (listener network compositor) (apply #'start-wm port args)
+    (unwind-protect (glass-repl:run-listener listener)
+      (stop-wm listener network compositor))))
+
+(defun stop-wm (listener network compositor)
+  "After START-WM's LISTENER has stopped: wait for its two threads, and let the listener go."
+  (ignore-errors (sb-thread:join-thread network))
+  (ignore-errors (sb-thread:join-thread compositor))
+  (when (eq glass-repl:*listener* listener) (setf glass-repl:*listener* nil)))
+
+(defun start-wm (port &key (width 800) (height 600) (apps *wm-apps*) (open '("Clock"))
+                           (address "127.0.0.1") clients stop audio-port audio-path)
+  "SERVE-WM without its listener loop: start the network and compositor threads and return
+   (values LISTENER NETWORK COMPOSITOR) at once.  THIS thread must then serve LISTENER --
+   GLASS-REPL:RUN-LISTENER, or GLASS-REPL:LISTENER-TURN from a loop of its own (one process that
+   is also a WebRTC gateway) -- and call STOP-WM when the listener stops."
   ;; The faces, loaded HERE: the compositor draws text, and a font it loaded itself could not go
   ;; in the shared cache on modus.
   (glass:default-font) (glass:default-font t) (glass-term:term-fonts)
@@ -55,10 +72,7 @@
                                                           inbox wake listener
                                                           sound sound-box audio-port audio-path)
                                          :name "glass-wm-network")))
-    (unwind-protect (glass-repl:run-listener listener)
-      (ignore-errors (sb-thread:join-thread network))
-      (ignore-errors (sb-thread:join-thread compositor))
-      (when (eq glass-repl:*listener* listener) (setf glass-repl:*listener* nil)))))
+    (values listener network compositor)))
 
 (defun %wm-network (fb port address clients stop inbox wake listener
                     sound sound-box audio-port audio-path)
