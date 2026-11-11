@@ -120,6 +120,15 @@ functions over the app contract both desktops host (glass/desk and glass/wm), an
   :serial t
   :components ((:module "src" :serial t :components ((:file "desk-apps")))))
 
+(asdf:defsystem :glass/voice-apps
+  :description "Speak and Listen as desk applications, with no McCLIM: a box to type into and a voice to say
+it, and a box the ear fills.  They talk to *VOICE* and *EAR*, a small protocol whose default is the session's
+own (glass/speech and glass/hearing, looked up by name, so neither is a dependency); a host with a voice of its
+own -- the phone's platform speech -- installs that instead."
+  :depends-on ("glass/desk-apps")
+  :serial t
+  :components ((:module "src" :serial t :components ((:file "voice-apps")))))
+
 (asdf:defsystem :glass/desk-serve
   :description "The desk served over RFB with a thread per concern: the calling thread is the
 network (SERVE-MULTI, every viewer), a second thread composites the desk.  Input crosses as
