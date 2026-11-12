@@ -1716,10 +1716,10 @@ that is the whole reason the two surfaces cannot drift apart."
                         (t (multiple-value-bind (token killed)
                                (mint-login-token :ttl *login-ttl* :for pubkey)
                              (if token
-                                 (format nil "Fresh glass login link~@[ for ~a~] (expires in ~a min):~%~%~a#~a~@[~%~%~a~]"
+                                 (format nil "Fresh glass login link~@[ for ~a~] (expires in ~a min):~%~%~a~@[~%~%~a~]"
                                          (%session-name-for-dm)
-                                         (max 1 (round *login-ttl* 60)) *login-url-base*
-                                         (login-link-fragment token)
+                                         (max 1 (round *login-ttl* 60))
+                                         (login-link-url token)
                                          ;; said out loud, because a person who taps an older link
                                          ;; after this will be refused and deserves to know why
                                          (and (integerp killed) (plusp killed)
@@ -2204,9 +2204,26 @@ it supersedes nothing).  A gateway topping up an allowlist admission wants the s
 (defparameter *nostr-relays*
   (let ((e (sb-ext:posix-getenv "NOSTR_RELAYS")))
     (if e (remove "" (%split-on e #\,) :test #'string=)
-        '("wss://relay.damus.io" "wss://nos.lol" "wss://relay.primal.net")))
+        '("wss://relay.snort.social" "wss://nostr.oxtr.dev" "wss://relay.primal.net")))
   "Relays the box listens on.  Fan-out means one DM arrives several times; that is the point, and
-the wrap-id set is what makes it free.")
+the wrap-id set is what makes it free.
+
+CHOSEN BY MEASUREMENT, NOT REPUTATION (glass-webrtc t/relays.py, 2026-11-11): every sign-in is two
+gift wraps, and nos.lol never acknowledged one, relay.damus.io answered 503, and relay.primal.net
+took 4-10 s -- so with damus/nos.lol/primal a sign-in rode primal alone and took up to 18 s.  snort
+and oxtr carried them in ~0.2 s; primal stays as the bridge to every link handed out before.")
+
+(defun login-link-url (token)
+  "The whole login link for TOKEN: the published client, THIS BOX'S RELAYS, and the fragment.
+
+The relays ride in the link because the client cannot know them: it has a built-in list, and a box
+listening anywhere else is one the page publishes its offer to and never hears from.  They go in the
+QUERY, where the client reads `relays' (the fragment is for credentials); a LOGIN_URL_BASE that
+already names relays is left alone."
+  (let* ((base *login-url-base*)
+         (query (unless (or (search "relays=" base) (null *nostr-relays*))
+                  (format nil "~:[?~;&~]relays=~{~a~^,~}" (find #\? base) *nostr-relays*))))
+    (format nil "~a~@[~a~]#~a" base query (login-link-fragment token))))
 
 (defparameter *nostr-command-max-age* 600
   "A command DM older than this many seconds is ignored.  Relays replay their backlog on every
@@ -2396,7 +2413,7 @@ still has the generic default, which would name nothing."
            ((null token)
             (format *error-output* "~&@@ link: this session has no identity and cannot mint one~%") nil)
            (t
-            (let ((url (format nil "~a#~a" *login-url-base* (login-link-fragment token))))
+            (let ((url (login-link-url token)))
               (handler-case
                   (progn
                     (%bot-publish
