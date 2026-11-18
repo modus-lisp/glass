@@ -74,6 +74,13 @@ would not have to visit every call site in the tree."
 ;;; copied: on modus a closure stays with the thread that made it.
 (defun %share (x) #+modus (modus:share x) #-modus x)
 
+(defun %shared-array (n &rest args)
+  "MAKE-ARRAY, in memory every thread may hold: on modus a thread's own objects may not be stored
+   into shared structure (a framebuffer the senders read), and MODUS:SHARE will not copy a typed
+   pixel array -- so a buffer made by one thread for others is allocated shared to begin with."
+  #+modus (apply #'modus:make-shared-array n args)
+  #-modus (apply #'make-array n args))
+
 #+sb-thread (defun %fb-make-lock (&optional (name "framebuffer"))
               (sb-thread:make-mutex :name name))
 #-sb-thread (defun %fb-make-lock (&optional name) (declare (ignore name)) nil)
@@ -126,7 +133,7 @@ would not have to visit every call site in the tree."
          (b (ash (+ (* 298 c) (* 516 d) 128) -8)))
     (logior (ash (max 0 (min 255 r)) 16) (ash (max 0 (min 255 g)) 8) (max 0 (min 255 b)))))
 
-(defun %u8-plane (n v) (make-array n :element-type '(unsigned-byte 8) :initial-element v))
+(defun %u8-plane (n v) (%shared-array n :element-type '(unsigned-byte 8) :initial-element v))
 
 (defstruct (framebuffer (:conc-name fb-) (:constructor %make-framebuffer))
   (width  0 :type fixnum)
@@ -293,6 +300,8 @@ would not have to visit every call site in the tree."
 
 (defun %i420-planes (fb width height fill)
   (let ((cn (* (ceiling width 2) (ceiling height 2))))
+    ;; Planes in shared memory (%U8-PLANE): FB-RESIZE runs this on whichever thread resizes
+    ;; (the WM's compositor), and the senders read them.
     (setf (fb-y fb) (%u8-plane (* width height) (%rgb-y fill))
           (fb-u fb) (%u8-plane cn (%rgb-u fill))
           (fb-v fb) (%u8-plane cn (%rgb-v fill)))
@@ -315,8 +324,9 @@ would not have to visit every call site in the tree."
     (unless (and (= width (fb-width fb)) (= height (fb-height fb)))
       (if (eq (fb-format fb) :i420)
           (%i420-planes fb width height fill)
-          (setf (fb-pixels fb) (make-array (* width height) :element-type '(unsigned-byte 32)
-                                                            :initial-element (logand fill #xffffff))))
+          ;; shared: the resizing thread (the WM's compositor) is not the one the senders are
+          (setf (fb-pixels fb) (%shared-array (* width height) :element-type '(unsigned-byte 32)
+                                                              :initial-element (logand fill #xffffff))))
       (setf (fb-width fb) width
             (fb-height fb) height)
       (fb-touch fb)))
