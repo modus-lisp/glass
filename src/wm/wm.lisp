@@ -431,6 +431,37 @@
       (setf (surf-copy-base s) nil)
       (wm-composite wm (box-union (list old (window-box s)))))))
 
+(defparameter *screen-min* 240 "The smallest screen side a client may ask for, in pixels.")
+(defparameter *screen-max* 2560 "The largest: a framebuffer is W x H words, and every one is sent.")
+
+(defun wm-resize-screen (wm w h)
+  "Make the screen W x H (clamped to *SCREEN-MIN*..*SCREEN-MAX*): what a client's SetDesktopSize
+   asks.  Every window is kept reachable on the new screen -- one wider or taller than it is
+   shrunk to fit (through its RESIZE-FN), and its position clamped as a drag's is -- an open menu
+   is closed (it was placed for the old screen), a drag in progress is let go, and the whole
+   screen is repainted.  The RFB senders see the framebuffer's new size and tell their clients.
+   Returns T if the size changed."
+  (let ((w (max *screen-min* (min *screen-max* w)))
+        (h (max *screen-min* (min *screen-max* h)))
+        (fb (wm-fb wm)))
+    (unless (and (= w (glass:fb-width fb)) (= h (glass:fb-height fb)))
+      (glass:fb-resize fb w h *wm-bg*)
+      (setf (wm-menu wm) nil (wm-drag wm) nil (wm-drag-wire wm) nil (wm-drag-wire-box wm) nil)
+      (dolist (s (wm-surfaces wm))
+        (setf (surf-saved-geom s) nil (surf-copy-base s) nil)
+        (let ((mw (- w (* 2 (wm-border)))) (mh (- h (wm-titleh) (* 2 (wm-border)))))
+          (when (and (surf-resize-fn s) (or (> (surf-cw s) mw) (> (surf-ch s) mh)))
+            (handler-case (funcall (surf-resize-fn s) (max 32 (min mw (surf-cw s)))
+                                   (max 32 (min mh (surf-ch s))))
+              (error (e) (note-surface-error wm s e)))))
+        ;; a window that still does not fit starts at the top left, its title bar showing
+        (let ((x (if (> (+ (surf-x s) (surf-cw s) (wm-border)) w) (wm-border) (surf-x s)))
+              (y (if (> (+ (surf-y s) (surf-ch s) (wm-border)) h) (+ (wm-titleh) (wm-border)) (surf-y s))))
+          (multiple-value-bind (cx cy) (clamp-position wm s x y)
+            (setf (surf-x s) cx (surf-y s) cy))))
+      (wm-composite wm)
+      t)))
+
 ;;; ---- hit test --------------------------------------------------------------------------------
 
 (defun wm-hit (wm x y)

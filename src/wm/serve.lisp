@@ -98,7 +98,11 @@
                                     :address address :clients clients :stop stop
                                     :tick (and out (lambda () (funcall 'audio-out-turn out)))
                                     :on-key (lambda (down key) (post (list :key down key)))
-                                    :on-pointer (lambda (mask x y) (post (list :pointer mask x y)))))
+                                    :on-pointer (lambda (mask x y) (post (list :pointer mask x y)))
+                                    ;; A CLIENT ASKING FOR A SIZE (SetDesktopSize) gets the screen it
+                                    ;; asked for: a phone a phone-shaped desktop, not a letterbox.
+                                    ;; The compositor does it, between frames, as it does input.
+                                    :on-resize (lambda (w h) (post (list :resize w h)))))
              (error (e)
                (ignore-errors (format *error-output* "~&glass wm: network: ~a~%" e)
                               (force-output *error-output*))))
@@ -144,15 +148,17 @@
        (glass:with-own-glyph-cache () (%wm-compositor-1 fb inbox wake apps open snd))))))
 
 (defun %superseded-p (wm m rest)
-  "Is pointer message M made redundant by the next one?  Only while a window is being dragged or
-   resized: a motion followed by another motion with the same buttons says nothing the second
+  "Is M made redundant by a later message?  A :RESIZE is, by any later :RESIZE: only the last
+   size asked for matters, and each one clears the screen.  A pointer message is, by the next
+   one, only while a window is being dragged or resized: a motion followed by another motion with the same buttons says nothing the second
    does not, and replaying a backlog of them one composite each is how a drag falls behind.
    Never otherwise -- Paint wants every point of a stroke."
-  (and (wm-drag wm)
+  (or (and (eq (first m) :resize) (find :resize rest :key #'first))   ; a rotation is a burst
+   (and (wm-drag wm)
        (eq (first m) :pointer)
        rest
        (eq (first (first rest)) :pointer)
-       (eql (second m) (second (first rest)))))
+       (eql (second m) (second (first rest))))))
 
 (defun %wm-compositor-1 (fb inbox wake apps open snd)
   (let ((wm (make-wm fb))
@@ -173,7 +179,8 @@
                    (case (first m)
                      (:listeners (when snd (funcall 'wm-sound-listen snd (second m))))
                      (:key (wm-key wm (second m) (third m)))
-                     (:pointer (destructuring-bind (mask x y) (rest m) (wm-pointer wm mask x y)))))))
+                     (:pointer (destructuring-bind (mask x y) (rest m) (wm-pointer wm mask x y)))
+                     (:resize (wm-resize-screen wm (second m) (third m)))))))
       ;; the sound first: a frame due now is mixed from what the player has queued, and the
       ;; tick after it (the player's query) decodes the next
       (when snd (%app-guard "sound" (funcall 'wm-sound-turn snd)))

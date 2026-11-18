@@ -118,6 +118,47 @@
     (check "a press off the menu dismisses it" (null (glass.wm::wm-menu wm)))
     (check "screen = full repaint at the end" (same-as-full-p wm))))
 
+;;; ---- the screen resized (a client's SetDesktopSize) ----------------------------------------
+(let* ((screen (glass:make-framebuffer 800 600))
+       (wm (glass.wm:make-wm screen)))
+  (dolist (a glass.desk:*standard-apps*)
+    (destructuring-bind (label fn &key width height) a
+      (glass.wm:wm-register-app wm label fn :width width :height height)))
+  (let* ((paint (glass.wm:wm-open wm "Paint"))
+         (notes (glass.wm:wm-open wm "Notes")))
+    (glass.wm:wm-tick wm)
+    (setf (glass.wm::surf-x notes) 700 (glass.wm::surf-y notes) 500)   ; far bottom right
+    (glass.wm::wm-composite wm)
+    (ptr wm 4 600 100) (ptr wm 0 600 100)                              ; the root menu, on bare workspace
+    (check "(the root menu is open before the resize)" (glass.wm::wm-menu wm))
+    (flet ((fits (s) (let ((sw (glass:fb-width screen)) (sh (glass:fb-height screen)))
+                       (and (<= 0 (glass.wm::surf-x s)) (<= (+ (glass.wm::surf-x s) (glass.wm::surf-cw s)) sw)
+                            (<= 0 (glass.wm::surf-y s)) (<= (+ (glass.wm::surf-y s) (glass.wm::surf-ch s)) sh)))))
+      (check "resizing the screen to a phone's shape says it changed"
+             (glass.wm:wm-resize-screen wm 400 700))
+      (check "the framebuffer is 400x700"
+             (and (= 400 (glass:fb-width screen)) (= 700 (glass:fb-height screen))))
+      (check "the open menu, placed for the old screen, is closed" (null (glass.wm::wm-menu wm)))
+      (check "every window is wholly on the narrower screen (shrunk if it had to be)"
+             (and (fits paint) (fits notes)))
+      (check "screen = full repaint after the resize" (same-as-full-p wm))
+      (check "the same size again is no change" (null (glass.wm:wm-resize-screen wm 400 700)))
+      (glass.wm:wm-resize-screen wm 10 99999)
+      (check "a size out of range is clamped (240 .. 2560)"
+             (and (= 240 (glass:fb-width screen)) (= 2560 (glass:fb-height screen))))
+      (glass.wm:wm-resize-screen wm 1280 800)
+      (check "back to a wide screen: still all there, and = full repaint"
+             (and (fits paint) (fits notes) (= 2 (length (glass.wm:wm-surfaces wm)))
+                  (same-as-full-p wm)))
+      (ptr wm 1 (+ (glass.wm::surf-x notes) 5) (+ (glass.wm::surf-y notes) 5))
+      (ptr wm 0 (+ (glass.wm::surf-x notes) 5) (+ (glass.wm::surf-y notes) 5))
+      (check "input still lands after a resize" (eq notes (glass.wm:wm-focus wm)))))
+  ;; a rotation is a burst of requests: only the last is acted on
+  (let ((q (list '(:resize 800 400) '(:pointer 0 1 1) '(:resize 400 800))))
+    (check "a resize followed by another is superseded; the last is not"
+           (and (glass.wm::%superseded-p wm (first q) (rest q))
+                (not (glass.wm::%superseded-p wm (third q) nil))))))
+
 (format t "~&WM ~d failure~:p~%" *fails*)
 (finish-output)
 #+sbcl (sb-ext:exit :code (if (zerop *fails*) 0 1))

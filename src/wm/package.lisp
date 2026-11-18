@@ -17,7 +17,7 @@
    ;; serving it
    #:serve-wm #:start-wm #:stop-wm
    ;; embedding it (the same shape as glass.desk's MAKE-DESK / DESK-POINTER / DESK-TICK)
-   #:make-wm #:wm-register-app #:wm-open #:wm-pointer #:wm-key #:wm-tick #:wm-redraw
+   #:make-wm #:wm-register-app #:wm-open #:wm-pointer #:wm-key #:wm-tick #:wm-redraw #:wm-resize-screen
    #:wm-fb #:wm-surfaces #:wm-apps #:wm-focus #:wm-keyboard-fn
    ;; tunables
    #:*wm-scale* #:*wm-bg* #:*drag-adaptive* #:*wireframe-queue-kb* #:*wireframe-lag-ms*
