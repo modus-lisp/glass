@@ -813,11 +813,12 @@ its bytes would land in the middle of a rect."
                   (car (rc-snap-box client)) nil)
             (setq sized t)))))                       ; and the frame follows, as above
     (let ((frame
-    (let ((snap-box (rc-snap-box client)) (enc (rc-enc client)) (zs (rc-zs client))
-          (trle (rc-trle client)) (fmt (rc-fmt client))
-          ;; cursor shape rides ALONG with a frame update (as its leading rect), never
-          ;; as its own message — see emit-cursor-rect.
-          (cur (and (rc-cursor client) (not (rc-cursor-sent client)))))
+    (let* ((snap-box (rc-snap-box client)) (had-snap (car snap-box))
+           (enc (rc-enc client)) (zs (rc-zs client))
+           (trle (rc-trle client)) (fmt (rc-fmt client))
+           ;; cursor shape rides ALONG with a frame update (as its leading rect), never
+           ;; as its own message — see emit-cursor-rect.
+           (cur (and (rc-cursor client) (not (rc-cursor-sent client)))))
       (flet ((cursor-done () (when cur (setf (rc-cursor-sent client) t))))
         (if (or (zerop inc) (null (car snap-box)))                   ; full / first frame
             (with-fb-locked (fb)
@@ -827,8 +828,18 @@ its bytes would land in the middle of a rect."
               ;; seen this frame -- the next diff then finds nothing, the request stays parked
               ;; and the client never gets that change.  Copied before, a change that lands
               ;; during the send just goes out again next time.
+              ;;
+              ;; AND WITH NO SNAPSHOT, THE WHOLE SCREEN, not the rect the request named.  The
+              ;; snapshot taken here is the whole framebuffer, so it claims the client holds all
+              ;; of it.  After a resize the request in hand was made at the OLD size (noVNC asks
+              ;; for its own framebuffer, 640x480, before it hears of 1280x720): clipped to it,
+              ;; the new area was never sent and never would be -- the next diff finds it
+              ;; "unchanged".  A browser showed the old desktop in the corner of the new one.
               (setf (car snap-box) (copy-pixels-into fb (car snap-box)))
-              (send-rects s fb (list (clip-rect fb x y w h)) enc zs trle fmt cur (rc-pbox client))
+              (send-rects s fb (list (if (null had-snap)
+                                         (list 0 0 (fb-width fb) (fb-height fb))
+                                         (clip-rect fb x y w h)))
+                          enc zs trle fmt cur (rc-pbox client))
               (cursor-done)
               t)
             (with-fb-locked (fb)                                     ; incremental: dirty tiles
