@@ -74,6 +74,34 @@
                  (format nil "~d of ~d" (count 1 seen) (* nw nh))))
         (ignore-errors (close s))))))
 
+(defun fresh-viewer-lag ()
+  "Leave a WM with nobody watching while its Clock ticks, then connect as a browser does -- a full
+   request and, at once, an incremental one -- and read the send-lag the WM's drag consults."
+  (let* ((port (free-port)) (sock (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
+    (let ((*trace-output* (make-broadcast-stream)) (*error-output* (make-broadcast-stream)))
+      (glass.wm:start-wm port :width 640 :height 480))
+    (loop repeat 50 until (ignore-errors (sb-bsd-sockets:socket-connect sock #(127 0 0 1) port) t)
+          do (sleep 0.1))
+    (sleep 2.5)                                         ; the Clock marks changes nobody takes
+    (setf glass:*send-lag* 0d0)
+    (let ((s (sb-bsd-sockets:socket-make-stream sock :input t :output t
+                                                     :element-type '(unsigned-byte 8) :buffering :full)))
+      (labels ((rd (n) (let ((b (make-array n :element-type '(unsigned-byte 8)))) (read-sequence b s) b))
+               (wr (v) (write-sequence (coerce v '(vector (unsigned-byte 8))) s) (finish-output s)))
+        (rd 12) (wr (map 'list #'char-code (format nil "RFB 003.008~c" (code-char 10))))
+        (let ((n (aref (rd 1) 0))) (rd n) (wr (list 1)) (rd 4))
+        (wr (list 1))
+        (let ((init (rd 24))) (rd (+ (ash (aref init 20) 24) (ash (aref init 21) 16) (ash (aref init 22) 8) (aref init 23))))
+        (wr (list 2 0 0 1 0 0 0 0))                      ; Raw
+        (wr (append (list 3 0 0 0 0 0 2 128 1 224) (list 3 1 0 0 0 0 2 128 1 224)))
+        (sleep 1.5)
+        (ignore-errors (close s))
+        glass:*send-lag*))))
+
+(let ((lag (fresh-viewer-lag)))
+  (check "a viewer connecting to a desktop nobody watched is not read as lagging (drag stays opaque)"
+         (< lag glass.wm:*wireframe-lag-ms*) (format nil "send-lag ~,1f ms" lag)))
+
 (run '(0) "Raw")
 (run '(16 1 0) "ZRLE+CopyRect")
 

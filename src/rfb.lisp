@@ -961,7 +961,16 @@ its bytes would land in the middle of a rect."
                        ;; (re)starting, and the change it takes may have been marked long before
                        ;; anybody connected: folding that in read a fresh viewer as seconds behind
                        ;; (3.2 s measured) and sent its first drag wireframe.
-                       (when (and damage (plusp mark-time) incremental) (note-send-lag mark-time))
+                       ;;
+                       ;; ...AND ONLY FOR A CLIENT THAT HAS A PICTURE (a snapshot) TO BE BEHIND ON.
+                       ;; The request flag alone is not enough: a browser sends its full request
+                       ;; and then, at once, a second (incremental) one to keep two in flight, and
+                       ;; the second replaces the first in the slot before this runs -- so a fresh
+                       ;; viewer's first frame, a change marked minutes ago with nobody watching,
+                       ;; was read as 328 s of lag and its first drag went wireframe.  No snapshot
+                       ;; also covers a resize, which drops it.
+                       (when (and damage (plusp mark-time) incremental (car (rc-snap-box client)))
+                         (note-send-lag mark-time))
                        (let* ((region (if (and incremental (consp damage)) damage :full))
                               (copy   (and incremental (consp damage) copy))
                               (tx (list 0)) (t0 (get-internal-real-time))
