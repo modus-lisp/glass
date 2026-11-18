@@ -123,6 +123,16 @@ functions over the app contract both desktops host (glass/desk and glass/wm), an
                                                      ;; through spool, found by name (no dependency)
                                                      (:file "media-radio")))))
 
+(asdf:defsystem :glass/media-pictures
+  :description "Media's Pictures tab: a folder of images (GLASS_PICTURES, else ~/Pictures, else
+Media's folder, never above it), a page of thumbnails, and one picture filling the tab with Prev /
+Next / Back.  Decoded by pigment (pure-CL PNG, JPEG, GIF, WebP, SVG) on a thread of the tab's own,
+never the window manager's.  MEDIA-APP finds it by name: without this system Media has no Pictures
+tab and is otherwise unchanged."
+  :depends-on ("glass/desk-apps" "pigment" "uiop")
+  :serial t
+  :components ((:module "src" :serial t :components ((:file "media-pictures")))))
+
 (asdf:defsystem :glass/voice-apps
   :description "Speak and Listen as desk applications, with no McCLIM: a box to type into and a voice to say
 it, and a box the ear fills.  They talk to *VOICE* and *EAR*, a small protocol whose default is the session's
