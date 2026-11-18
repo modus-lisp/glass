@@ -160,8 +160,10 @@ messages, pixels through the shared screen framebuffer -- so it runs where threa
 (asdf:defsystem :glass/wm
   :description "The McCLIM desktop's window manager without McCLIM: OPEN LOOK chrome, raise and
 focus, a drag that moves by CopyRect and goes wireframe when the link lags, resize, the root and
-window menus -- one seat, surface windows only, served by SERVE-WM in SERVE-DESK's shape (a
-network thread and one compositor thread that owns every window), so it runs on modus.  Its
+window menus -- surface windows only, served by SERVE-WM in SERVE-DESK's shape (a network thread
+and one compositor thread that owns every window), so it runs on modus.  Cooperative SEATS: one
+session of windows, a screen, pointer, focus, menu, clipboard and arrangement per person watching,
+each seat a loopback RFB port of its own by key (WM-SEAT-PORT); the home seat is PORT.  Its
 root menu adds a Lisp listener (glass/repl) and a Terminal (glass/term) to the desk's apps."
   :depends-on ("glass" "glass/text" "glass/desk-apps" "glass/term" "glass/repl")
   :serial t

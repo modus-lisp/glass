@@ -1412,80 +1412,122 @@ its bytes would land in the middle of a rect."
    arguments) runs each turn, so an app can draw between updates on this thread.  CLIENTS,
    if given, is how many connections to serve before returning (once the last has left);
    STOP, if given, is a predicate polled each turn.  At most MAX-CLIENTS at once; a further
-   connection is closed at once.  ADDRESS defaults to loopback.  Otherwise as SERVE."
+   connection is closed at once.  ADDRESS defaults to loopback.  Otherwise as SERVE.
+   One endpoint of SERVE-ENDPOINTS, which serves several screens from the one thread."
   (let* ((listen (or listen (tcp-listen port :address address)))
-         (lfd (%listener-fd listen))
-         (peers '())
-         (served 0))
+         (ep (make-rfb-endpoint :listen listen :fb fb :on-key on-key :on-pointer on-pointer
+                                :on-resize on-resize :name name :password password
+                                :clipboard clipboard :max-clients max-clients)))
     (format *error-output* "~&glass: RFB server (all clients, one thread) on ~a (~dx~d)~%"
             (listener-endpoint listen) (fb-width fb) (fb-height fb))
     (force-output *error-output*)
-    (flet ((drop (peer)
-             (ignore-errors (close (peer-stream peer)))
-             (setf peers (remove peer peers)))
-           (finished-p ()
-             (or (and stop (funcall stop))
-                 (and clients (>= served clients) (null peers)))))
+    (let ((eps (list ep)))
+      (serve-endpoints (lambda () eps) :tick tick :interval interval :clients clients :stop stop))))
+
+;;; AN ENDPOINT is one listener and the one screen its clients see: SERVE-MULTI is one of them.
+;;; SERVE-ENDPOINTS serves however many there are from the calling thread -- a window manager
+;;; with a screen per SEAT (src/wm/serve.lisp) gives each seat a listener of its own, and every
+;;; seat's viewers are still served by its one network thread.  The list is asked for afresh each
+;;; turn (ENDPOINTS-FN), so TICK may open a new one.
+
+(defstruct (rfb-endpoint (:conc-name ep-))
+  listen fb on-key on-pointer on-resize
+  (name *desktop-name*) (password :inherit) clipboard
+  (max-clients 16)
+  (peers '())          ; the connections on this screen, in arrival order
+  (served 0))          ; connections accepted, ever
+
+(defun endpoint-viewers (ep) "How many clients EP has right now." (length (ep-peers ep)))
+
+(defun %endpoint-close (ep)
+  (dolist (peer (ep-peers ep)) (ignore-errors (close (peer-stream peer))))
+  (setf (ep-peers ep) '())
+  (ignore-errors (close-listener (ep-listen ep))))
+
+(defun serve-endpoints (endpoints-fn &key tick (interval 1/60) clients stop)
+  "Serve every endpoint ENDPOINTS-FN returns, all from the calling thread, until STOP says so
+   (or, with CLIENTS, until that many connections have been served and have left).  Per turn:
+   new connections on each listener, input from every client, TICK, every client's sender.
+   Closes every endpoint it served on the way out."
+  (let ((seen '()))
+    (labels ((eps () (let ((l (funcall endpoints-fn)))
+                       (dolist (ep l) (pushnew ep seen))
+                       l))
+             (lfd (ep) (%listener-fd (ep-listen ep)))
+             (served () (reduce #'+ (eps) :key #'ep-served))
+             (accepting-p () (or (null clients) (< (served) clients)))
+             (drop (ep peer)
+               (ignore-errors (close (peer-stream peer)))
+               (setf (ep-peers ep) (remove peer (ep-peers ep))))
+             (finished-p ()
+               (or (and stop (funcall stop))
+                   (and clients (>= (served) clients) (every (lambda (ep) (null (ep-peers ep))) (eps))))))
       (unwind-protect
            (loop until (finished-p) do
              (let ((busy nil))
                ;; 1. new connections
-               (when (and (or (null clients) (< served clients))
-                          (sb-sys:wait-until-fd-usable lfd :input 0))
-                 (let ((stream (accept-stream listen)))
-                   (when stream
-                     (setf busy t)
-                     (if (>= (length peers) max-clients)
-                         (ignore-errors (close stream))
-                         (let ((ok (ignore-errors (handshake fb stream name password))))
-                           (incf served)
-                           (if (not ok)
-                               (ignore-errors (close stream))
-                               (let* ((id (%next-conn-id))
-                                      (client (make-rfb-client
-                                               :id id :last-size (cons (fb-width fb) (fb-height fb))))
-                                      (conn (make-rfb-conn
-                                             :id id :post (lambda (m) (%rfb-apply client m fb)))))
-                                 (setf peers (append peers
-                                                     (list (make-rfb-peer
-                                                            :stream stream
-                                                            :fd (ignore-errors (sb-sys:fd-stream-fd stream))
-                                                            :conn conn :client client)))))))))))
+               (dolist (ep (eps))
+                 (when (and (accepting-p)
+                            (sb-sys:wait-until-fd-usable (lfd ep) :input 0))
+                   (let ((stream (accept-stream (ep-listen ep))) (fb (ep-fb ep)))
+                     (when stream
+                       (setf busy t)
+                       (if (>= (length (ep-peers ep)) (ep-max-clients ep))
+                           (ignore-errors (close stream))
+                           (let ((ok (ignore-errors (handshake fb stream (ep-name ep) (ep-password ep)))))
+                             (incf (ep-served ep))
+                             (if (not ok)
+                                 (ignore-errors (close stream))
+                                 (let* ((id (%next-conn-id))
+                                        (client (make-rfb-client
+                                                 :id id :last-size (cons (fb-width fb) (fb-height fb))))
+                                        (conn (make-rfb-conn
+                                               :id id :post (lambda (m) (%rfb-apply client m fb)))))
+                                   (setf (ep-peers ep)
+                                         (append (ep-peers ep)
+                                                 (list (make-rfb-peer
+                                                        :stream stream
+                                                        :fd (ignore-errors (sb-sys:fd-stream-fd stream))
+                                                        :conn conn :client client))))))))))))
                ;; 2. input, from every client that has some
-               (dolist (peer peers)
-                 (loop while (and (rc-running (peer-client peer)) (%peer-input-p peer))
-                       do (setf busy t)
-                          (when (eq (handler-case
-                                        (%rfb-handle-message (read-byte (peer-stream peer) nil :eof)
-                                                             (peer-conn peer) (peer-stream peer)
-                                                             on-key on-pointer on-resize clipboard)
-                                      (error () :done))
-                                    :done)
-                            (setf (rc-running (peer-client peer)) nil)))
-                 (unless (rc-running (peer-client peer)) (drop peer)))
+               (dolist (ep (eps))
+                 (dolist (peer (ep-peers ep))
+                   (loop while (and (rc-running (peer-client peer)) (%peer-input-p peer))
+                         do (setf busy t)
+                            (when (eq (handler-case
+                                          (%rfb-handle-message (read-byte (peer-stream peer) nil :eof)
+                                                               (peer-conn peer) (peer-stream peer)
+                                                               (ep-on-key ep) (ep-on-pointer ep)
+                                                               (ep-on-resize ep) (ep-clipboard ep))
+                                        (error () :done))
+                                      :done)
+                              (setf (rc-running (peer-client peer)) nil)))
+                   (unless (rc-running (peer-client peer)) (drop ep peer))))
                ;; 3. the app draws
                (when tick (funcall tick))
                ;; 4. every client's sender takes a turn
-               (dolist (peer peers)
-                 (when (%rfb-sender-step (peer-client peer) fb (peer-stream peer) clipboard
-                                         (peer-fd peer))
-                   (setf busy t))
-                 (unless (rc-running (peer-client peer)) (drop peer)))
-               ;; 5. idle: wait for input -- on the listener in slices, checking every
-               ;;    client between them -- for at most INTERVAL
+               (dolist (ep (eps))
+                 (dolist (peer (ep-peers ep))
+                   (when (%rfb-sender-step (peer-client peer) (ep-fb ep) (peer-stream peer)
+                                           (ep-clipboard ep) (peer-fd peer))
+                     (setf busy t))
+                   (unless (rc-running (peer-client peer)) (drop ep peer))))
+               ;; 5. idle: wait for input -- on the first listener in slices, checking every
+               ;;    client and every other listener between them -- for at most INTERVAL
                (unless busy
                  (let ((deadline (+ (get-internal-real-time)
-                                    (round (* interval internal-time-units-per-second)))))
+                                    (round (* interval internal-time-units-per-second))))
+                       (open (eps)))
                    (loop
-                     (when (some #'%peer-input-p peers) (return))
-                     (when (or (null clients) (< served clients))
-                       (when (sb-sys:wait-until-fd-usable lfd :input 0) (return)))
+                     (when (some (lambda (ep) (some #'%peer-input-p (ep-peers ep))) open) (return))
+                     (when (and (accepting-p)
+                                (some (lambda (ep) (sb-sys:wait-until-fd-usable (lfd ep) :input 0)) open))
+                       (return))
                      (when (>= (get-internal-real-time) deadline) (return))
-                     (if (or (null clients) (< served clients))
-                         (sb-sys:wait-until-fd-usable lfd :input *multi-slice*)
+                     (if (and (accepting-p) open)
+                         (sb-sys:wait-until-fd-usable (lfd (first open)) :input *multi-slice*)
                          (sleep *multi-slice*)))))))
-        (dolist (peer peers) (ignore-errors (close (peer-stream peer))))
-        (close-listener listen)))))
+        (dolist (ep seen) (%endpoint-close ep))))))
 
 (defun serve-single (fb port &rest args &key &allow-other-keys)
   "Serve FB to ONE client on PORT, entirely on the calling thread, and return when it
