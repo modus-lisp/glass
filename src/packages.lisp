@@ -56,9 +56,9 @@
    #:send-cut-text #:read-client-cut-text
    ;; audio (the :glass/audio system; reed-backed) — one bus of sources, a mix per listener
    #:make-mixer #:mixer #:mixer-p #:mixer-start #:mixer-stop #:mixer-tick #:mixer-report
-   #:mixer-rate #:mixer-frame-samples #:mixer-seq #:mixer-level #:mixer-late #:mixer-running
+   #:mixer-rate #:mixer-frame-samples #:mixer-seq #:mixer-level #:mixer-sinks #:mixer-late #:mixer-running
    #:mixer-add-source #:mixer-remove-source #:mixer-sources #:mixer-play #:audio-tone
-   #:mixer-source #:mixer-source-p #:src-id #:src-name #:src-gain #:src-frames #:src-audience
+   #:mixer-source #:mixer-source-p #:src-id #:src-name #:src-gain #:src-level #:src-frames #:src-audience
    #:mixer-subscribe #:mixer-unsubscribe #:sink #:sink-p #:sink-next-frame #:sink-source
    #:sink-rate #:sink-frames #:sink-drops #:sink-underruns #:sink-gain #:sink-mix #:sink-mixer
    #:sink-unsubscribe

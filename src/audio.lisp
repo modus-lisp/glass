@@ -95,7 +95,8 @@ frames gets them without rebuffering; nothing here depends on the number.")
   (audience nil)
   (ears t)                          ; NIL = a mix that feeds a recognizer does not hear this
   (frames 0 :type fixnum)
-  (errors 0 :type fixnum))
+  (errors 0 :type fixnum)
+  (level 0d0 :type double-float))   ; RMS of its last frame (0 when it had none): a meter per source
 
 ;;; ---- one listener's mix ------------------------------------------------------
 ;;;
@@ -332,6 +333,7 @@ source takes."
                      ;; it is out, so a permanently broken source does not burn the clock.
                      (when (>= (incf (src-errors s)) 3) (push s done))
                      (values nil e)))))
+        (setf (src-level s) (if (and buf (plusp (length buf))) (%rms buf) 0d0))
         (cond ((and buf (plusp (length buf)))
                (incf (src-frames s))
                (push (cons s buf) pairs))
