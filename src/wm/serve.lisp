@@ -42,7 +42,8 @@
     ("Browser"  "LOOM.GLASS" "BROWSER-APP"      900 620)     ; loom/glass
     ("Podcasts" "SPOOL.DESK" "PODCASTS-APP"     980 660)     ; spool/desk
     ("Speak"    "GLASS.DESK" "SPEAK-APP"        400 300)     ; glass/voice-apps
-    ("Listen"   "GLASS.DESK" "LISTEN-APP"       400 320)))
+    ("Listen"   "GLASS.DESK" "LISTEN-APP"       400 320)     ; glass/voice-apps
+    ("Mixer"    "GLASS.DESK" "MIXER-APP"        460 340)))   ; glass/mixer-desk
 
 (defun wm-available-apps (&optional (apps *wm-apps*))
   "APPS, then each of *WM-OPTIONAL-APPS* whose system is loaded."

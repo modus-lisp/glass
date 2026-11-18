@@ -21,7 +21,11 @@
 (export '(mixer-app))
 
 (defun %mx-mixer (mixer)
-  (or mixer (ignore-errors (glass:session-mixer :start nil))))
+  "MIXER, else the desktop's own (*MEDIA-MIXER*, the window manager's, bound where apps open), else
+the session's if there is one.  NEVER MAKES one: GLASS:SESSION-MIXER creates a mixer on first ask,
+and a Mixer window opened before the window manager adopted its mix as the session's would leave
+the session with a second, unserved mixer -- everything that plays into it then silent."
+  (or mixer *media-mixer* glass::*session-mixer*))
 
 (defun %mx-sources (m)
   (and m (ignore-errors (copy-list (glass:mixer-sources m)))))
