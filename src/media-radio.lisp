@@ -457,22 +457,33 @@
          (left (sb-thread:with-mutex ((tuner-lock tu)) (setf (tuner-windows tu) (max 0 (1- (tuner-windows tu)))))))
     (when (zerop left) (%ra-teardown tu))))
 
-;;; ---- Media: the Music, Stations and Pictures tabs ------------------------------------------------
+;;; ---- Media: the Music, Stations, Pictures and Documents tabs ------------------------------------
 
 (defparameter *media-tab-h* 36 "Media's tab strip: a fingertip tall.")
 
-(defparameter +media-tab-labels+ '((:music . "Music") (:stations . "Stations") (:pictures . "Pictures")))
+(defparameter +media-tab-labels+ '((:music . "Music") (:stations . "Stations") (:pictures . "Pictures")
+                                   (:documents . "Documents")))
 
-(defun %media-pictures-fn ()
-  "PICTURES-APP (glass/media-pictures, which brings pigment), found by name, or NIL when it is not
-   loaded -- then Media has no Pictures tab."
-  (let ((s (find-symbol "PICTURES-APP" "GLASS.DESK")))
-    (and s (fboundp s) (find-package "PIGMENT") s)))
+(defparameter +media-lazy-tabs+
+  '((:pictures "PICTURES-APP" "PIGMENT") (:documents "DOCUMENTS-APP" "FOLIO"))
+  "The tabs made from another system, found by name: (KEY APP-FUNCTION PACKAGE-IT-NEEDS).  Each is
+   made the first time it is shown.")
+
+(defun %media-lazy-fn (key)
+  "KEY's app function (glass/media-pictures' PICTURES-APP, glass/media-documents' DOCUMENTS-APP),
+   found by name, or NIL when its system (or the decoder it brings) is not loaded -- then Media has
+   no such tab."
+  (destructuring-bind (name pkg) (cdr (assoc key +media-lazy-tabs+))
+    (let ((s (find-symbol name "GLASS.DESK")))
+      (and s (fboundp s) (find-package pkg) s))))
+
+(defun %media-pictures-fn () (%media-lazy-fn :pictures))
 
 (defun %media-tab-keys ()
   "The tabs this image's Media has: Music with warp's player, Stations always, Pictures with
-   glass/media-pictures."
-  (append (and (%warp-media-p) '(:music)) '(:stations) (and (%media-pictures-fn) '(:pictures))))
+   glass/media-pictures, Documents with glass/media-documents."
+  (append (and (%warp-media-p) '(:music)) '(:stations)
+          (loop for (key) in +media-lazy-tabs+ when (%media-lazy-fn key) collect key)))
 
 (defun %media-tab-at (keys w x)
   "The tab under X in a strip W wide: equal shares, the last taking what division leaves."
@@ -481,7 +492,8 @@
 
 (defun %media-tabs (fb tab &optional (keys '(:music :stations)))
   "Media's tab strip across the top of FB, one equal share of the width per KEYS, TAB the one
-   showing.  Three across a phone-narrow window are still each a fingertip target."
+   showing.  Four across a phone-narrow window are still each a fingertip target; a label too wide
+   for its share is drawn a size smaller."
   (let* ((w (glass:fb-width fb)) (h *media-tab-h*) (n (length keys)) (share (floor w n)))
     (glass:fb-rect fb 0 0 w h +ra-head+)
     (loop for key in keys
@@ -489,26 +501,29 @@
           for x = (* i share)
           for tw = (if (= i (1- n)) (- w x) share)
           for label = (cdr (assoc key +media-tab-labels+))
+          for size = (if (<= (%ra-width label 13) (- tw 12)) 13 11)
           for on = (eq key tab)
           do (when on (glass:fb-rect fb x 0 tw h +ra-sel+))
-             (%ra-text fb (+ x (floor (- tw (%ra-width label 13)) 2)) (%ra-baseline 0 (- h 3) 13) label
-                       :size 13 :color (if on +ra-fg+ +ra-dim+))
+             (let ((label (%ra-fit label (- tw 8) size)))
+               (%ra-text fb (+ x (floor (- tw (%ra-width label size)) 2)) (%ra-baseline 0 (- h 3) size) label
+                         :size size :color (if on +ra-fg+ +ra-dim+)))
              (when on (glass:fb-rect fb x (- h 3) tw 3 +ra-on+))
              (when (plusp i) (glass:fb-rect fb x 6 1 (- h 12) +ra-bg+)))))
 
 (defun media-app (fb)
   "Media: tabs -- Music (warp's player over *MEDIA-ROOT*, which needs warp-media/glass loaded),
-   Stations (media-radio.lisp: internet radio through spool, found by name) and Pictures
-   (glass/media-pictures, found by name) -- the one showing given the whole window under the tab
-   strip.  Each draws into a framebuffer of its own, kept painted while hidden, and the one showing
-   is copied into FB; a press goes to whichever part it started in until it is released.  Pictures
-   is made the first time it is shown: a window that never looks reads no folder and decodes
-   nothing.  With only Stations there is nothing to choose between, so the window is the Stations
-   alone.  No RESIZE-FN and no TEXT-P, as before."
+   Stations (media-radio.lisp: internet radio through spool, found by name), Pictures
+   (glass/media-pictures, found by name) and Documents (glass/media-documents, found by name) -- the
+   one showing given the whole window under the tab strip.  Each draws into a framebuffer of its own,
+   kept painted while hidden, and the one showing is copied into FB; a press goes to whichever part
+   it started in until it is released.  Pictures and Documents are made the first time they are
+   shown: a window that never looks reads no folder and decodes nothing.  With only Stations there
+   is nothing to choose between, so the window is the Stations alone.  No RESIZE-FN and no TEXT-P,
+   as before."
   (let ((keys (%media-tab-keys)))
     (when (null (cdr keys))
-      ;; NO FILE PLAYER AND NO PICTURES HERE: the window is the Stations, rather than a pane
-      ;; saying what is missing -- radio does not need warp.
+      ;; NO FILE PLAYER, NO PICTURES, NO DOCUMENTS HERE: the window is the Stations, rather than a
+      ;; pane saying what is missing -- radio does not need warp.
       (let ((panel (radio-panel-open (make-radio-panel fb :whole t))) (down nil))
         (return-from media-app
           (values nil
@@ -524,25 +539,31 @@
            (bh (max 1 (- (glass:fb-height fb) th)))
            (music (and (member :music keys) (glass:make-framebuffer w bh #x0c0e12 (glass:fb-format fb))))
            (stations (glass:make-framebuffer w bh +ra-bg+ (glass:fb-format fb)))
-           (pictures (and (member :pictures keys) (glass:make-framebuffer w bh +ra-bg+ (glass:fb-format fb))))
+           ;; the lazy tabs: KEY -> (FB . PART), PART (ON-KEY ON-POINTER DIRTY-P CLOSE-FN) once shown
+           (lazy (loop for (key) in +media-lazy-tabs+
+                       when (member key keys)
+                         collect (cons key (cons (glass:make-framebuffer w bh +ra-bg+ (glass:fb-format fb)) nil))))
            (panel (radio-panel-open (make-radio-panel stations :whole t)))
            ;; a station already on is what this window opens on
            (tab (if (%ra-active-p *radio-tuner*) :stations (first keys)))
            (shown nil)                        ; the tab last copied into FB, NIL = draw it all
-           (grab nil)
-           (pic nil))                         ; Pictures' (ON-KEY ON-POINTER DIRTY-P CLOSE-FN), once shown
+           (grab nil))
       (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn)
           (if music (%warp-media-window music) (values nil nil nil nil nil))
         (declare (ignore copy-p))          ; a move hint in a part's coordinates is not one in FB's
-        (flet ((pictures-part ()
-                 (or pic
-                     (setf pic (multiple-value-bind (k p d c x) (funcall (%media-pictures-fn) pictures)
-                                 (declare (ignore c))
-                                 (list k p d x))))))
+        (labels ((part (key)
+                   (let ((cell (cdr (assoc key lazy))))
+                     (or (cdr cell)
+                         (setf (cdr cell) (multiple-value-bind (k p d c x) (funcall (%media-lazy-fn key) (car cell))
+                                            (declare (ignore c))
+                                            (list k p d x))))))
+                 (part-fb (key)
+                   (case key (:music music) (:stations stations) (t (cadr (assoc key lazy))))))
           (values (lambda (down keysym)
                     (case tab
                       (:music (when on-key (funcall on-key down keysym)))
-                      (:pictures (funcall (first (pictures-part)) down keysym))))
+                      (:stations nil)
+                      (t (funcall (first (part tab)) down keysym))))
                   (lambda (mask x y)
                     (let ((to (or grab (if (< y th) :tabs tab))))
                       (when (and (logbitp 0 mask) (null grab))
@@ -552,27 +573,28 @@
                                    (unless (eq want tab) (setf tab want shown nil))))
                           (:stations (radio-panel-press panel x (- y th)))))
                       (case to
+                        ((:tabs :stations) nil)
                         (:music (when on-pointer (funcall on-pointer mask x (max 0 (- y th)))))
-                        (:pictures (funcall (second (pictures-part)) mask x (max 0 (- y th)))))
+                        (t (funcall (second (part to)) mask x (max 0 (- y th)))))
                       (when (zerop mask) (setf grab nil))))
                   (lambda ()
                     ;; every part stays painted, so a tab shows at once what it last showed
-                    (let ((m (and dirty-p (funcall dirty-p) t))
-                          (r (radio-panel-dirty-p panel))
-                          (p (and (or pic (eq tab :pictures)) (funcall (third (pictures-part))) t)))
+                    (let ((changed (list (cons :music (and dirty-p (funcall dirty-p) t))
+                                         (cons :stations (radio-panel-dirty-p panel)))))
+                      (loop for (key . (nil . made)) in lazy
+                            when (or made (eq tab key))
+                              do (push (cons key (and (funcall (third (part key))) t)) changed))
                       (cond ((not (eq shown tab))
                              (%media-tabs fb tab keys)
-                             (glass:fb-blit-clipped fb (ecase tab (:music music) (:stations stations)
-                                                         (:pictures pictures))
-                                                    0 th)
+                             (glass:fb-blit-clipped fb (part-fb tab) 0 th)
                              (setf shown tab)
                              t)
-                            ((and (eq tab :music) m) (glass:fb-blit-clipped fb music 0 th) t)
-                            ((and (eq tab :stations) r) (glass:fb-blit-clipped fb stations 0 th) t)
-                            ((and (eq tab :pictures) p) (glass:fb-blit-clipped fb pictures 0 th) t))))
+                            ((cdr (assoc tab changed)) (glass:fb-blit-clipped fb (part-fb tab) 0 th) t))))
                   nil
                   (lambda ()
                     (unwind-protect (when close-fn (funcall close-fn))
-                      (unwind-protect (when pic (funcall (fourth pic)))
+                      (unwind-protect
+                           (loop for (nil . (nil . made)) in lazy
+                                 when made do (ignore-errors (funcall (fourth made))))
                         (radio-panel-close panel))))
                   nil nil))))))

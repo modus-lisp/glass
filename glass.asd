@@ -123,15 +123,34 @@ functions over the app contract both desktops host (glass/desk and glass/wm), an
                                                      ;; through spool, found by name (no dependency)
                                                      (:file "media-radio")))))
 
+(asdf:defsystem :glass/media-folder
+  :description "What Media's folder tabs (Pictures, Documents) share: a folder never left for one
+above it, a paged view of it, a worker thread of the tab's own fed a replacing wish list through
+mailboxes (cooperative where there are no threads), and one file opened with Prev / Back / Next.
+No decoder of its own: each tab brings one."
+  :depends-on ("glass/desk-apps" "uiop")
+  :serial t
+  :components ((:module "src" :serial t :components ((:file "media-folder")))))
+
 (asdf:defsystem :glass/media-pictures
   :description "Media's Pictures tab: a folder of images (GLASS_PICTURES, else ~/Pictures, else
 Media's folder, never above it), a page of thumbnails, and one picture filling the tab with Prev /
 Next / Back.  Decoded by pigment (pure-CL PNG, JPEG, GIF, WebP, SVG) on a thread of the tab's own,
 never the window manager's.  MEDIA-APP finds it by name: without this system Media has no Pictures
 tab and is otherwise unchanged."
-  :depends-on ("glass/desk-apps" "pigment" "uiop")
+  :depends-on ("glass/media-folder" "pigment")
   :serial t
   :components ((:module "src" :serial t :components ((:file "media-pictures")))))
+
+(asdf:defsystem :glass/media-documents
+  :description "Media's Documents tab: a folder of PDFs (GLASS_DOCUMENTS, else ~/Documents, else
+Media's folder, never above it), a row per document with its first page, title and page count, and
+one document read a page at a time with Prev / Back / Next.  Rendered by folio (pure-CL PDF) on a
+thread of the tab's own, never the window manager's.  MEDIA-APP finds it by name: without this system
+Media has no Documents tab and is otherwise unchanged."
+  :depends-on ("glass/media-folder" "folio")
+  :serial t
+  :components ((:module "src" :serial t :components ((:file "media-documents")))))
 
 (asdf:defsystem :glass/voice-apps
   :description "Speak and Listen as desk applications, with no McCLIM: a box to type into and a voice to say
