@@ -283,16 +283,18 @@
    (radio-was :initform nil :accessor panel-radio-was))
   (:documentation "The Stations panel at the bottom of one Media window."))
 
-(defun radio-panel-height (window-height n-stations)
+(defun radio-panel-height (window-height n-stations &key whole)
   "(values HEIGHT ROWS): a head, the now-playing line, and as many station rows as there are,
-   up to half the window -- the rest stays the file list's.  Paged beyond that."
+   up to half the window -- the rest stays the file list's.  Paged beyond that.  WHOLE: there is
+   no file list (warp's player is not loaded), so the panel is the window."
   (let* ((fixed (+ *ra-head-h* *ra-now-h*))
-         (fit (max 1 (floor (- (floor window-height 2) fixed) *ra-row-h*)))
+         (room (if whole window-height (floor window-height 2)))
+         (fit (max 1 (floor (- room fixed) *ra-row-h*)))
          (rows (max 1 (min (max 1 n-stations) fit))))
-    (values (+ fixed (* rows *ra-row-h*)) rows)))
+    (values (if whole window-height (+ fixed (* rows *ra-row-h*))) rows)))
 
-(defun make-radio-panel (fb &key (stations (media-stations)) (tuner *radio-tuner*))
-  (multiple-value-bind (h rows) (radio-panel-height (glass:fb-height fb) (length stations))
+(defun make-radio-panel (fb &key (stations (media-stations)) (tuner *radio-tuner*) whole)
+  (multiple-value-bind (h rows) (radio-panel-height (glass:fb-height fb) (length stations) :whole whole)
     (make-instance 'radio-panel :fb fb :tuner tuner :stations stations :rows rows :height h
                                 :y (- (glass:fb-height fb) h))))
 
@@ -454,3 +456,82 @@
   (let* ((tu (panel-tuner pn))
          (left (sb-thread:with-mutex ((tuner-lock tu)) (setf (tuner-windows tu) (max 0 (1- (tuner-windows tu)))))))
     (when (zerop left) (%ra-teardown tu))))
+
+;;; ---- Media: the Music and Stations tabs --------------------------------------------------
+
+(defparameter *media-tab-h* 36 "Media's tab strip: a fingertip tall.")
+
+(defun %media-tabs (fb tab)
+  "Media's tab strip across the top of FB, TAB (:music or :stations) the one showing."
+  (let* ((w (glass:fb-width fb)) (h *media-tab-h*) (half (floor w 2)))
+    (glass:fb-rect fb 0 0 w h +ra-head+)
+    (loop for (key label) in '((:music "Music") (:stations "Stations"))
+          for x from 0 by half
+          for tw = (if (eq key :stations) (- w half) half)
+          for on = (eq key tab)
+          do (when on (glass:fb-rect fb x 0 tw h +ra-sel+))
+             (%ra-text fb (+ x (floor (- tw (%ra-width label 13)) 2)) (%ra-baseline 0 (- h 3) 13) label
+                       :size 13 :color (if on +ra-fg+ +ra-dim+))
+             (when on (glass:fb-rect fb x (- h 3) tw 3 +ra-on+)))
+    (glass:fb-rect fb half 6 1 (- h 12) +ra-bg+)))
+
+(defun media-app (fb)
+  "Media: two tabs, Music (warp's player over *MEDIA-ROOT*, which needs warp-media/glass loaded)
+   and Stations (media-radio.lisp: internet radio through spool, found by name), the one showing
+   given the whole window under the tab strip.  Each draws into a framebuffer of its own, kept
+   painted while hidden, and the one showing is copied into FB; a press goes to whichever part it
+   started in until it is released.  Without warp's player there is nothing to choose between, so
+   the window is the Stations alone.  No RESIZE-FN and no TEXT-P, as before."
+  (unless (%warp-media-p)
+    ;; NO FILE PLAYER HERE (warp-media/glass not loaded): the window is the Stations, rather
+    ;; than a pane saying what is missing -- radio does not need warp.
+    (let ((panel (radio-panel-open (make-radio-panel fb :whole t))) (down nil))
+      (return-from media-app
+        (values nil
+                (lambda (mask x y)            ; on the press, not on every move while held
+                  (let ((now (logbitp 0 mask)))
+                    (when (and now (not down)) (radio-panel-press panel x y))
+                    (setf down now)))
+                (lambda () (radio-panel-dirty-p panel))
+                nil
+                (lambda () (radio-panel-close panel))
+                nil nil))))
+  (let* ((w (glass:fb-width fb)) (th *media-tab-h*)
+         (bh (max 1 (- (glass:fb-height fb) th)))
+         (music (glass:make-framebuffer w bh #x0c0e12 (glass:fb-format fb)))
+         (stations (glass:make-framebuffer w bh +ra-bg+ (glass:fb-format fb)))
+         (panel (radio-panel-open (make-radio-panel stations :whole t)))
+         ;; a station already on is what this window opens on
+         (tab (if (%ra-active-p *radio-tuner*) :stations :music))
+         (shown nil)                          ; the tab last copied into FB, NIL = draw it all
+         (grab nil))
+    (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn) (%warp-media-window music)
+      (declare (ignore copy-p))            ; a move hint in MUSIC's coordinates is not one in FB's
+      (values (lambda (down keysym) (when (and on-key (eq tab :music)) (funcall on-key down keysym)))
+              (lambda (mask x y)
+                (let ((to (or grab (if (< y th) :tabs tab))))
+                  (when (and (logbitp 0 mask) (null grab))
+                    (setf grab to)
+                    (case to
+                      (:tabs (let ((want (if (< x (floor w 2)) :music :stations)))
+                               (unless (eq want tab) (setf tab want shown nil))))
+                      (:stations (radio-panel-press panel x (- y th)))))
+                  (when (and (eq to :music) on-pointer)
+                    (funcall on-pointer mask x (max 0 (- y th))))
+                  (when (zerop mask) (setf grab nil))))
+              (lambda ()
+                ;; both stay painted, so a tab shows at once what it last showed
+                (let ((m (and dirty-p (funcall dirty-p) t))
+                      (r (radio-panel-dirty-p panel)))
+                  (cond ((not (eq shown tab))
+                         (%media-tabs fb tab)
+                         (glass:fb-blit-clipped fb (if (eq tab :music) music stations) 0 th)
+                         (setf shown tab)
+                         t)
+                        ((and (eq tab :music) m) (glass:fb-blit-clipped fb music 0 th) t)
+                        ((and (eq tab :stations) r) (glass:fb-blit-clipped fb stations 0 th) t))))
+              nil
+              (lambda ()
+                (unwind-protect (when close-fn (funcall close-fn))
+                  (radio-panel-close panel)))
+              nil nil))))

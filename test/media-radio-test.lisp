@@ -136,28 +136,37 @@
 (defun target (panel label)
   (find label (glass.desk::panel-targets panel) :key #'glass.desk::rt-label :test #'equal))
 
+(defvar *panels* '())
+(defmethod initialize-instance :after ((p glass.desk:radio-panel) &key) (push p *panels*))
+
+(defvar *panel-window-h* (make-hash-table) "Each panel's window height, for its taps' offset.")
+(defvar *win-h* 0 "The height of the Media window the taps go to.")
+
 (defun open-media (w h)
   "Media in a W x H framebuffer: (values fb on-pointer dirty-p close-fn panel)."
+  (setf *win-h* h)
   (let ((fb (glass:make-framebuffer w h)))
     (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn resize-fn text-p selection-fn)
         (glass.desk:media-app fb)
       (declare (ignore on-key copy-p))
       (check (format nil "~dx~d: no RESIZE-FN, TEXT-P or SELECTION-FN, as before" w h)
              (and (null resize-fn) (null text-p) (null selection-fn)))
-      ;; the panel is the one this window made: the newest with this framebuffer
+      ;; the panel is the one this window made: the newest
+      (when *panels* (setf (gethash (first *panels*) *panel-window-h*) h))
       (values fb on-pointer dirty-p close-fn))))
 
 (defun tap (on-pointer x y) (funcall on-pointer 1 x y) (funcall on-pointer 0 x y))
 
+
 (defun tap-label (on-pointer panel label)
-  (let ((tg (target panel label)))
+  "Tap LABEL's target; the panel's framebuffer sits at the bottom of ITS window (under the tabs)."
+  (let ((tg (target panel label))
+        (off (- (gethash panel *panel-window-h* *win-h*) (glass:fb-height (glass.desk::panel-fb panel)))))
     (when tg
       (tap on-pointer (+ (glass.desk::rt-x tg) (floor (glass.desk::rt-w tg) 2))
-           (+ (glass.desk::rt-y tg) (floor (glass.desk::rt-h tg) 2)))
+           (+ off (glass.desk::rt-y tg) (floor (glass.desk::rt-h tg) 2)))
       t)))
 
-(defvar *panels* '())
-(defmethod initialize-instance :after ((p glass.desk:radio-panel) &key) (push p *panels*))
 
 (let* ((mixer (glass:make-mixer :rate 48000))
        (glass.desk:*media-mixer* mixer)
@@ -166,23 +175,26 @@
        (tu glass.desk:*radio-tuner*)
        (png-dir (sb-ext:posix-getenv "MEDIA_PNG_DIR")))
   (glass:mixer-subscribe mixer :name "ear" :rate 48000)
-  (multiple-value-bind (fb on-pointer dirty-p close-fn) (open-media 480 520)
+  (multiple-value-bind (fb on-pointer dirty-p close-fn) (open-media 480 300)
     (let ((panel (first *panels*)))
       (check "it paints when opened" (funcall dirty-p))
       (check "and then is quiet (no repaint for 1.5 s with nothing playing)"
              (loop repeat 75 never (progn (sleep 0.02) (funcall dirty-p))))
-      (check "the panel takes the bottom of the window, the file list the rest"
-             (and (= (glass.desk::panel-y panel) (- 520 (glass.desk::panel-height panel)))
-                  (<= (glass.desk::panel-height panel) 260)))
+      (check "it opens on the Music tab: warp's file list under the tab strip"
+             (let ((seen (make-hash-table)))
+               (loop for y from 40 below 300 by 3
+                     do (loop for x from 0 below 480 by 3 do (setf (gethash (glass:fb-get fb x y) seen) t)))
+               (> (hash-table-count seen) 4)))
       (check "warp's file list is listed above it (the track in Media's folder)"
              (let ((lib glass.desk::*media-library*))
                (and lib (find "sweep" (warp-media:folder-tracks (warp-media:library-root lib))
                               :key #'pathname-name :test #'string=))))
-      (check "and painted: the top half is not blank"
-             (let ((seen (make-hash-table)))
-               (loop for y from 0 below (glass.desk::panel-y panel) by 3
-                     do (loop for x from 0 below 480 by 3 do (setf (gethash (glass:fb-get fb x y) seen) t)))
-               (> (hash-table-count seen) 4)))
+      (tap on-pointer 360 18) (funcall dirty-p)        ; the Stations tab
+      (check "a tap on Stations: the stations are the whole window under the tabs"
+             (and (= (glass:fb-height (glass.desk::panel-fb panel)) (- 300 glass.desk::*media-tab-h*))
+                  (= 0 (glass.desk::panel-y panel))
+                  (= (glass:fb-get fb 240 (+ glass.desk::*media-tab-h* 10))
+                     (glass:fb-get (glass.desk::panel-fb panel) 240 10))))
       (check "page 1: the first five stations, a row each, every row a fingertip tall and the full width"
              (let ((rows (remove-if-not (lambda (tg) (find (glass.desk::rt-label tg) (glass.desk:panel-stations panel)
                                                            :key #'car :test #'equal))
@@ -252,8 +264,9 @@
                    (and (= 1 (glass.desk::%ra-pages np)) (not (target np "Next page"))
                         (every (lambda (s) (let ((tg (target np (car s)))) (and tg (= 400 (glass.desk::rt-w tg)))))
                                (glass.desk:panel-stations np))))
-            (check "400x700: the panel still leaves the file list most of the window"
-                   (>= (glass.desk::panel-y np) 350))
+            (check "400x700: a station is on, so it opens on the Stations tab"
+                   (= (glass:fb-get nfb 200 (+ glass.desk::*media-tab-h* 10))
+                      (glass:fb-get (glass.desk::panel-fb np) 200 10)))
             (when png-dir (save-png nfb (format nil "~a/media-400x700.png" (string-right-trim "/" png-dir))))
             (funcall nclose)
             (check "closing one of two windows leaves the station playing"
@@ -294,7 +307,9 @@
          (multiple-value-bind (k on-pointer dirty-p c close-fn) (glass.desk:media-app fb)
            (declare (ignore k c))
            (let ((panel (first *panels*)))
+             (setf (gethash panel *panel-window-h*) 520)
              (check "without spool it still opens and paints" (funcall dirty-p))
+             (tap on-pointer 360 18) (funcall dirty-p)      ; the Stations tab
              (check "and the Stations panel says spool is missing"
                     (search "spool" (glass.desk::%ra-now glass.desk:*radio-tuner*)))
              (tap-label on-pointer panel "Second")
@@ -302,6 +317,22 @@
                     (search "spool" (or (glass.desk:tuner-note glass.desk:*radio-tuner*) "")))
              (funcall close-fn))))
     (rename-package "SPOOL-HIDDEN" "SPOOL")))
+
+;;; without warp's file player, Media is the Stations -- no pane saying what is missing
+(progn
+  (rename-package "WARP-MEDIA-GLASS" "WARP-MEDIA-GLASS-HIDDEN")
+  (unwind-protect
+       (let ((fb (glass:make-framebuffer 400 700 #xffffff)))
+         (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn) (glass.desk:media-app fb)
+           (declare (ignore on-key copy-p))
+           (funcall dirty-p)
+           ;; the top row is the panel's background, not the file pane's near-black
+           (check "without warp, the Stations panel is the whole window"
+                  (/= #x10141a (logand #xffffff (aref (glass:fb-pixels fb) (+ (* 5 400) 200)))))
+           (check "and a station row is still a tap target"
+                  (functionp on-pointer))
+           (funcall close-fn)))
+    (rename-package "WARP-MEDIA-GLASS-HIDDEN" "WARP-MEDIA-GLASS")))
 
 (ignore-errors (sb-bsd-sockets:socket-close *listener*))
 (format t "~&MEDIA-RADIO ~:[FAIL (~d)~;PASS~]~%" (zerop *fails*) *fails*)
