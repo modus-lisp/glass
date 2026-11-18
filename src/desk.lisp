@@ -62,6 +62,9 @@
   (windows '())            ; topmost first
   (apps '())               ; ((label make-fn w h) ...), in menu order; an action is (label fn :action nil)
   (menu nil)               ; NIL, or (x y) of the open root menu
+  (menu-hover nil)         ; the item the pointer is over, highlighted
+  (menu-armed nil)         ; the opening press has been let go: the next release over an item chooses it
+  (last-mask 0)            ; the buttons as the last pointer event had them: a press is a change, not a state
   (drag nil)               ; (window dx dy) while a title bar is held
   (cascade 0)
   (damage '())             ; ((x y w h) ...) to repaint at the next tick
@@ -191,9 +194,41 @@
 
 ;;; ---- input ---------------------------------------------------------------------------------------
 
+(defun %damage-menu (desk)
+  (multiple-value-bind (mx my mw mh) (%menu-box desk)
+    (%damage desk (1- mx) (1- my) (+ mw 2) (+ mh 2))))
+
+(defun %close-menu (desk)
+  (%damage-menu desk)
+  (setf (desk-menu desk) nil (desk-menu-hover desk) nil (desk-menu-armed desk) nil))
+
+(defun %menu-pointer (desk x y pressed released)
+  "A pointer event while the root menu is open, as McCLIM's menus take it (and glass's window manager's):
+   the item under the pointer is highlighted as it moves; RELEASING over an item chooses it -- so a press on
+   the background, a drag to an item and a lift opens it -- except the opening press's own lift where it was
+   pressed, which leaves the menu up to be tapped into; a release or a new press anywhere else closes it.
+   A move with the button held chooses nothing."
+  (let ((label (%menu-item-at desk x y)))
+    (unless (equal label (desk-menu-hover desk))
+      (setf (desk-menu-hover desk) label)
+      (%damage-menu desk))
+    (cond (released
+           (destructuring-bind (ox oy) (desk-menu desk)
+             (if (and (not (desk-menu-armed desk)) (<= (abs (- x ox)) 8) (<= (abs (- y oy)) 8))
+                 (setf (desk-menu-armed desk) t)            ; a tap opened it: it stays for the next
+                 (progn (%close-menu desk)
+                        (when label (desk-open desk label))))))
+          ;; a press on an item: chosen when it is let go (there, or after a drag to another); elsewhere, closed
+          (pressed (if label (setf (desk-menu-armed desk) t) (%close-menu desk))))))
+
 (defun desk-pointer (desk mask x y)
-  "A pointer event in desk pixels.  MASK bit 0 is the button."
-  (let ((down (logbitp 0 mask)))
+  "A pointer event in desk pixels.  MASK bit 0 is the button.  What a press does happens when the button
+   goes down -- not again for every move it makes while held."
+  (let* ((down (logbitp 0 mask))
+         (was (logbitp 0 (desk-last-mask desk)))
+         (pressed (and down (not was)))
+         (released (and was (not down))))
+    (setf (desk-last-mask desk) mask)
     (cond
       ;; a title bar held: follow the pointer, let go on lift
       ((desk-drag desk)
@@ -213,22 +248,17 @@
          (unless down (setf (win-pressed win) nil))
          (when (win-on-pointer win)
            (funcall (win-on-pointer win) mask (- x (win-x win)) (- y (win-y win))))))
-      ;; the menu is open: a press on an item opens it, anywhere else closes the menu
-      ((desk-menu desk)
-       (when down
-         (let ((label (%menu-item-at desk x y)))
-           (multiple-value-bind (mx my mw mh) (%menu-box desk)
-             (%damage desk (1- mx) (1- my) (+ mw 2) (+ mh 2)))
-           (setf (desk-menu desk) nil)
-           (when label (desk-open desk label)))))
-      (down
+      ;; the menu is open: it has the pointer
+      ((desk-menu desk) (%menu-pointer desk x y pressed released))
+      ;; the button held from a press that is over (it closed the menu, say): nothing to do until it is let go
+      ((and down (not pressed)) nil)
+      (pressed
        (multiple-value-bind (win part) (%hit desk x y)
          (cond
            ((null win)
             (%focus desk nil)                       ; the desktop takes no typing
-            (setf (desk-menu desk) (list x y))
-            (multiple-value-bind (mx my mw mh) (%menu-box desk)
-              (%damage desk (1- mx) (1- my) (+ mw 2) (+ mh 2))))
+            (setf (desk-menu desk) (list x y) (desk-menu-hover desk) nil (desk-menu-armed desk) nil)
+            (%damage-menu desk))
            ((eq part :close) (%close desk win))
            ((eq part :copy)
             (let ((text (funcall (win-copy-fn win))))
@@ -303,7 +333,9 @@
       (let ((items (%menu-items desk)))
         (if items
             (loop for label in items for i from 0
-                  do (glass:fb-text fb (+ mx 12) (%text-top (+ my (* i *menu-item-h*)) *menu-item-h*) label
+                  do (when (equal label (desk-menu-hover desk))
+                       (glass:fb-rect fb mx (+ my (* i *menu-item-h*)) mw *menu-item-h* *menu-hi*))
+                     (glass:fb-text fb (+ mx 12) (%text-top (+ my (* i *menu-item-h*)) *menu-item-h*) label
                                     :size *font-size* :color *menu-fg*))
             (glass:fb-text fb (+ mx 12) (%text-top my *menu-item-h*) "(no applications)"
                            :size *font-size* :color *menu-fg*))))))

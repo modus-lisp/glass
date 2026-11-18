@@ -138,5 +138,46 @@
     (glass.desk:desk-pointer d 1 590 790) (glass.desk:desk-pointer d 0 590 790)
     (check "tapping the desktop puts it away" (null (first calls)))))
 
+;; the menu takes a drag as McCLIM's did: nothing chosen while the button is held, the item under the
+;; lift chosen once
+(let* ((screen (glass:make-framebuffer 600 800))
+       (d (glass.desk:make-desk screen))
+       (opened '()))
+  (dolist (name '("One" "Two" "Three"))
+    (let ((name name)) (glass.desk:desk-register-action d name (lambda () (push name opened)))))
+  (glass.desk:desk-tick d)
+  (let ((h glass.desk:*menu-item-h*))
+    ;; press on the background, drag down across every item, button held the whole way
+    (glass.desk:desk-pointer d 1 100 100)
+    (loop for y from 101 to (+ 100 (* 3 h) -5) by 3 do (glass.desk:desk-pointer d 1 105 y))
+    (check "dragging across the menu chooses nothing" (null opened))
+    (check "and keeps it open" (glass.desk::desk-menu d))
+    (check "the item under the pointer is highlighted" (equal (glass.desk::desk-menu-hover d) "Three"))
+    ;; let go over the third
+    (glass.desk:desk-pointer d 0 105 (+ 100 (* 2 h) 5))
+    (check "the lift chooses the item under it, once" (equal opened '("Three")))
+    (check "and closes the menu" (null (glass.desk::desk-menu d)))
+    ;; a drag across the bare desktop opens one menu, not one per move
+    (setf opened '())
+    (glass.desk:desk-pointer d 1 300 300)
+    (loop for x from 301 to 500 by 5 do (glass.desk:desk-pointer d 1 x 300))
+    (glass.desk:desk-pointer d 0 500 300)
+    (check "a drag off the menu chooses nothing, and closes it" (and (null opened) (null (glass.desk::desk-menu d))))
+    ;; a tap opens it and leaves it open; a tap on an item chooses it
+    (glass.desk:desk-pointer d 1 100 100) (glass.desk:desk-pointer d 0 100 100)
+    (check "a tap leaves the menu open" (glass.desk::desk-menu d))
+    (glass.desk:desk-pointer d 1 105 (+ 100 h 5))
+    (check "a press on an item chooses nothing yet" (null opened))
+    (glass.desk:desk-pointer d 0 105 (+ 100 h 5))
+    (check "its lift chooses it" (equal opened '("Two")))
+    ;; a press off an open menu closes it, and the drag after it opens nothing
+    (glass.desk:desk-pointer d 1 100 100) (glass.desk:desk-pointer d 0 100 100)
+    (setf opened '())
+    (glass.desk:desk-pointer d 1 500 700)
+    (loop for y from 700 downto 100 by 10 do (glass.desk:desk-pointer d 1 105 y))
+    (glass.desk:desk-pointer d 0 105 105)
+    (check "a press that closed the menu, dragged over where it was, opens nothing"
+           (and (null opened) (null (glass.desk::desk-menu d))))))
+
 (format t "~&DESK ~:[FAIL (~d)~;PASS~]~%" (zerop *fails*) *fails*)
 (sb-ext:exit :code (if (zerop *fails*) 0 1))
