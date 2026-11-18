@@ -23,6 +23,24 @@
             ("Terminal" glass-term:terminal-app :width 640 :height 400)))
   "SERVE-WM's root menu: the desk's applications, a Lisp listener and a shell terminal.")
 
+;; The McCLIM desktop's other applications, each in a system of its own that glass must not depend
+;; on (loom and warren depend on glass): (LABEL PACKAGE NAME WIDTH HEIGHT), the MAKE-FN found by
+;; name.  Whoever composes the desktop loads the ones it wants; the menu offers what is loaded.
+(defparameter *wm-optional-apps*
+  '(("Files"    "WARREN"     "DESKTOP-SURFACE" 1000 640)     ; warren, the file browser
+    ("Browser"  "LOOM.GLASS" "BROWSER-APP"      900 620)     ; loom/glass
+    ("Podcasts" "SPOOL.DESK" "PODCASTS-APP"     980 660)     ; spool/desk
+    ("Speak"    "GLASS.DESK" "SPEAK-APP"        400 300)     ; glass/voice-apps
+    ("Listen"   "GLASS.DESK" "LISTEN-APP"       400 320)))
+
+(defun wm-available-apps (&optional (apps *wm-apps*))
+  "APPS, then each of *WM-OPTIONAL-APPS* whose system is loaded."
+  (append apps
+          (loop for (label pkg name w h) in *wm-optional-apps*
+                for s = (and (find-package pkg) (find-symbol name pkg))
+                when (and s (fboundp s) (not (find label apps :key #'first :test #'string=)))
+                  collect (list label s :width w :height h))))
+
 (defun serve-wm (port &rest args &key width height apps open address clients stop audio-port
                                       audio-path)
   "Serve the window manager WIDTH x HEIGHT on PORT: a network thread (every viewer), a
@@ -43,7 +61,7 @@
   (ignore-errors (sb-thread:join-thread compositor))
   (when (eq glass-repl:*listener* listener) (setf glass-repl:*listener* nil)))
 
-(defun start-wm (port &key (width 800) (height 600) (apps *wm-apps*) (open '("Clock"))
+(defun start-wm (port &key (width 800) (height 600) (apps (wm-available-apps)) (open '("Clock"))
                            (address "127.0.0.1") clients stop audio-port audio-path)
   "SERVE-WM without its listener loop: start the network and compositor threads and return
    (values LISTENER NETWORK COMPOSITOR) at once.  THIS thread must then serve LISTENER --
@@ -145,6 +163,16 @@
    (lambda ()
      (let* ((snd (and sound-box (funcall 'wm-sound-open sound-box)))
             (glass.desk:*media-mixer* (and snd (funcall 'wm-sound-mixer snd))))
+       ;; ONE DESKTOP, ONE MIX.  The voice (glass/speech) and the podcast player (spool) play into
+       ;; GLASS:SESSION-MIXER, which would otherwise make a second mixer with its own clock that
+       ;; nobody serves: the gateway hears THIS one, on AUDIO-PORT.  So this mixer is the
+       ;; session's, unless the process already has one.  SBCL only: their threads add sources
+       ;; under the mixer's lock, and where threads share nothing (modus) another thread may not
+       ;; hold this one at all.
+       #-modus
+       (when snd
+         (sb-thread:with-mutex (glass::*session-mixer-lock*)
+           (unless glass::*session-mixer* (setf glass::*session-mixer* glass.desk:*media-mixer*))))
        (glass:with-own-glyph-cache () (%wm-compositor-1 fb inbox wake apps open snd))))))
 
 (defun %superseded-p (wm m rest)

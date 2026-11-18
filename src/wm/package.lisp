@@ -15,7 +15,7 @@
   (:use #:cl)
   (:export
    ;; serving it
-   #:serve-wm #:start-wm #:stop-wm
+   #:serve-wm #:start-wm #:stop-wm #:*wm-apps* #:*wm-optional-apps* #:wm-available-apps
    ;; embedding it (the same shape as glass.desk's MAKE-DESK / DESK-POINTER / DESK-TICK)
    #:make-wm #:wm-register-app #:wm-open #:wm-pointer #:wm-key #:wm-tick #:wm-redraw #:wm-resize-screen
    #:wm-fb #:wm-surfaces #:wm-apps #:wm-focus #:wm-keyboard-fn

@@ -118,7 +118,10 @@ functions over the app contract both desktops host (glass/desk and glass/wm), an
 *STANDARD-APPS*, the menu they make."
   :depends-on ("glass/desk" "glass/text")
   :serial t
-  :components ((:module "src" :serial t :components ((:file "desk-apps")))))
+  :components ((:module "src" :serial t :components ((:file "desk-apps")
+                                                     ;; Media's Stations panel: internet radio
+                                                     ;; through spool, found by name (no dependency)
+                                                     (:file "media-radio")))))
 
 (asdf:defsystem :glass/voice-apps
   :description "Speak and Listen as desk applications, with no McCLIM: a box to type into and a voice to say

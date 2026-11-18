@@ -1,4 +1,5 @@
-;;;; desk-apps.lisp — the desk's own applications: Clock, Notes, Paint, and Media from warp.
+;;;; desk-apps.lisp — the desk's own applications: Clock, Notes, Paint, and Media from warp
+;;;; (with internet radio under it: media-radio.lisp).
 ;;;;
 ;;;; Each is a desk application (DESK-REGISTER-APP's MAKE-FN: called with the window's content
 ;;;; framebuffer, returning ON-KEY ON-POINTER DIRTY-P [COPY-P CLOSE-FN RESIZE-FN TEXT-P]) and a
@@ -238,8 +239,9 @@
         (funcall tables body)
         (funcall body))))
 
-(defun media-app (fb)
-  "Media: warp's player over *MEDIA-ROOT*.  Needs the warp-media-glass system loaded."
+(defun %warp-media-window (fb)
+  "warp's player over *MEDIA-ROOT* in FB: (values ON-KEY ON-POINTER DIRTY-P COPY-P CLOSE-FN), or a
+   window saying warp-media-glass is missing."
   (let ((make-lib (and (find-package "WARP-MEDIA") (find-symbol "MAKE-LIBRARY" "WARP-MEDIA")))
         (make-win (and (find-package "WARP-MEDIA-GLASS")
                        (find-symbol "MAKE-MEDIA-WINDOW" "WARP-MEDIA-GLASS"))))
@@ -250,15 +252,50 @@
         (let ((lib (or *media-library*
                        (setf *media-library* (funcall make-lib :root (or *media-root* "./")
                                                          :mixer *media-mixer*)))))
-          ;; FIVE values, then no RESIZE-FN and no TEXT-P: the player's sixth value is its
-          ;; consumer, which a desktop would read as RESIZE-FN (and once read as TEXT-P, raising a
-          ;; keyboard for it -- kiln found that).
+          ;; FIVE values: the player's sixth value is its consumer, which a desktop would read as
+          ;; RESIZE-FN (and once read as TEXT-P, raising a keyboard for it -- kiln found that).
           (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn) (funcall make-win fb lib)
-            (values on-key on-pointer dirty-p copy-p close-fn nil nil))))))
+            (values on-key on-pointer dirty-p copy-p close-fn))))))
+
+(defun media-app (fb)
+  "Media: warp's player over *MEDIA-ROOT* (needs the warp-media-glass system loaded), and under it
+   the Stations panel (media-radio.lisp: internet radio through spool, found by name).
+
+   warp's window draws into a framebuffer of its own, the window's width and the height the panel
+   leaves, which is copied into FB whenever it repaints; the panel draws straight into FB below
+   it.  A press goes to whichever half it started in, and stays there until it is released, so a
+   drag that wanders across the line is still the drag it started as.  No RESIZE-FN and no TEXT-P,
+   as before."
+  (let* ((w (glass:fb-width fb))
+         (panel (radio-panel-open (make-radio-panel fb)))
+         (split (panel-y panel))
+         (top (glass:make-framebuffer w (max 1 split) #x0c0e12 (glass:fb-format fb)))
+         (grab nil))
+    (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn) (%warp-media-window top)
+      (declare (ignore copy-p))           ; a move hint in TOP's coordinates is not one in FB's
+      (values on-key
+              (lambda (mask x y)
+                (let ((to (or grab (if (< y split) :top :panel))))
+                  (when (and (logbitp 0 mask) (null grab))
+                    (setf grab to)
+                    (when (eq to :panel) (radio-panel-press panel x y)))
+                  (when (and (eq to :top) on-pointer)
+                    (funcall on-pointer mask x (min y (1- split))))
+                  (when (zerop mask) (setf grab nil))))
+              (lambda ()
+                (let ((a (and dirty-p (funcall dirty-p) t)))
+                  (when a (glass:fb-blit-clipped fb top 0 0))
+                  (let ((b (radio-panel-dirty-p panel)))
+                    (and (or a b) t))))
+              nil
+              (lambda ()
+                (unwind-protect (when close-fn (funcall close-fn))
+                  (radio-panel-close panel)))
+              nil nil))))
 
 (defparameter *standard-apps*
   '(("Clock" clock-app :width 260 :height 110)
     ("Notes" notes-app :width 420 :height 300)
     ("Paint" paint-app :width 320 :height 240)
-    ("Media" media-app :width 480 :height 440))
+    ("Media" media-app :width 480 :height 520))
   "The desk's applications, as SERVE-DESK takes them: (LABEL MAKE-FN &key WIDTH HEIGHT).")

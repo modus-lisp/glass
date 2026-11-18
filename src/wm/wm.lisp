@@ -71,6 +71,7 @@
   (deco-fb nil) (deco-w -1)             ; cached title bar, and the width it was drawn for
   on-key on-pointer dirty-p copy-p close-fn resize-fn
   (text-p nil)
+  (selection-fn nil)                    ; () -> what the window has highlighted now, or NIL
   (copy-base nil)                       ; content box as of the last composite that drew it whole
   (saved-geom nil)                      ; (x y w h) saved by Full Size
   (err-count 0))
@@ -369,12 +370,13 @@
              (c (wm-cascade wm))
              (x (max (wm-border) (min (+ 40 c) (- sw w (wm-border)))))
              (y (max (+ (wm-titleh) (wm-border)) (min (+ 40 c (wm-titleh)) (- sh h (wm-border))))))
-        (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn resize-fn text-p)
+        (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn resize-fn text-p selection-fn)
             (funcall make-fn fb)
           (setf (wm-cascade wm) (mod (+ c 28) 200))
           (let ((s (%make-surf :fb fb :x x :y y :title lbl :on-key on-key :on-pointer on-pointer
                                :dirty-p dirty-p :copy-p copy-p :close-fn close-fn
-                               :resize-fn resize-fn :text-p (and text-p t))))
+                               :resize-fn resize-fn :text-p (and text-p t)
+                               :selection-fn selection-fn)))
             (push s (wm-surfaces wm))
             (%focus wm s)
             (damage wm (window-box s))
@@ -562,15 +564,45 @@
 (defun menu-chain-box (wm)
   (when-let (m (wm-menu wm)) (box-union (mapcar #'wm-menu-box (wm-menu-chain m)))))
 
+;;; SPEAKING.  The desktop's voice (glass/voice-apps' *VOICE*, by default the session's chord) says
+;;; what is highlighted in a window, or what was last copied -- the McCLIM desktop's Speak selection
+;;; and Speak clipboard.  Found by name: a desktop without glass/voice-apps offers neither.
+(defun %voice-say-fn ()
+  (let ((say (and (find-package "GLASS.DESK") (find-symbol "VOICE-SAY" "GLASS.DESK")))
+        (voice (and (find-package "GLASS.DESK") (find-symbol "*VOICE*" "GLASS.DESK"))))
+    (and say (fboundp say) voice (boundp voice)
+         (lambda (text) (funcall say (symbol-value voice) text)))))
+
+(defun %speakable (text)
+  (and (stringp text) (string/= "" (string-trim '(#\Space #\Tab #\Newline #\Return) text)) text))
+
+(defun clipboard-menu-items ()
+  "Speak clipboard, when there is a voice and something was copied (a viewer's paste lands in the
+session clipboard, rfb.lisp READ-CLIENT-CUT-TEXT)."
+  (let ((say (%voice-say-fn))
+        (text (%speakable (ignore-errors (glass:clipboard-text (glass:session-clipboard))))))
+    (when (and say text)
+      (list (cons "Speak clipboard" (lambda () (funcall say text)))))))
+
+(defun selection-menu-items (s)
+  "Speak selection, when there is a voice and window S has something highlighted right now."
+  (let ((say (%voice-say-fn))
+        (text (and (surf-selection-fn s) (%speakable (ignore-errors (funcall (surf-selection-fn s)))))))
+    (when (and say text)
+      (list (cons "Speak selection" (lambda () (funcall say text)))))))
+
 (defun wm-open-root-menu (wm x y mask)
   (setf (wm-menu wm)
-        (wm-place-menu (make-wm-menu :items (mapcar (lambda (a) (cons (first a) (list :app (first a))))
-                                                    (wm-apps wm)))
+        (wm-place-menu (make-wm-menu :items (append
+                                             (mapcar (lambda (a) (cons (first a) (list :app (first a))))
+                                                     (wm-apps wm))
+                                             (clipboard-menu-items)))
                        (screen-w wm) (screen-h wm) x y mask))
   (wm-composite wm (menu-chain-box wm)))
 
 (defun window-menu-items (wm s)
   (append
+   (selection-menu-items s)
    (when (surf-resize-fn s)
      (list (cons (if (surf-saved-geom s) "Restore Size" "Full Size") (lambda () (wm-fullsize wm s)))))
    (list (cons "Back" (lambda () (wm-lower wm s)))
