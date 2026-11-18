@@ -746,6 +746,10 @@ its bytes would land in the middle of a rect."
 ;;; that cadence.  The reader thread only stashes the latest FramebufferUpdate-
 ;;; Request in WANT; the sender fulfils it the moment the fb has something to show
 ;;; (polling ~60 Hz).  ONLY the sender writes pixels to the socket.
+(defconstant +max-request-credit+ 4
+  "The most update requests a client may have outstanding at once: what RC-CREDIT counts to.
+   noVNC sends one per update it receives, so this only bounds a client that sends a burst.")
+
 (defstruct (rfb-client (:conc-name rc-))
   (enc +enc-raw+) dss cursor cursor-sent copyrect trle
   eds                           ; client offered ExtendedDesktopSize (-308) specifically
@@ -756,6 +760,7 @@ its bytes would land in the middle of a rect."
   (pbox (list nil))             ; the packed-tile buffer ZRLE reuses for this client (see %ZRLE-PACK-BUF)
   last-size                     ; (cons w h) — fb size last announced to this client
   (want nil)                    ; latest pending request (inc x y w h), or NIL
+  (credit 0)                    ; requests the client has sent that no frame has answered yet
   (last-gen -1)                 ; fb generation this client has already caught up to
   (last-frame -1)               ; fb composite-frame this client has already caught up to
   (id 0)                        ; the connection's id: its identity as a clipboard owner
@@ -984,9 +989,19 @@ its bytes would land in the middle of a rect."
                          ;; change (rtt100: answer at 70 ms, frame at 195 ms, every drag step).
                          ;; The request stays parked for the frame; the client's next request,
                          ;; prompted by the answer, only replaces it.
+                         ;;
+                         ;; AND A FRAME SPENDS ONE REQUEST, NOT ALL OF THEM.  A client that keeps
+                         ;; two requests in flight (the browser does: payload.js) is owed a frame
+                         ;; for each, so the request stays parked while any are unanswered and
+                         ;; the next change goes out without waiting a round trip for the next
+                         ;; ask.  Lockstep -- one request, one frame, then silence until the client
+                         ;; has it and asks again -- held a drag to one update per round trip (5/s
+                         ;; at 100 ms).  A client that asks once at a time is served as before.
                          (when framed
                            (sb-thread:with-mutex ((rc-lock client))
-                             (when (eq (rc-want client) req) (setf (rc-want client) nil))))
+                             (setf (rc-credit client) (max 0 (1- (rc-credit client))))
+                             (when (and (eq (rc-want client) req) (zerop (rc-credit client)))
+                               (setf (rc-want client) nil))))
                          sent))))))
            sent)))))
 
@@ -1130,8 +1145,9 @@ its bytes would land in the middle of a rect."
                (rc-enc client) (rc-trle client) (rc-copyrect client) (length encs))
        (force-output *trace-output*)))
     (:request
-     (sb-thread:with-mutex ((rc-lock client))   ; park the latest request
-       (setf (rc-want client) (rest msg))))
+     (sb-thread:with-mutex ((rc-lock client))   ; park the latest request, and count it
+       (setf (rc-want client) (rest msg)
+             (rc-credit client) (min +max-request-credit+ (1+ (rc-credit client))))))
     (:resize-ack
      (sb-thread:with-mutex ((rc-lock client))
        (setf (rc-resize-ack client) (second msg)))
