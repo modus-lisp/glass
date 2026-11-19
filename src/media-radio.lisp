@@ -36,7 +36,7 @@
 
 (in-package #:glass.desk)
 
-(export '(*default-stations* media-stations media-stations-file *radio-tuner*
+(export '(*default-stations* *media-import* media-stations media-stations-file *radio-tuner*
           tuner-player tuner-station tuner-note radio-panel panel-stations panel-page panel-rows))
 
 ;;; ---- spool and the mixer, by name ------------------------------------------------------------
@@ -494,17 +494,41 @@
   (append (and (%warp-media-p) '(:music)) '(:stations)
           (loop for (key) in +media-lazy-tabs+ when (%media-lazy-fn key) collect key)))
 
+(defvar *media-import* nil
+  "A function of no arguments that brings files into the media folder from elsewhere -- on the
+   phone, the system's document picker (iCloud Drive and the rest), whose picks are copied into
+   *MEDIA-ROOT* -- or NIL.  When set, Media's tab strip ends in a square + that calls it.  Nothing
+   is told when the files arrive: the Music, Pictures and Documents tabs re-read their folders.")
+
+(defun %media-strip-share (w)
+  "How much of a strip W wide the tabs share: all of it, or all but the + square at the right."
+  (if *media-import* (max 1 (- w *media-tab-h*)) w))
+
+(defun %media-import ()
+  "Call *MEDIA-IMPORT*, if there is one; what it signals is not the tab strip's to handle."
+  (let ((f *media-import*))
+    (when f (handler-case (funcall f) (error () nil)))))
+
 (defun %media-tab-at (keys w x)
-  "The tab under X in a strip W wide: equal shares, the last taking what division leaves."
-  (let ((n (length keys)))
-    (nth (max 0 (min (1- n) (floor (max 0 x) (max 1 (floor w n))))) keys)))
+  "The tab under X in a strip W wide: equal shares, the last taking what division leaves; :IMPORT
+   on the + square when there is one."
+  (let ((n (length keys)) (tw (%media-strip-share w)))
+    (if (>= x tw)
+        :import
+        (nth (max 0 (min (1- n) (floor (max 0 x) (max 1 (floor tw n))))) keys))))
 
 (defun %media-tabs (fb tab &optional (keys '(:music :stations)))
   "Media's tab strip across the top of FB, one equal share of the width per KEYS, TAB the one
    showing.  Four across a phone-narrow window are still each a fingertip target; a label too wide
    for its share is drawn a size smaller."
-  (let* ((w (glass:fb-width fb)) (h *media-tab-h*) (n (length keys)) (share (floor w n)))
-    (glass:fb-rect fb 0 0 w h +ra-head+)
+  (let* ((fw (glass:fb-width fb)) (w (%media-strip-share fw)) (h *media-tab-h*) (n (length keys))
+         (share (floor w n)))
+    (glass:fb-rect fb 0 0 fw h +ra-head+)
+    (when (< w fw)                       ; the + square: two bars, a third of the square long
+      (let* ((cx (+ w (floor (- fw w) 2))) (cy (floor h 2)) (r (floor h 6)))
+        (glass:fb-rect fb w 6 1 (- h 12) +ra-bg+)
+        (glass:fb-rect fb (- cx r) (1- cy) (1+ (* 2 r)) 2 +ra-fg+)
+        (glass:fb-rect fb (1- cx) (- cy r) 2 (1+ (* 2 r)) +ra-fg+)))
     (loop for key in keys
           for i from 0
           for x = (* i share)
@@ -579,7 +603,8 @@
                         (setf grab to)
                         (case to
                           (:tabs (let ((want (%media-tab-at keys w x)))
-                                   (unless (eq want tab) (setf tab want shown nil))))
+                                   (cond ((eq want :import) (%media-import))
+                                         ((not (eq want tab)) (setf tab want shown nil)))))
                           (:stations (radio-panel-press panel x (- y th)))))
                       (case to
                         ((:tabs :stations) nil)
