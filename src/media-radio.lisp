@@ -469,6 +469,7 @@
 ;;; ---- Media: the Music, Stations, Pictures and Documents tabs ------------------------------------
 
 (defparameter *media-tab-h* 36 "Media's tab strip: a fingertip tall.")
+(defparameter *media-hidden-look* 0.5d0 "Seconds between looks at the tabs Media is not showing.")
 
 (defparameter +media-tab-labels+ '((:music . "Music") (:stations . "Stations") (:pictures . "Pictures")
                                    (:documents . "Documents")))
@@ -580,6 +581,7 @@
            ;; a station already on is what this window opens on
            (tab (if (%ra-active-p *radio-tuner*) :stations (first keys)))
            (shown nil)                        ; the tab last copied into FB, NIL = draw it all
+           (hidden-next 0)                    ; when the hidden tabs are next looked at
            (grab nil))
       (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn)
           (if music (%warp-media-window music) (values nil nil nil nil nil))
@@ -612,11 +614,20 @@
                         (t (funcall (second (part to)) mask x (max 0 (- y th)))))
                       (when (zerop mask) (setf grab nil))))
                   (lambda ()
-                    ;; every part stays painted, so a tab shows at once what it last showed
-                    (let ((changed (list (cons :music (and dirty-p (funcall dirty-p) t))
-                                         (cons :stations (radio-panel-dirty-p panel)))))
+                    ;; every part stays painted, so a tab shows at once what it last showed -- but a
+                    ;; HIDDEN part is looked at only every *MEDIA-HIDDEN-LOOK* seconds.  Music's look is
+                    ;; warp's whole pass (its layout re-derived and diffed), about 1 ms on a Mac and
+                    ;; several on a phone; made every frame behind Stations it held the main thread --
+                    ;; the speaker's loop -- 500-900 ms of each second, and the radio broke up.
+                    (let* ((now (get-internal-real-time))
+                           (look (>= now hidden-next))
+                           (changed (list (cons :music (and dirty-p (or look (eq tab :music))
+                                                            (funcall dirty-p) t))
+                                          (cons :stations (radio-panel-dirty-p panel)))))
+                      (when look
+                        (setf hidden-next (+ now (floor (* *media-hidden-look* internal-time-units-per-second)))))
                       (loop for (key . (nil . made)) in lazy
-                            when (or made (eq tab key))
+                            when (or (eq tab key) (and made look))
                               do (push (cons key (and (funcall (third (part key))) t)) changed))
                       (cond ((not (eq shown tab))
                              (%media-tabs fb tab keys)
