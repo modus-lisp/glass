@@ -186,22 +186,32 @@
               t))))                       ; it takes typing: focusing it brings up the keyboard
 
 (defun paint-app (fb)
-  "Paint: press and drag to draw; any key clears."
-  (let ((dirty t) (down nil))
+  "Paint: press and drag to draw; any key clears.  A stroke is joined from each pointer event to
+   the next: a finger on a phone reports a few dozen points a second, and stamped alone they
+   were a trail of dots."
+  (let ((dirty t) (down nil) (lx nil) (ly nil))
     (glass:fb-fill fb #xf4f1ea)
-    (values
-     (lambda (pressed keysym)
-       (declare (ignore keysym))
-       (when pressed (glass:fb-fill fb #xf4f1ea) (setf dirty t)))
-     (lambda (mask x y)
-       (setf down (logtest mask 1))
-       (when down
-         (glass:fb-rect fb (- x 3) (- y 3) 6 6 #x1d3557)
-         (setf dirty t)))
-     (lambda () (prog1 dirty (setf dirty nil)))
-     nil nil
-     ;; a new size is a new canvas: FB-RESIZE does not keep pixels, and neither does Paint
-     (lambda (w h) (glass:fb-resize fb w h #xf4f1ea) (setf dirty t)))))
+    (flet ((dab (x y) (glass:fb-rect fb (- x 3) (- y 3) 6 6 #x1d3557)))
+      (values
+       (lambda (pressed keysym)
+         (declare (ignore keysym))
+         (when pressed (glass:fb-fill fb #xf4f1ea) (setf dirty t)))
+       (lambda (mask x y)
+         (setf down (logtest mask 1))
+         (if (not down)
+             (setf lx nil ly nil)
+             (progn
+               (if lx
+                   ;; the brush every 2 pixels along the segment from the last point
+                   (let ((n (max 1 (ceiling (max (abs (- x lx)) (abs (- y ly))) 2))))
+                     (loop for i from 1 to n
+                           do (dab (+ lx (round (* i (- x lx)) n)) (+ ly (round (* i (- y ly)) n)))))
+                   (dab x y))
+               (setf lx x ly y dirty t))))
+       (lambda () (prog1 dirty (setf dirty nil)))
+       nil nil
+       ;; a new size is a new canvas: FB-RESIZE does not keep pixels, and neither does Paint
+       (lambda (w h) (glass:fb-resize fb w h #xf4f1ea) (setf dirty t))))))
 
 ;;; ---- Media, from warp --------------------------------------------------------------------------
 ;;;
