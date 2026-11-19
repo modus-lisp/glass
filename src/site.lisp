@@ -77,9 +77,11 @@
 ;;;;      process already runs as its owner, so any process that could reach this image could
 ;;;;      already read that file.  What changes is that the secret is now handled by a process that
 ;;;;      stays up for days, holds relay connections, and answers an unauthenticated EVAL on a
-;;;;      socket.  So it is READ PER PUBLISH AND NOT CACHED: SITE-SECRET opens the file, the value
-;;;;      lives inside one LET, and between publishes this image holds no site secret at all.
-;;;;      SITE-NPUB caches only the public name.
+;;;;      socket.  So it is READ PER PUBLISH AND NOT CACHED, AND NEVER ON THE HEAP: WITH-SITE-SECRET
+;;;;      reads the file straight into gossamer memory (non-moving, outside the collector's
+;;;;      reach), signs from there, and wipes it on the way out — see "the site key" below.
+;;;;      Between publishes this image holds no site secret at all; SITE-NPUB caches only the
+;;;;      public name.
 ;;;;   2. A TYPO ON THE CONTROL SOCKET CAN NOW TAKE THE SITE DOWN.  It could not before, because
 ;;;;      the key only ever entered a short-lived `sbcl --script' somebody ran on purpose.
 ;;;;      NSITE-PUBLISH's :REQUIRE-BLOBS covers the worst version (a manifest naming a blob nobody
@@ -89,6 +91,18 @@
 ;;;;      and it is the disposable, internet-facing, respawn-on-crash half.  That is why publishing
 ;;;;      is its own system (:glass/site) rather than another section of nostr.lisp: a system
 ;;;;      boundary is the only thing that reliably keeps code out of an image.
+;;;;
+;;;;      THE HOSTED CARD BREAKS THIS, and says so.  With CARD_ONE_PROCESS=1 the gateway IS the
+;;;;      desktop: one SBCL holds the relay connections, the WebRTC endpoint and the mint.  So on
+;;;;      the card this system is OFF unless CARD_SITE=1 (glass-webrtc/hosted-card/card.sh), and
+;;;;      when it is on, what bounds the exposure is not a process boundary but these three: the
+;;;;      key is in memory only for the length of a publish, in gossamer memory, wiped after; a
+;;;;      publish can only be ASKED for over the card's control socket (CARD_CONTROL=1: 0600,
+;;;;      same uid, refused at accept(2) otherwise); and the internet-facing code shares no
+;;;;      variable with it.  What it does NOT bound: a compromise of that process DURING a
+;;;;      publish could read the key — and, being this uid, could read ~/.glass/site-key at any
+;;;;      time anyway.  The residence of the authority is unchanged from the desktop; the
+;;;;      process it is used in is the exposed one.
 ;;;;
 ;;;; ==============================================================================================
 ;;;; ~/.glass/site-url — A MEMO, NOT A HANDOFF
@@ -131,10 +145,9 @@ nothing — unlike the secret it came from, which is deliberately never held bet
 
 ;; %BLANK->NIL is nostr.lisp's — an exported empty variable and an unset one mean the same thing.
 
-(defun %hex64-p (s)
-  (and (stringp s) (= 64 (length s)) (every (lambda (c) (digit-char-p c 16)) s)))
-
 (defun %read-first-line (path)
+  "PATH's first line that is neither blank nor a `#' comment, trimmed, or NIL.  For PUBLIC things
+only (the site-url memo): it reads through a Lisp string.  The site key never comes through here."
   (handler-case
       (with-open-file (s path :if-does-not-exist nil)
         (and s (loop for line = (read-line s nil)
@@ -144,30 +157,202 @@ nothing — unlike the secret it came from, which is deliberately never held bet
                        return trimmed)))
     (error () nil)))
 
-(defun site-secret (&key (file *site-key-file*))
-  "The site's 64-hex secret, from $GLASS_SITE_SEC / $SITE_SEC, else FILE.  NIL if there is none.
+;;; ---- the site key: read into gossamer memory, used, wiped --------------------
+;;;
+;;; "Secrets aren't supposed to be on the heap, they're supposed to be in separate memory that
+;;; doesn't get copied around."  The moving heap is the wrong place for a key for a reason that has
+;;; nothing to do with who can read this process: a copying collector COPIES.  Every collection
+;;; that moves a string leaves the old bytes behind on a page nobody zeroes until it is reused, so
+;;; a key that touched the heap once is in an unknown number of places for an unknown time, and no
+;;; wipe can find them all.  So the site key never touches it:
+;;;
+;;;   FILE  read(2) straight into a gossamer buffer (natrium's `gossamer': on SBCL a static vector,
+;;;         outside dynamic space, never moved).  No Lisp stream, so no stream buffer either.
+;;;   HEX   decoded byte by byte out of that buffer into a second 32-byte gossamer buffer.  The
+;;;         digits pass through registers as fixnums; nothing is consed.
+;;;   KEY   CL-NOSTR.KEYS:KEYPAIR-FROM-SECRET with that fixed buffer copies it into ANOTHER pooled
+;;;         gossamer buffer (fixed to fixed) — and from there every signature is secp256k1-fast's
+;;;         BIP-340 code, whose scalars are fixed limb buffers released (wiped) per call.
+;;;   WIPE  the raw read buffer and the decoded buffer go back to the pool zeroed when the read
+;;;         returns; the keypair's buffer is wiped by WITH-SITE-SECRET's UNWIND-PROTECT, on every
+;;;         exit, error or not.  Between publishes this image holds no site secret at all.
+;;;
+;;; $GLASS_SITE_SEC / $SITE_SEC ARE THE WEAKER PATH, and it is worth being exact about why.  The
+;;; value is read with getenv(3) and decoded from the C string where the kernel put it, never via
+;;; SB-EXT:POSIX-GETENV (which would make a Lisp string of it) — so it is not on the heap either.
+;;; But the environment block is not ours to wipe: it stays in the process for its whole life,
+;;; /proc/PID/environ shows it to anything of this uid, and every child (a terminal's shell, an
+;;; app) inherits it.  The FILE is the path for a long-running image; the card does not pass the
+;;; variables on at all (card.sh).
 
-CALLED PER PUBLISH AND NEVER CACHED, which is the whole of consequence 1 in the header: between
-publishes this image holds no site secret, so a backtrace, an inspector or a heap dump has nothing
-to find.  It costs one 65-byte read on an operation that already takes tens of seconds."
-  (let ((v (or (%blank->nil (sb-ext:posix-getenv "GLASS_SITE_SEC"))
-               (%blank->nil (sb-ext:posix-getenv "SITE_SEC"))
-               (%read-first-line file))))
-    (and (%hex64-p v) (string-downcase v))))
+(defconstant +site-key-read-max+ 1024
+  "How much of the key file is read: room for a few comment lines and the 64 hex digits.")
+
+(defun %hex-value (b)
+  "The value of the ASCII hex digit B (an octet), or NIL."
+  (declare (type (unsigned-byte 8) b))
+  (cond ((<= 48 b 57) (- b 48))
+        ((<= 97 b 102) (- b 87))
+        ((<= 65 b 70) (- b 55))
+        (t nil)))
+
+(defun %parse-site-key (get n out)
+  "Decode the site key from bytes [0,N) — each read by calling GET with an index — into OUT, a
+fixed 32-byte buffer.  T on success; NIL, with OUT zeroed, otherwise.
+
+The layout is the one the key file always had: blank lines and `#' comment lines are skipped, and
+the first other line, trimmed of blanks, must be exactly 64 hex digits.  GET rather than a vector
+because the bytes are in a gossamer buffer for the file and in C memory for the environment, and
+neither may be copied into a Lisp object to be parsed."
+  (declare (type fixnum n) (type function get))
+  (flet ((blank-p (b) (or (= b 32) (= b 9) (= b 13))))
+    (let ((i 0))
+      (declare (type fixnum i))
+      (loop
+        (loop while (and (< i n) (blank-p (funcall get i))) do (incf i))
+        (when (>= i n) (return nil))
+        (let ((b (funcall get i)))
+          (cond ((= b 10) (incf i))
+                ((= b 35) (loop while (and (< i n) (/= (funcall get i) 10)) do (incf i)))
+                (t                                   ; the key line
+                 (return
+                   (if (and (<= (+ i 64) n)
+                            (dotimes (k 32 t)
+                              (let ((hi (%hex-value (funcall get (+ i (* 2 k)))))
+                                    (lo (%hex-value (funcall get (+ i (* 2 k) 1)))))
+                                (unless (and hi lo) (return nil))
+                                (setf (aref out k) (logior (ash hi 4) lo))))
+                            ;; and nothing after the 64 digits but blanks up to the end of the line
+                            (loop for j from (+ i 64) below n
+                                  for c = (funcall get j)
+                                  until (= c 10)
+                                  always (blank-p c)))
+                       t
+                       (progn (gossamer:wipe out) nil))))))))))
+
+#+(and sbcl (not modus))
+(defun %read-into-fixed (path buf)
+  "Read up to (LENGTH BUF) bytes of PATH straight into BUF with read(2).  Returns the count, or NIL
+if PATH cannot be opened.  No Lisp stream: an fd-stream would put the bytes through a buffer of its
+own first, and that buffer is not ours to wipe."
+  (let ((fd (ignore-errors (sb-unix:unix-open (sb-ext:native-namestring (merge-pathnames path))
+                                              sb-unix:o_rdonly 0))))
+    (when fd
+      (unwind-protect
+           (sb-sys:with-pinned-objects (buf)
+             (let ((sap (sb-sys:vector-sap buf)) (got 0) (n (length buf)))
+               (declare (type fixnum got n))
+               (loop
+                 (let ((r (sb-unix:unix-read fd (sb-sys:sap+ sap got) (- n got))))
+                   (if (and r (plusp r))
+                       (when (>= (incf got r) n) (return got))
+                       (return got))))))
+        (sb-unix:unix-close fd)))))
+
+#-(and sbcl (not modus))
+(defun %read-into-fixed (path buf)
+  "Read up to (LENGTH BUF) bytes of PATH into BUF.  Through a Lisp stream here, so its buffer holds
+a copy for as long as the stream's buffer lives: the direct read(2) is SBCL's."
+  (handler-case
+      (with-open-file (s path :element-type '(unsigned-byte 8) :if-does-not-exist nil)
+        (and s (read-sequence buf s)))
+    (error () nil)))
+
+#+(and sbcl (not modus))
+(defun %env-key-source (name)
+  "NAME's value as (values SAP LENGTH) in the C environment, or NIL if it is unset or blank.
+getenv(3), not SB-EXT:POSIX-GETENV: the latter returns a Lisp string, which is a heap copy."
+  (let ((sap (sb-alien:alien-funcall
+              (sb-alien:extern-alien "getenv" (function sb-sys:system-area-pointer sb-alien:c-string))
+              name)))
+    (unless (zerop (sb-sys:sap-int sap))
+      (let ((n (loop for i fixnum from 0 below 4096
+                     until (zerop (sb-sys:sap-ref-8 sap i))
+                     finally (return i))))
+        (when (loop for i below n
+                    thereis (not (member (sb-sys:sap-ref-8 sap i) '(32 9 10 13))))
+          (values sap n))))))
+
+#+(and sbcl (not modus))
+(defun %env-getter (sap) (lambda (i) (sb-sys:sap-ref-8 sap i)))
+
+#-(and sbcl (not modus))
+(defun %env-getter (sap) (declare (ignore sap)) (error "no C environment reader here"))
+
+#-(and sbcl (not modus))
+(defun %env-key-source (name)
+  "Elsewhere there is no way to read the environment without making a Lisp string of it, so the
+environment is not a source of the site key at all: put it in the file."
+  (declare (ignore name))
+  nil)
+
+(defun %site-key-into (out file)
+  "Decode the site key into OUT (a fixed 32-byte buffer) from $GLASS_SITE_SEC, else $SITE_SEC,
+else FILE.  T if a well-formed key was found; NIL with OUT zeroed otherwise.  A variable that is
+set but malformed is NIL, NOT a fall-through to the file: a typo must not quietly pick a key."
+  (dolist (name '("GLASS_SITE_SEC" "SITE_SEC"))
+    (multiple-value-bind (sap n) (%env-key-source name)
+      (when sap
+        (return-from %site-key-into
+          (%parse-site-key (%env-getter sap) n out)))))
+  (gossamer:with-fixed-scratch ((raw :octets +site-key-read-max+))
+    (let ((n (and file (%read-into-fixed file raw))))
+      (and n (%parse-site-key (lambda (i) (aref raw i)) n out)))))
+
+(defun %load-site-keypair (file)
+  "A CL-NOSTR KEYPAIR for the site key, its secret in gossamer memory, or NIL.  The caller wipes it
+(CL-NOSTR.KEYS:KEYPAIR-WIPE) — WITH-SITE-SECRET is the form that does."
+  (gossamer:with-fixed-scratch ((sk :octets 32))
+    (when (%site-key-into sk file)
+      ;; fixed -> fixed: KEYPAIR-FROM-SECRET POOLED-COPYs a fixed buffer; SK is wiped on the way out
+      (handler-case (cl-nostr.keys:keypair-from-secret sk)
+        (error () nil)))))                ; 0 or >= n: not a key
+
+(defun call-with-site-secret (function &key (file *site-key-file*))
+  "Call FUNCTION with the site's KEYPAIR (or NIL if no site key is reachable), and wipe the key on
+every exit.  See WITH-SITE-SECRET."
+  (let ((keypair nil))
+    (unwind-protect
+         (progn (setf keypair (%load-site-keypair file))
+                (funcall function keypair))
+      (when keypair (cl-nostr.keys:keypair-wipe keypair)))))
+
+(defmacro with-site-secret ((var &key (file '*site-key-file*)) &body body)
+  "Run BODY with VAR bound to the site's CL-NOSTR KEYPAIR — NIL if no site key is reachable — read
+from $GLASS_SITE_SEC / $SITE_SEC / FILE straight into gossamer memory, and WIPED when BODY exits,
+however it exits.
+
+READ PER USE AND NEVER CACHED, which is the whole of consequence 1 in the header: between publishes
+this image holds no site secret, so a backtrace, an inspector or a heap dump has nothing to find.
+VAR is only good inside BODY: the keypair's secret is NIL afterwards, so nothing may keep it."
+  `(call-with-site-secret (lambda (,var) ,@body) :file ,file))
+
+(defun site-secret (&rest args)
+  "GONE: the site key is never returned as a value.  A returned value is a heap copy the caller
+cannot wipe — use WITH-SITE-SECRET, which hands the key to a body and wipes it after."
+  (declare (ignore args))
+  (error "GLASS:SITE-SECRET is gone: the site key is never handed out as a value. ~
+          Use (glass:with-site-secret (keypair) ...), which wipes it on exit."))
 
 (defun site-identity-p (&key (file *site-key-file*))
   "T iff this image can publish — i.e. a site key is reachable.  Asks WITHOUT keeping the answer."
-  (and (site-secret :file file) t))
+  (with-site-secret (keypair :file file) (and keypair t)))
 
 (defun site-npub (&key secret (file *site-key-file*) (cache t))
-  "The site's npub, or NIL if no site key is reachable.  Cached in *SITE-NPUB* once known."
+  "The site's npub, or NIL if no site key is reachable.  Cached in *SITE-NPUB* once known.
+SECRET, if given, is anything CL-NOSTR.KEYS:PUBLIC-KEY-OF-SECRET takes (a KEYPAIR is the form that
+puts nothing on the heap); without it the key is read, used and wiped."
   (or (and cache (null secret) *site-npub*)
-      (let ((sec (or secret (site-secret :file file))))
-        (when sec
-          (let ((npub (ignore-errors
-                       (cl-nostr.bech32:npub-encode (cl-nostr.keys:public-key-of-secret sec)))))
-            (when (and npub cache (null secret)) (setf *site-npub* npub))
-            npub)))))
+      (let ((npub (if secret
+                      (ignore-errors
+                       (cl-nostr.bech32:npub-encode (cl-nostr.keys:public-key-of-secret secret)))
+                      (with-site-secret (keypair :file file)
+                        (and keypair (cl-nostr.bech32:npub-encode
+                                      (cl-nostr.keys:keypair-public-key keypair)))))))
+        (when (and npub cache (null secret)) (setf *site-npub* npub))
+        npub)))
+
+(export '(with-site-secret call-with-site-secret) '#:glass)
 
 ;;; ---- the site's policy -------------------------------------------------------
 ;;;
@@ -329,13 +514,15 @@ the in-memory effect, which makes it the thing a test can exercise without a rel
               (or (cl-nostr.pool:ack-message ack) "")))
     (finish-output *error-output*)))
 
-(defun publish-site (files &key version secret
-                                (gateway *site-gateway*)
-                                (relays *site-relays*) (lookup *site-lookup-relays*)
-                                (servers *site-blossom*) (title *site-title*)
-                                (content-type "text/html")
-                                (link t) (persist t)
-                                (on-upload #'%say-upload) (on-publish #'%say-publication))
+(defun %refuse-no-site-key ()
+  (format *error-output*
+          "~&@@ site: no site key — put the 64-hex secret in ~a (chmod 600).~@
+             @@   Refusing to publish without one; a site is its key.~%"
+          *site-key-file*)
+  (finish-output *error-output*)
+  (values nil nil))
+
+(defun publish-site (files &rest args &key version secret &allow-other-keys)
   "Publish FILES as this box's site, and point the login link at VERSION.  Returns (values URL
 PUBLICATION); URL is NIL when the publish did not land, and the link base is then untouched.
 
@@ -343,29 +530,52 @@ FILES is a list of (PATH . CONTENT) conses, CONTENT octets or a string — CL-NO
 shape, and the reason this takes bytes rather than a filename is in the header.  VERSION names
 which of those paths a login link should point at (\"k43\" -> \"/k43.html\").
 
+THE KEY.  Without SECRET the site key is read for this publish into gossamer memory and wiped when
+it returns, however it returns (WITH-SITE-SECRET).  SECRET, if given, must be a CL-NOSTR KEYPAIR
+the caller owns and wipes — a hex string or a heap byte vector is refused, because by the time it
+got here the secret was already on the heap and this function cannot take that back.
+
 THE LINK BASE MOVES ONLY IF THE MANIFEST LANDED.  Publishing REPLACES the manifest, so until a
 relay has accepted the new one the OLD paths are still what resolves — and a link base moved ahead
 of the manifest names a page that does not exist yet, which is the same 404 this file exists to
 prevent, arriving from the other direction.
 
 AND ONLY AT A PATH THE MANIFEST HAS.  A version whose path is not in FILES would produce a link
-into a site that never had it, so the publish still happens and the link is left alone, loudly."
-  (let* ((sec (or secret (site-secret)))
-         (path (site-link-path version)))
-    (unless sec
-      (format *error-output*
-              "~&@@ site: no site key — put the 64-hex secret in ~a (chmod 600) or pass SITE_SEC.~@
-                 @@   Refusing to publish without one; a site is its key.~%"
-              *site-key-file*)
-      (finish-output *error-output*)
-      (return-from publish-site (values nil nil)))
+into a site that never had it, so the publish still happens and the link is left alone, loudly.
+
+Every other keyword is %PUBLISH-SITE-AS's: GATEWAY RELAYS LOOKUP SERVERS TITLE CONTENT-TYPE LINK
+PERSIST ON-UPLOAD ON-PUBLISH."
+  (declare (ignore version))
+  (let ((rest (copy-list args)))
+    (remf rest :secret)
+    (cond (secret
+           (unless (cl-nostr.keys:keypair-p secret)
+             (error "PUBLISH-SITE :SECRET must be a CL-NOSTR KEYPAIR, not ~a: a hex string or ~
+                     heap vector is a copy of the site key on the moving heap.  Omit :SECRET to ~
+                     have the key read into gossamer memory and wiped."
+                    (type-of secret)))
+           (apply #'%publish-site-as secret files rest))
+          (t (with-site-secret (keypair)
+               (if keypair
+                   (apply #'%publish-site-as keypair files rest)
+                   (%refuse-no-site-key)))))))
+
+(defun %publish-site-as (keypair files &key version
+                                            (gateway *site-gateway*)
+                                            (relays *site-relays*) (lookup *site-lookup-relays*)
+                                            (servers *site-blossom*) (title *site-title*)
+                                            (content-type "text/html")
+                                            (link t) (persist t)
+                                            (on-upload #'%say-upload)
+                                            (on-publish #'%say-publication))
+  "PUBLISH-SITE's work, signed by KEYPAIR, which the caller owns (and wipes)."
+  (let ((path (site-link-path version)))
     (unless (assoc path files :test #'string=)
       (format *error-output*
               "~&@@ site: nothing in this publish is at ~a — the link base will NOT be moved.~%" path)
       (finish-output *error-output*)
       (setf link nil))
-    (let* ((keypair (cl-nostr.keys:keypair-from-secret sec))
-           (where (append relays lookup)))
+    (let ((where (append relays lookup)))
       (multiple-value-bind (npub report)
           (cl-nostr.nsite:nsite-publish where servers keypair files
                                         :relays relays :title title

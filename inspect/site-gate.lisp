@@ -54,6 +54,8 @@
 ;; A throwaway site key, fixed rather than random so a failure is reproducible.  It is 64 hex and
 ;; it is not the site's; that is all it has to be.
 (defparameter *toy-key* "1f2e3d4c5b6a79880011223344556677889900aabbccddeeff0123456789abcd")
+;; PUBLISH-SITE takes a caller's key only as a KEYPAIR (a hex string is refused: it is a heap copy).
+(defparameter *toy-kp* (cl-nostr.keys:keypair-from-secret *toy-key*))
 (defparameter *box-secret* "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
 (defparameter *owner* "1111111111111111111111111111111111111111111111111111111111111111")
 (defparameter *device* "2222222222222222222222222222222222222222222222222222222222222222")
@@ -95,26 +97,32 @@
 
 (ok "a 64-hex key file is an identity" (glass:site-identity-p))
 (ok "and it has an npub" (let ((n (glass:site-npub))) (and (stringp n) (eql 0 (search "npub1" n)))))
-(ok "SITE-SECRET reads the file every time rather than caching it"
+(defun site-key-pubhex (&rest args)
+  "The public hex of the site key WITH-SITE-SECRET reads, or NIL — the secret is never returned."
+  (glass:call-with-site-secret (lambda (kp) (and kp (cl-nostr.keys:public-hex kp))) 
+                               :file (getf args :file glass:*site-key-file*)))
+(defun pubhex-of (hex) (cl-nostr.util:bytes->hex (cl-nostr.keys:public-key-of-secret hex)))
+
+(ok "the site key is read from the file every time rather than cached"
     ;; the observable half of "the image holds no site secret between publishes": rewrite the file
-    ;; and the very next call answers with the new value, with nothing to invalidate.
+    ;; and the very next call answers with the new key, with nothing to invalidate.
     (let ((other (make-string 64 :initial-element #\a)))
       (unwind-protect
            (progn (with-open-file (s *key-fixture* :direction :output :if-exists :supersede)
                     (write-line other s))
-                  (equal other (glass:site-secret)))
+                  (equal (pubhex-of other) (site-key-pubhex)))
         (with-open-file (s *key-fixture* :direction :output :if-exists :supersede)
           (write-line *toy-key* s)))))
 (ok "a missing key file is NIL, not an error"
-    (null (glass:site-secret :file "/tmp/glass-site-gate-nope")))
+    (null (site-key-pubhex :file "/tmp/glass-site-gate-nope")))
 (ok "and so is a file with something that is not 64 hex in it"
     (progn (with-open-file (s "/tmp/glass-site-gate-junk" :direction :output :if-exists :supersede)
              (write-line "not-a-key" s))
-           (null (glass:site-secret :file "/tmp/glass-site-gate-junk"))))
+           (null (site-key-pubhex :file "/tmp/glass-site-gate-junk"))))
 (ok "comment lines are skipped, so a key file may say what it is"
     (progn (with-open-file (s "/tmp/glass-site-gate-cmt" :direction :output :if-exists :supersede)
              (format s "# the site key~%~a~%" *toy-key*))
-           (equal *toy-key* (glass:site-secret :file "/tmp/glass-site-gate-cmt"))))
+           (equal (pubhex-of *toy-key*) (site-key-pubhex :file "/tmp/glass-site-gate-cmt"))))
 
 ;;; ==============================================================================
 (banner "a versioned PATH, and the gateway host that is actually current")
@@ -241,7 +249,7 @@
 ;; loopback and there are no uploads to attempt.
 (multiple-value-bind (url pub)
     (glass:publish-site (list (cons "/k999.html" "<html>nope</html>"))
-                        :version "k999" :secret *toy-key*
+                        :version "k999" :secret *toy-kp*
                         :servers '() :relays '("ws://127.0.0.1:1") :lookup '()
                         :on-upload nil :on-publish nil)
   (ok "a publish that stored nothing returns NIL for the URL" (null url))
@@ -262,7 +270,7 @@
 (ok "a version naming a path this publish does NOT contain leaves the link alone"
     ;; the publish itself is fine; pointing a link into a site that never had that path is not
     (let ((glass:*login-url-base* "https://kept.example/k1.html"))
-      (glass:publish-site (list (cons "/k997.html" "x")) :version "k996" :secret *toy-key*
+      (glass:publish-site (list (cons "/k997.html" "x")) :version "k996" :secret *toy-kp*
                           :servers '() :relays '("ws://127.0.0.1:1") :lookup '()
                           :on-upload nil :on-publish nil)
       (equal "https://kept.example/k1.html" glass:*login-url-base*)))
@@ -277,7 +285,7 @@
 (if (not (equal "1" (sb-ext:posix-getenv "GLASS_SITE_GATE_LIVE")))
     (format t "  --   skipped (set GLASS_SITE_GATE_LIVE=1 to publish to real relays)~%")
     (let* ((kp (cl-nostr.keys:generate-keypair))
-           (secret (string-downcase (cl-nostr.keys:secret-hex kp)))
+           (secret kp)
            (npub (glass:site-npub :secret secret))
            (tag1 (format nil "t~a" (glass:unix-now)))
            (tag2 (format nil "t~a" (+ 1 (glass:unix-now)))))

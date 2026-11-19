@@ -354,7 +354,7 @@ admission.  A system boundary is the only thing that reliably keeps code out of 
   :version "0.0.1"
   :author "ynniv"
   :license "MIT"
-  :depends-on ("glass/nostr")
+  :depends-on ("glass/nostr" "cl-nostr" "natrium/gossamer")   ; the site key lives in gossamer memory
   :serial t
   :components ((:module "src" :serial t :components ((:file "site")))))
 
