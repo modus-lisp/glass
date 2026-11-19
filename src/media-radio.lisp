@@ -145,7 +145,16 @@
 
 (defun %ra-async (tu what fn)
   "FN on its own thread, one operation at a time, a failure a note rather than a dead image (a
-   desktop runs under --disable-debugger, where a condition escaping any thread takes it)."
+   desktop runs under --disable-debugger, where a condition escaping any thread takes it).
+
+   ON MODUS, RIGHT HERE: a thread there may not store into the player or this tuner (another
+   thread's objects), and spool's PLAY-URL and STOP only post to the station's own thread now --
+   nothing in them waits -- so there is nothing to move off the caller's thread."
+  #+modus
+  (sb-thread:with-mutex ((tuner-op-lock tu))
+    (handler-case (funcall fn)
+      (serious-condition (e) (setf (tuner-note tu) (format nil "~a failed: ~a" what e)))))
+  #-modus
   (sb-thread:make-thread
    (lambda ()
      (sb-thread:with-mutex ((tuner-op-lock tu))
