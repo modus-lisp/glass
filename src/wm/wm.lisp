@@ -180,6 +180,7 @@
 (defstruct (wm (:constructor %make-wm))
   (surfaces '())        ; the session's windows by their OWN z, topmost first (the home seat's stack)
   (apps '())            ; ((label make-fn w h) ...), in menu order
+  (actions '())         ; ((label . thunk) ...): root-menu entries that open no window
   (cascade 0)
   (zclock 0)            ; the one monotonic z counter: every seat's tickets come from it
   home                  ; the home seat
@@ -237,6 +238,14 @@
   (setf (wm-apps wm)
         (append (remove label (wm-apps wm) :key #'first :test #'string=)
                 (list (list label make-fn width height))))
+  label)
+
+(defun wm-register-action (wm label thunk)
+  "Put LABEL on the root menu, after the applications; choosing it calls THUNK and opens no window
+   -- what a host's own screens hang off (a phone's native views, drawn over the desktop)."
+  (setf (wm-actions wm)
+        (append (remove label (wm-actions wm) :key #'car :test #'string=)
+                (list (cons label thunk))))
   label)
 
 (defun wm-redraw (wm) (setf (wm-pending wm) :full))
@@ -870,12 +879,19 @@ in its seat's clipboard -- the home seat's is the session's -- rfb.lisp READ-CLI
       (list (cons "Speak selection" (lambda () (funcall say text)))))))
 
 (defun wm-open-root-menu (wm x y mask)
+  ;; The ORIGIN, as the window menu has: the opening press's own release, where it was pressed,
+  ;; only arms the menu.  Without it a TAP -- a finger's press and lift in one place -- chose
+  ;; whatever item the menu had opened under it; with it a tap opens the menu and a second tap
+  ;; chooses, while a mouse's press-drag-release still chooses in one gesture.
   (setf (wm-menu wm)
         (wm-place-menu (make-wm-menu :items (append
                                              (mapcar (lambda (a) (cons (first a) (list :app (first a))))
                                                      (wm-apps wm))
+                                             (mapcar (lambda (a) (cons (car a) (cdr a)))
+                                                     (wm-actions wm))
                                              (clipboard-menu-items wm)))
-                       (screen-w wm) (screen-h wm) x y mask))
+                       (screen-w wm) (screen-h wm) x y mask)
+        (wm-menu-origin (wm-menu wm)) (cons x y))
   (wm-composite wm (menu-chain-box wm)))
 
 (defun window-menu-items (wm s)

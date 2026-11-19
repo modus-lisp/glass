@@ -188,6 +188,16 @@ messages, pixels through the shared screen framebuffer -- so it runs where threa
   :serial t
   :components ((:module "src" :serial t :components ((:file "desk-serve")))))
 
+(asdf:defsystem :glass/wm-core
+  :description "glass.wm's window manager alone -- the chrome, the windows, the menus, the
+pointer and the tick -- with no server, no Lisp listener and no Terminal: what a host that draws
+the screen itself embeds (a phone: vessel drives MAKE-WM / WM-POINTER / WM-TICK from its own
+loop).  GLASS/WM is this plus SERVE-WM and the root menu's Lisp and Terminal."
+  :depends-on ("glass" "glass/text")
+  :serial t
+  :components ((:module "src/wm" :serial t
+                :components ((:file "package") (:file "chrome") (:file "wm")))))
+
 (asdf:defsystem :glass/wm
   :description "The McCLIM desktop's window manager without McCLIM: OPEN LOOK chrome, raise and
 focus, a drag that moves by CopyRect and goes wireframe when the link lags, resize, the root and
@@ -196,10 +206,9 @@ and one compositor thread that owns every window), so it runs on modus.  Coopera
 session of windows, a screen, pointer, focus, menu, clipboard and arrangement per person watching,
 each seat a loopback RFB port of its own by key (WM-SEAT-PORT); the home seat is PORT.  Its
 root menu adds a Lisp listener (glass/repl) and a Terminal (glass/term) to the desk's apps."
-  :depends-on ("glass" "glass/text" "glass/desk-apps" "glass/term" "glass/repl")
+  :depends-on ("glass/wm-core" "glass/text" "glass/desk-apps" "glass/term" "glass/repl")
   :serial t
-  :components ((:module "src/wm" :serial t
-                :components ((:file "package") (:file "chrome") (:file "wm") (:file "serve")))))
+  :components ((:module "src/wm" :serial t :components ((:file "serve")))))
 
 (asdf:defsystem :glass/wm-sound
   :description "The window manager's sound, with no thread of its own: the compositor mixes its
