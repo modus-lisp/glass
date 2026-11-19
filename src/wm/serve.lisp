@@ -43,7 +43,8 @@
     ("Podcasts" "SPOOL.DESK" "PODCASTS-APP"     980 660)     ; spool/desk
     ("Speak"    "GLASS.DESK" "SPEAK-APP"        400 300)     ; glass/voice-apps
     ("Listen"   "GLASS.DESK" "LISTEN-APP"       400 320)     ; glass/voice-apps
-    ("Mixer"    "GLASS.DESK" "MIXER-APP"        460 340)))   ; glass/mixer-desk
+    ("Mixer"    "GLASS.DESK" "MIXER-APP"        460 340)     ; glass/mixer-desk
+    ("Remote"   "GLASS-REMOTE-WEBRTC" "REMOTE-APP" 900 600)))   ; glass/remote-webrtc: a box over WebRTC
 
 (defun wm-available-apps (&optional (apps *wm-apps*))
   "APPS, then each of *WM-OPTIONAL-APPS* whose system is loaded."

@@ -84,6 +84,18 @@ audio across the boundary, deliberately."
   :serial t
   :components ((:module "src" :serial t :components ((:file "rfb-client")))))
 
+(asdf:defsystem :glass/remote-webrtc
+  :description "Remote: another BOX's desktop as a window, reached as the phone reaches it --
+a login link or an enrolled device key, a gift-wrapped offer over Nostr, WebRTC data channels
+carrying RFB (glass-webrtc/dial) -- read by glass-client through its CONNECTOR.  A window-manager
+app found by name (glass.wm's *WM-OPTIONAL-APPS*: \"Remote\"), so glass/wm does not depend on it."
+  :version "0.0.1"
+  :author "ynniv"
+  :license "MIT"
+  :depends-on ("glass" "glass/text" "glass/client" "glass-webrtc/dial")
+  :serial t
+  :components ((:module "src" :serial t :components ((:file "remote-webrtc")))))
+
 (asdf:defsystem :glass/vncauth
   :description "VNC Authentication (the RFB DES challenge/response) for glass's
 server, via seal's DES.  OPTIONAL — core :glass carries no crypto dependency and

@@ -44,7 +44,8 @@
            #:remote-fb #:remote-host #:remote-port #:remote-name #:remote-password
            #:remote-state #:remote-connected-p #:remote-width #:remote-height
            #:remote-key #:remote-pointer #:remote-take-dirty #:remote-take-copy
-           #:remote-on-resize #:remote-report #:remote-stats
+           #:remote-on-resize #:remote-report #:remote-stats #:remote-connector
+           #:remote-last-error #:remote-set-desktop-size
            #:*pass-copyrect* #:*update-hook* #:*reconnect-delay* #:*reconnect-max-delay*
            #:*input-queue-limit* #:*rfb-client-name*))
 
@@ -147,6 +148,7 @@
 (defconstant +enc-copyrect+ 1)
 (defconstant +enc-zrle+ 16)
 (defconstant +pseudo-desktop-size+ -223)
+(defconstant +pseudo-extended-desktop-size+ -308)
 
 (defparameter *rfb-client-name* "glass"
   "What we call ourselves in log lines; RFB has no client-name field.")
@@ -177,6 +179,15 @@
 (defstruct (remote (:conc-name remote-) (:constructor %make-remote))
   host port
   password                                  ; NIL = security type None only; a string = VNC auth
+  ;; NIL: dial HOST:PORT.  Else a function of the REMOTE returning (values CLOSER STREAM) -- a
+  ;; byte stream already connected to an RFB server (a WebRTC data channel, say) and a thunk
+  ;; that hangs it up.  Called again on every reconnect, so it may redial from scratch.
+  connector
+  ;; ExtendedDesktopSize: offered only when RESIZABLE (so existing viewers' wire is unchanged),
+  ;; and SetDesktopSize is sent only once the server has shown it understands (EDS-SEEN), as
+  ;; noVNC does.
+  (resizable nil)
+  (eds-seen nil)
   fb                                        ; the local framebuffer holding the remote screen
   (name "" :type string)                    ; the remote's desktop name
   (state :connecting)                       ; :connecting | :up | :down
@@ -241,6 +252,13 @@
    the client's keysym unchanged, and that is exactly what the remote's KeyEvent
    wants, so there is no translation at all."
   (%enqueue r (list :key (if down 1 0) keysym)))
+
+(defun remote-set-desktop-size (r w h)
+  "Ask the remote to make its screen W x H (SetDesktopSize).  Only a REMOTE made :RESIZABLE,
+   and only once the server has said it can (an ExtendedDesktopSize rect); returns T if asked.
+   The answer arrives as a resize like any other, through ON-RESIZE."
+  (when (and (remote-resizable r) (remote-eds-seen r) (plusp w) (plusp h))
+    (%enqueue r (list :size (min w 16384) (min h 16384)))))
 
 (defun remote-pointer (r mask x y)
   "Forward a pointer event, in the remote's coordinates.  A wm-surface's on-pointer
@@ -521,6 +539,14 @@
           ;; DesktopSize: the rect header IS the new size; there is no payload.
           ((= enc +pseudo-desktop-size+)
            (glass:with-fb-locked (fb) (%resize r w h)))
+          ;; ExtendedDesktopSize: X is the reason, Y the result, W x H the size now; then the
+          ;; screen layout, which glass always sends as one screen and we do not need.
+          ((= enc +pseudo-extended-desktop-size+)
+           (let ((nscreens (r-u8 s)))
+             (r-skip s 3) (r-skip s (* 16 nscreens))
+             (incf (remote-bytes r) (+ 4 (* 16 nscreens)))
+             (setf (remote-eds-seen r) t)
+             (glass:with-fb-locked (fb) (%resize r w h))))
           ((= enc +enc-copyrect+)
            (let ((sx (r-u16 s)) (sy (r-u16 s)))
              (incf (remote-bytes r) 4)
@@ -655,9 +681,11 @@
     ;; behind it.  Without it the remote paints no cursor at all and the only arrow
     ;; on the screen is the local one — which is over the right pixel by
     ;; construction, because the coordinates we forward are the ones it is at.
-    (w-u8 s 2) (w-u8 s 0) (w-u16 s 4)
+    (w-u8 s 2) (w-u8 s 0) (w-u16 s (if (remote-resizable r) 5 4))
     (w-u32 s +enc-zrle+) (w-u32 s +enc-copyrect+) (w-u32 s +enc-raw+)
     (w-u32 s (logand +pseudo-desktop-size+ #xffffffff))
+    (when (remote-resizable r)
+      (w-u32 s (logand +pseudo-extended-desktop-size+ #xffffffff)))
     (force-output s)
     (values w h)))
 
@@ -679,7 +707,10 @@
                      (:key (destructuring-bind (down keysym) (cdr e)
                              (w-u8 s 4) (w-u8 s down) (w-u16 s 0) (w-u32 s keysym)))
                      (:pointer (destructuring-bind (mask x y) (cdr e)
-                                 (w-u8 s 5) (w-u8 s mask) (w-u16 s x) (w-u16 s y)))))
+                                 (w-u8 s 5) (w-u8 s mask) (w-u16 s x) (w-u16 s y)))
+                     (:size (destructuring-bind (w h) (cdr e)      ; SetDesktopSize, one screen
+                              (w-u8 s 251) (w-u8 s 0) (w-u16 s w) (w-u16 s h) (w-u8 s 1) (w-u8 s 0)
+                              (w-u32 s 1) (w-u16 s 0) (w-u16 s 0) (w-u16 s w) (w-u16 s h) (w-u32 s 0)))))
                  (when want
                    (w-u8 s 3) (w-u8 s (if full 0 1)) (w-u16 s 0) (w-u16 s 0)
                    (w-u16 s (remote-width r)) (w-u16 s (remote-height r)))
@@ -695,11 +726,19 @@
   (setf (remote-want-update r) t)
   (sb-thread:with-mutex ((remote-qlock r)) (sb-thread:condition-notify (remote-qcv r))))
 
+(defun %hang-up (sock)
+  "Close what a session connected through: a socket, or a CONNECTOR's closer thunk."
+  (if (functionp sock)
+      (ignore-errors (funcall sock))
+      (ignore-errors (sb-bsd-sockets:socket-close sock))))
+
 (defun %session (r)
   "One connection, from TCP connect to the socket dying.  Returns normally when the
    remote goes away; signals only on a programming error."
-  (multiple-value-bind (sock s) (%tcp-connect (remote-host r) (remote-port r))
-    (setf (remote-socket r) sock (remote-stream r) s)
+  (multiple-value-bind (sock s) (if (remote-connector r)
+                                    (funcall (remote-connector r) r)
+                                    (%tcp-connect (remote-host r) (remote-port r)))
+    (setf (remote-socket r) sock (remote-stream r) s (remote-eds-seen r) nil)
     (unwind-protect
          (multiple-value-bind (w h) (%handshake r s)
            (glass:with-fb-locked ((remote-fb r))
@@ -739,7 +778,7 @@
       (setf (remote-state r) :down)
       (ignore-errors (sb-thread:condition-notify (remote-qcv r)))
       (ignore-errors (close s))
-      (ignore-errors (sb-bsd-sockets:socket-close sock))
+      (%hang-up sock)
       (when (remote-writer r)
         (ignore-errors (sb-thread:join-thread (remote-writer r) :timeout 2))
         (setf (remote-writer r) nil)))))
@@ -783,7 +822,8 @@
 
 ;;; ---- the public handle ------------------------------------------------------
 
-(defun connect-remote (host port &key fb (width 1280) (height 800) on-resize password)
+(defun connect-remote (host port &key fb (width 1280) (height 800) on-resize password connector
+                                      resizable)
   "Open a live view of the RFB server at HOST:PORT.  Returns immediately with a
    REMOTE whose framebuffer starts out WIDTH x HEIGHT (or FB, if you brought your
    own — a window manager has usually already made one) and becomes the remote's
@@ -793,8 +833,13 @@
    PASSWORD, when the server asks for one (security type 2, VNC auth): needs
    :glass/vncauth loaded for the DES.  It is kept for the life of the REMOTE because
    this client RECONNECTS, and a credential that only worked the first time would give
-   a window that goes blank the first time the desktop restarts."
-  (let ((r (%make-remote :host host :port port :password password
+   a window that goes blank the first time the desktop restarts.
+
+   CONNECTOR, instead of dialling HOST:PORT (which then only name it in messages): a function
+   of the REMOTE returning (values CLOSER STREAM) -- see the slot.  It runs on the reader thread,
+   so it may take its time (a WebRTC dial does)."
+  (let ((r (%make-remote :host host :port port :password password :connector connector
+                         :resizable resizable
                          :fb (or fb (glass:make-framebuffer width height (glass:rgb 24 24 24)))
                          :on-resize on-resize)))
     (%notice r (format nil "~a:~d — connecting…" host port))
@@ -808,7 +853,7 @@
   (setf (remote-running r) nil (remote-state r) :down)
   (ignore-errors (sb-thread:condition-notify (remote-qcv r)))
   (ignore-errors (close (remote-stream r)))
-  (ignore-errors (sb-bsd-sockets:socket-close (remote-socket r)))
+  (%hang-up (remote-socket r))
   (ignore-errors (sb-thread:join-thread (remote-reader r) :timeout 2))
   r)
 
