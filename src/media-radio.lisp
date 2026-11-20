@@ -307,6 +307,13 @@
     (make-instance 'radio-panel :fb fb :tuner tuner :stations stations :rows rows :height h
                                 :y (- (glass:fb-height fb) h))))
 
+(defun radio-panel-resized (pn &key whole)
+  "PN's framebuffer has a new size: its rows, height and place again, from the first page."
+  (multiple-value-bind (h rows) (radio-panel-height (glass:fb-height (panel-fb pn)) (length (panel-stations pn))
+                                                    :whole whole)
+    (setf (panel-height pn) h (panel-rows pn) rows (panel-y pn) (- (glass:fb-height (panel-fb pn)) h)
+          (panel-page pn) 0 (panel-dirty pn) t (panel-shown pn) nil)))
+
 (defun %ra-target (pn x y w h action &optional label)
   (push (make-instance 'radio-target :x x :y y :w w :h h :action action :label label) (panel-targets pn)))
 
@@ -552,8 +559,9 @@
    kept painted while hidden, and the one showing is copied into FB; a press goes to whichever part
    it started in until it is released.  Pictures and Documents are made the first time they are
    shown: a window that never looks reads no folder and decodes nothing.  With only Stations there
-   is nothing to choose between, so the window is the Stations alone.  No RESIZE-FN and no TEXT-P,
-   as before."
+   is nothing to choose between, so the window is the Stations alone.  RESIZABLE (a phone's rack
+   fills a turned screen with it): every part's framebuffer follows, each lays itself out again.
+   No TEXT-P."
   (let ((keys (%media-tab-keys)))
     (when (null (cdr keys))
       ;; NO FILE PLAYER, NO PICTURES, NO DOCUMENTS HERE: the window is the Stations, rather than a
@@ -568,7 +576,8 @@
                   (lambda () (radio-panel-dirty-p panel))
                   nil
                   (lambda () (radio-panel-close panel))
-                  nil nil))))
+                  (lambda (w h) (glass:fb-resize fb w h +ra-bg+) (radio-panel-resized panel :whole t))
+                  nil))))
     (let* ((w (glass:fb-width fb)) (th *media-tab-h*)
            (bh (max 1 (- (glass:fb-height fb) th)))
            (music (and (member :music keys) (glass:make-framebuffer w bh #x0c0e12 (glass:fb-format fb))))
@@ -583,15 +592,15 @@
            (shown nil)                        ; the tab last copied into FB, NIL = draw it all
            (hidden-next 0)                    ; when the hidden tabs are next looked at
            (grab nil))
-      (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn)
-          (if music (%warp-media-window music) (values nil nil nil nil nil))
+      (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn music-resize)
+          (if music (%warp-media-window music) (values nil nil nil nil nil nil))
         (declare (ignore copy-p))          ; a move hint in a part's coordinates is not one in FB's
         (labels ((part (key)
                    (let ((cell (cdr (assoc key lazy))))
                      (or (cdr cell)
-                         (setf (cdr cell) (multiple-value-bind (k p d c x) (funcall (%media-lazy-fn key) (car cell))
+                         (setf (cdr cell) (multiple-value-bind (k p d c x r) (funcall (%media-lazy-fn key) (car cell))
                                             (declare (ignore c))
-                                            (list k p d x))))))
+                                            (list k p d x r))))))
                  (part-fb (key)
                    (case key (:music music) (:stations stations) (t (cadr (assoc key lazy))))))
           (values (lambda (down keysym)
@@ -642,4 +651,19 @@
                            (loop for (nil . (nil . made)) in lazy
                                  when made do (ignore-errors (funcall (fourth made))))
                         (radio-panel-close panel))))
-                  nil nil))))))
+                  ;; RESIZE-FN: the window, then every part under the tab strip -- the ones not made
+                  ;; yet just get the new size, and draw at it when first shown
+                  (lambda (nw nh)
+                    (let ((nbh (max 1 (- nh th))))
+                      (glass:fb-resize fb nw nh +ra-bg+)
+                      (setf w nw)
+                      (when music
+                        (if music-resize (funcall music-resize nw nbh) (glass:fb-resize music nw nbh #x0c0e12)))
+                      (glass:fb-resize stations nw nbh +ra-bg+)
+                      (radio-panel-resized panel :whole t)
+                      (loop for (nil . (pfb . made)) in lazy
+                            do (if (and made (fifth made))
+                                   (funcall (fifth made) nw nbh)
+                                   (glass:fb-resize pfb nw nbh +ra-bg+)))
+                      (setf shown nil)))
+                  nil))))))

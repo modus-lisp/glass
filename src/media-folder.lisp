@@ -578,8 +578,8 @@
     (when (eq edge :press) (folder-panel-press pn x y))))
 
 (defun %folder-app (pn)
-  "PN as an application: (values ON-KEY ON-POINTER DIRTY-P COPY-P CLOSE-FN) -- no RESIZE-FN, no
-   TEXT-P."
+  "PN as an application: (values ON-KEY ON-POINTER DIRTY-P COPY-P CLOSE-FN RESIZE-FN) -- no TEXT-P.
+   It draws from its framebuffer's size every time, so a resize is the framebuffer and a redraw."
   (let ((down nil))
     (values (lambda (pressed keysym) (when pressed (folder-panel-key pn keysym)))
             (lambda (mask x y)
@@ -590,4 +590,5 @@
                 (setf down now)))
             (lambda () (folder-panel-dirty-p pn))
             nil
-            (lambda () (folder-panel-close pn)))))
+            (lambda () (folder-panel-close pn))
+            (lambda (w h) (glass:fb-resize (panel-fb pn) w h +ra-bg+) (setf (panel-dirty pn) t)))))

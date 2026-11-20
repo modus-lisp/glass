@@ -2,10 +2,13 @@
 ;;;; (with internet radio under it: media-radio.lisp).
 ;;;;
 ;;;; Each is a desk application (DESK-REGISTER-APP's MAKE-FN: called with the window's content
-;;;; framebuffer, returning ON-KEY ON-POINTER DIRTY-P [COPY-P CLOSE-FN RESIZE-FN TEXT-P]) and a
+;;;; framebuffer, returning ON-KEY ON-POINTER DIRTY-P [COPY-P CLOSE-FN RESIZE-FN TEXT-P
+;;;; SELECTION-FN DRAG-P]) and a
 ;;;; GLOBAL FUNCTION, so SERVE-DESK and SERVE-WM can hand it to their compositor thread by name.
 ;;;; RESIZE-FN (w h) resizes the content -- the app FB-RESIZEs its own framebuffer -- and is what
-;;;; gives a window the window manager's resize corner; the desk ignores it.  Clock and Notes
+;;;; gives a window the window manager's resize corner; the desk ignores it.  DRAG-P (x y) says
+;;;; whether a drag starting there is the app's: glass.wm's rack scrolls with one that is not, and
+;;;; asks before the press reaches the app; without it every drag is the app's.  Clock and Notes
 ;;;; came from kiln's phone desk (kiln-android boot/app.lisp), unchanged but for the names
 ;;;; and the Clock's second line.
 
@@ -267,10 +270,17 @@
         (let ((lib (or *media-library*
                        (setf *media-library* (funcall make-lib :root (or *media-root* "./")
                                                          :mixer *media-mixer*)))))
-          ;; FIVE values: the player's sixth value is its consumer, which a desktop would read as
-          ;; RESIZE-FN (and once read as TEXT-P, raising a keyboard for it -- kiln found that).
-          (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn) (funcall make-win fb lib)
-            (values on-key on-pointer dirty-p copy-p close-fn))))))
+          ;; The player's sixth value is its CONSUMER, which a desktop would read as RESIZE-FN (and
+          ;; once read as TEXT-P, raising a keyboard for it -- kiln found that).  So the sixth value
+          ;; here is a real RESIZE-FN: the framebuffer resized, and the consumer RESYNCed -- it
+          ;; forgets what it drew and lays the player out again at the new size (warp's layout reads
+          ;; the viewport from the framebuffer on every pass).
+          (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn consumer) (funcall make-win fb lib)
+            (values on-key on-pointer dirty-p copy-p close-fn
+                    (lambda (w h)
+                      (glass:fb-resize fb w h #x0c0e12)
+                      (let ((resync (and (find-package "WARP") (find-symbol "RESYNC" "WARP"))))
+                        (when (and resync consumer) (funcall resync consumer))))))))))
 
 (defparameter *standard-apps*
   '(("Clock" clock-app :width 260 :height 110)
