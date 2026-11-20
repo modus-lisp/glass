@@ -152,4 +152,6 @@ the session with a second, unserved mixer -- everything that plays into it then 
                 (when dirty (setf dirty nil) (redraw) t))
               nil nil
               (lambda (w h) (glass:fb-resize fb w h +va-bg+) (setf dirty t))
-              nil))))
+              nil nil
+              ;; DRAG-P: its buttons act on a press; no drag is its own (a phone's rack scrolls)
+              (lambda (x y) (declare (ignore x y)) nil)))))

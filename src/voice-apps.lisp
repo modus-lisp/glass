@@ -225,7 +225,10 @@
                 (when dirty (setf dirty nil) (redraw) t))
               nil nil
               (lambda (w h) (glass:fb-resize fb w h +va-bg+) (layout) (setf dirty t))
-              t))))                       ; it takes typing: focusing it brings up the keyboard
+              t                           ; it takes typing: focusing it brings up the keyboard
+              nil
+              ;; DRAG-P: its buttons act on a press; no drag is its own (a phone's rack scrolls)
+              (lambda (x y) (declare (ignore x y)) nil)))))
 
 ;;; ---- Listen ----------------------------------------------------------------------------------------------
 
@@ -268,7 +271,9 @@
                 (when dirty (setf dirty nil) (redraw) t))
               nil nil
               (lambda (w h) (glass:fb-resize fb w h +va-bg+) (layout) (setf dirty t))
-              nil))))
+              nil nil
+              ;; DRAG-P: its buttons act on a press; no drag is its own (a phone's rack scrolls)
+              (lambda (x y) (declare (ignore x y)) nil)))))
 
 (defparameter *voice-apps*
   '(("Speak" speak-app :width 400 :height 300)

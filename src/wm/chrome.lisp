@@ -21,8 +21,18 @@
    a dense screen (a phone at one desk pixel per device pixel) sets it to 2 for touch-sized
    title bars and menu rows.  Drawing and hit testing both read it, so they cannot disagree.")
 
+(defvar *wm-title-scale* nil
+  "The title bars' own density, or NIL for *WM-SCALE*'s.  The rack (rack.lisp) draws its title
+   bars smaller than the menus: on a phone a 44-pixel bar over every window of a rack of three is
+   a sixth of the screen, while a menu row still wants a finger's height.")
+
+(declaim (inline title-scale))
+(defun title-scale () (or *wm-title-scale* *wm-scale*))
+
 (declaim (inline wm-titleh wm-border))
-(defun wm-titleh () (max 1 (round (* +wm-titleh-1x+ *wm-scale*))))
+(defun wm-titleh ()
+  "The title bar's height: 0 when *WM-TITLE-SCALE* is 0 -- no title bars (the rack's units)."
+  (if (eql *wm-title-scale* 0) 0 (max 1 (round (* +wm-titleh-1x+ (title-scale))))))
 (defun wm-border () (max 1 (round (* +wm-border-1x+ *wm-scale*))))
 (defun wm-size (n) "A chrome text size N at the current density." (max 1 (round (* n *wm-scale*))))
 (defun menu-itemh () (max 1 (round (* +menu-itemh-1x+ *wm-scale*))))
@@ -43,7 +53,7 @@
   "The window-menu wedge's (values X Y SIZE) inside a title bar, at the current density.  One
    definition, read by the renderer and the hit test, so the two cannot drift."
   (let* ((h (wm-titleh))
-         (pad (max 2 (round (* 4 *wm-scale*))))
+         (pad (max 2 (round (* 4 (title-scale)))))
          (size (max 4 (- h (* 2 pad)))))
     (values pad pad size)))
 
@@ -64,7 +74,8 @@
 (defun wm-render-titlebar (title width &key (close t))
   "A framebuffer of an OPEN LOOK title bar WIDTH px wide: the window-menu wedge at the left, the
    bold title centred, and (CLOSE) a close box at the right.  Glass primitives and scribe only."
-  (let* ((h (wm-titleh))
+  (let* ((*wm-scale* (title-scale))      ; the bar is drawn at the title bars' density
+         (h (wm-titleh))
          (tb (glass:make-framebuffer (max 1 width) h +wm-title-bg+)))
     (glass:fb-hline tb 0 (1- h) width (glass:rgb 120 120 120))                ; bottom shadow line
     (multiple-value-bind (bx by bs) (wm-menu-button-box)
@@ -136,7 +147,7 @@
    via CONTENT-FN, then the border and the corner marks."
   (let* ((ty (- cy (wm-titleh))) (wx (- cx (wm-border))) (wy (- ty (wm-border)))
          (ww (+ cw (* 2 (wm-border)))) (wh (+ (wm-titleh) ch (* 2 (wm-border)))))
-    (blit-fb deco cx ty fb)
+    (when deco (blit-fb deco cx ty fb))
     (funcall content-fn)
     (glass:fb-frame fb wx wy ww wh glass:+black+ (wm-border))
     (wm-corners fb wx wy ww wh)))

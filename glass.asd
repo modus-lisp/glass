@@ -196,7 +196,7 @@ loop).  GLASS/WM is this plus SERVE-WM and the root menu's Lisp and Terminal."
   :depends-on ("glass" "glass/text")
   :serial t
   :components ((:module "src/wm" :serial t
-                :components ((:file "package") (:file "chrome") (:file "wm")))))
+                :components ((:file "package") (:file "chrome") (:file "wm") (:file "rack")))))
 
 (asdf:defsystem :glass/wm
   :description "The McCLIM desktop's window manager without McCLIM: OPEN LOOK chrome, raise and

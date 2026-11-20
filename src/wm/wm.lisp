@@ -112,6 +112,9 @@
   (copy-base nil)                       ; HOME seat's: content box as of the last composite that drew it whole
   (copy-round nil) (copy-hint nil)      ; this tick's take of COPY-P, judged by every seat
   (saved-geom nil)                      ; (x y w h) saved by Full Size
+  (span nil)                            ; rack units it takes in the RACK layout (rack.lisp), NIL = not placed yet
+  (pos nil)                             ; the rack unit it starts at (rack.lisp), NIL = not placed yet
+  (drag-p nil)                          ; (lambda (x y)): is a drag starting there the app's?  NIL: every one is
   (err-count 0))
 
 (defmethod print-object ((s surf) stream)
@@ -184,7 +187,16 @@
   (cascade 0)
   (zclock 0)            ; the one monotonic z counter: every seat's tickets come from it
   home                  ; the home seat
-  (seats '()))          ; every seat, the home seat first
+  (seats '())           ; every seat, the home seat first
+  ;; THE RACK (rack.lisp): NIL lays windows out as they are put (floating), :RACK in rack units
+  (layout nil)
+  (rack-order '())      ; the windows in rack order, first at the top (portrait) or left (landscape)
+  (rack-scroll 0)       ; how far the rack is scrolled along its axis, in pixels
+  (rack-drag nil)       ; the overflow bar dragged: (nil along0 scroll0 moved-p)
+  (rack-press nil)      ; a press in a unit, not yet a tap, a drag or a long press: (s x y t0 mask)
+  (rack-lift nil)       ; a unit picked up by a long press: (s grab-offset moved-p)
+  (rack-want nil)       ; the empty slot the root menu was opened on: where its app goes
+  (obscured 0))         ; pixels at the bottom of the screen hidden by the host's keyboard (WM-SET-OBSCURED)
 
 (defun make-wm (fb)
   "A window manager drawing into FB, the home seat's screen."
@@ -368,6 +380,7 @@
 (defun window-box (s) (window-box-at s (sx s) (sy s)))
 
 (defun surf-deco (s)
+  (when (zerop (wm-titleh)) (return-from surf-deco nil))     ; no title bars (the rack)
   (let ((cw (surf-cw s)))
     (when (or (null (surf-deco-fb s)) (/= cw (surf-deco-w s)))
       (setf (surf-deco-fb s) (wm-render-titlebar (surf-title s) cw) (surf-deco-w s) cw))
@@ -540,10 +553,13 @@
 (defun composite-whole (wm fb box)
   "Rebuild BOX (NIL = the screen) bottom up: workspace, windows, wireframe, menus."
   (unless (covered-p wm box)
-    (glass:fb-fill fb *wm-bg*))
-  (dolist (s (reverse (stack wm)))
-    (handler-case (draw-surface wm s fb)
-      (error (e) (note-surface-error wm s e))))
+    (glass:fb-fill fb (if (rack-p wm) *rack-panel* *wm-bg*)))   ; the rack: filler, not a workspace
+  (if (rack-p wm)
+      (rack-draw-units wm fb)
+      (dolist (s (reverse (stack wm)))
+        (handler-case (draw-surface wm s fb)
+          (error (e) (note-surface-error wm s e)))))
+  (when (rack-p wm) (rack-draw-bar wm fb) (rack-draw-lift wm fb))
   (when-let (b (and (wm-drag-wire wm) (wm-drag-wire-box wm)))
     (destructuring-bind (x y w h) b
       (let ((t2 (max 2 (round (* 2 *wm-scale*)))) (t1 (max 1 (round *wm-scale*))))
@@ -586,6 +602,7 @@
 (defun wm-tick (wm)
   "Poll every window once and repaint what changed on every seat that is watched.  Returns T if
    it painted."
+  (when (rack-p wm) (rack-tick wm))
   (dolist (s (wm-surfaces wm))
     (handler-case
         (let ((dp (surf-dirty-p s)))
@@ -632,23 +649,28 @@
              (c (wm-cascade wm))
              (x (max (wm-border) (min (+ 40 c) (- sw w (wm-border)))))
              (y (max (+ (wm-titleh) (wm-border)) (min (+ 40 c (wm-titleh)) (- sh h (wm-border))))))
-        (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn resize-fn text-p selection-fn)
+        (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn resize-fn text-p selection-fn drag-p)
             (funcall make-fn fb)
           (setf (wm-cascade wm) (mod (+ c 28) 200))
           (let ((s (%make-surf :fb fb :x x :y y :title lbl :on-key on-key :on-pointer on-pointer
                                :dirty-p dirty-p :copy-p copy-p :close-fn close-fn
                                :resize-fn resize-fn :text-p (and text-p t)
-                               :selection-fn selection-fn
+                               :selection-fn selection-fn :drag-p drag-p
                                :z (incf (wm-zclock wm)))))
             (push s (wm-surfaces wm))
             (%focus wm s)
-            (damage wm (window-box s))
-            (loop for (seat . box) in (others-boxes wm s) do (seat-damage seat box))
+            (if (rack-p wm)
+                (rack-opened wm s w h)
+                (progn
+                  (damage wm (window-box s))
+                  (loop for (seat . box) in (others-boxes wm s) do (seat-damage seat box))))
             s))))))
 
 (defun %forget (wm s)
   "S is gone for everybody: every seat's hands come off it and no seat keeps a view of it."
   (setf (wm-surfaces wm) (remove s (wm-surfaces wm)))
+  (when (eq (first (wm-rack-press wm)) s) (setf (wm-rack-press wm) nil))
+  (when (eq (first (wm-rack-lift wm)) s) (setf (wm-rack-lift wm) nil))
   (dolist (seat (wm-seats wm))
     (let ((*seat* seat))
       (when (eq (wm-grab wm) s) (setf (wm-grab wm) nil))
@@ -662,7 +684,7 @@
 (defun wm-close (wm s)
   (let ((box (window-box s)))
     (with-others-damaged (wm s) (%forget wm s))
-    (wm-composite wm box)))
+    (if (rack-p wm) (rack-closed wm) (wm-composite wm box))))
 
 (defun wm-raise (wm s)
   (unless (eq s (wm-topmost wm))
@@ -729,6 +751,11 @@
     (unless (and (= w (glass:fb-width fb)) (= h (glass:fb-height fb)))
       (glass:fb-resize fb w h *wm-bg*)
       (setf (wm-menu wm) nil (wm-drag wm) nil (wm-drag-wire wm) nil (wm-drag-wire-box wm) nil)
+      ;; THE RACK turns with the screen: laid out again the other way (rack.lisp)
+      (when (and (rack-p wm) (seat-home-p me))
+        (setf (wm-rack-drag wm) nil (wm-rack-press wm) nil (wm-rack-lift wm) nil)
+        (rack-layout wm)
+        (return-from wm-resize-screen t))
       (dolist (s (wm-surfaces wm))
         (setf (seat-copy-base me s) nil)
         (when (seat-home-p me)
@@ -895,6 +922,11 @@ in its seat's clipboard -- the home seat's is the session's -- rfb.lisp READ-CLI
   (wm-composite wm (menu-chain-box wm)))
 
 (defun window-menu-items (wm s)
+  (when (rack-p wm)
+    (return-from window-menu-items
+      (append (selection-menu-items s)
+              (rack-menu-items wm s)
+              (list (cons "Close" (lambda () (wm-close wm s)))))))
   (append
    (selection-menu-items s)
    (when (surf-resize-fn s)
@@ -980,6 +1012,18 @@ in its seat's clipboard -- the home seat's is the session's -- rfb.lisp READ-CLI
     (cond
       ;; an open menu has the pointer
       ((wm-menu wm) (menu-pointer wm (wm-menu wm) mask x y))
+      ;; THE RACK's gestures (rack.lisp): a unit picked up, a press not yet decided, the bar dragged
+      ((and (rack-p wm) (wm-rack-lift wm)) (rack-lift-pointer wm x y down))
+      ((and (rack-p wm) (wm-rack-press wm)) (rack-press-pointer wm mask x y down))
+      ((and (rack-p wm) (wm-rack-drag wm)) (rack-drag-to wm x y down))
+      ((and (rack-p wm) (logtest pressed 1) (rack-on-bar-p wm x y)) (rack-press-bar wm x y))
+      ;; a press anywhere in a unit's slot -- its window or the infill round it -- is the unit's;
+      ;; only the screen past the last unit opens the root menu
+      ((and (rack-p wm) (logtest pressed 1) (rack-unit-at wm x y))
+       (rack-begin-press wm (rack-unit-at wm x y) mask x y))
+      ;; an EMPTY SLOT: no root menu in the rack -- a long press there is its apps menu, a drag
+      ;; scrolls, a tap does nothing (rack.lisp)
+      ((and (rack-p wm) (logtest pressed 5)) (rack-begin-press wm nil mask x y))
       ;; a move or resize in flight
       ((wm-drag wm)
        (destructuring-bind (s mode &rest rest) (wm-drag wm)
@@ -1003,6 +1047,8 @@ in its seat's clipboard -- the home seat's is the session's -- rfb.lisp READ-CLI
       (t
        (multiple-value-bind (s region cx cy cw ch) (wm-hit wm x y)
          (declare (ignore cw))
+         ;; in the rack a window is neither moved nor resized by hand: its corner is content
+         (when (and (rack-p wm) (eq region :resize)) (setq region :content))
          (cond
            ((null s)
             (when (logtest pressed 5)                ; a press on the workspace: the root menu
@@ -1021,6 +1067,8 @@ in its seat's clipboard -- the home seat's is the session's -- rfb.lisp READ-CLI
                    (:winmenu (wm-open-window-menu wm s cx cy mask x y))
                    (:resize (setf (wm-drag wm) (list s :resize x y (surf-cw s) ch)))
                    (:title (setf (wm-drag wm) (list s :move (- x (sx s)) (- y (sy s))))))))))
+           ((and (rack-p wm) (logtest pressed 1))      ; a unit: a tap, a drag or a long press
+            (rack-begin-press wm s mask x y))
            (t                                         ; a press in a window's content
             (%focus wm s :force (surf-text-p s))
             (wm-raise wm s)
