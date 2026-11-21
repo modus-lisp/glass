@@ -24,14 +24,17 @@
   "SERVE-WM's root menu: the desk's applications, a Lisp listener and a shell terminal.")
 
 (defun serve-wm (port &key (width 800) (height 600) (apps *wm-apps*) (open '("Clock"))
-                           (address "127.0.0.1") clients stop audio-port audio-path)
+                           (address "127.0.0.1") clients stop audio-port audio-path
+                           (display :rfb))
   "Serve the window manager WIDTH x HEIGHT on PORT: a network thread (every viewer), a
    compositor thread, and this thread the Lisp listener REPL windows evaluate on.  APPS is a
    list of (LABEL MAKE-FN &key WIDTH HEIGHT), MAKE-FN a symbol or global function returning the
    app contract (see wm.lisp); OPEN lists labels to open at start.  CLIENTS and STOP are
    SERVE-MULTI's.  AUDIO-PORT (or AUDIO-PATH, a UNIX socket) serves the desktop's sound as
    glass-audio/1 -- the McCLIM desktop's convention is PORT + 10, where the WebRTC gateway
-   looks -- and needs glass/wm-sound loaded (sound.lisp).  Returns when the network side does."
+   looks -- and needs glass/wm-sound loaded (sound.lisp).  DISPLAY :NATIVE shows the desktop
+   in a window of this platform's instead of serving it (GLASS:SERVE-NATIVE; PORT is then
+   unused, and closing the window ends it).  Returns when the network side does."
   ;; The faces, loaded HERE: the compositor draws text, and a font it loaded itself could not go
   ;; in the shared cache on modus.
   (glass:default-font) (glass:default-font t) (glass-term:term-fonts)
@@ -53,7 +56,8 @@
          (network (sb-thread:make-thread #'%wm-network
                                          :arguments (list fb port address clients stop
                                                           inbox wake listener
-                                                          sound sound-box audio-port audio-path)
+                                                          sound sound-box audio-port audio-path
+                                                          display)
                                          :name "glass-wm-network")))
     (unwind-protect (glass-repl:run-listener listener)
       (ignore-errors (sb-thread:join-thread network))
@@ -61,7 +65,7 @@
       (when (eq glass-repl:*listener* listener) (setf glass-repl:*listener* nil)))))
 
 (defun %wm-network (fb port address clients stop inbox wake listener
-                    sound sound-box audio-port audio-path)
+                    sound sound-box audio-port audio-path display)
   "The network thread: every viewer, and the sound's listeners, until SERVE-MULTI returns; then
    stop the others."
   (let ((out nil))
@@ -80,11 +84,16 @@
                      (error (e)
                        (format *error-output* "~&glass wm: no audio stream (~a); the desktop runs silent~%" e)
                        (force-output *error-output*))))
-                 (glass:serve-multi fb port
-                                    :address address :clients clients :stop stop
-                                    :tick (and out (lambda () (funcall 'audio-out-turn out)))
-                                    :on-key (lambda (down key) (post (list :key down key)))
-                                    :on-pointer (lambda (mask x y) (post (list :pointer mask x y)))))
+                 (if (eq display :native)
+                     (glass:serve-native fb :stop stop :title "glass"
+                                            :tick (and out (lambda () (funcall 'audio-out-turn out)))
+                                            :on-key (lambda (down key) (post (list :key down key)))
+                                            :on-pointer (lambda (mask x y) (post (list :pointer mask x y))))
+                     (glass:serve-multi fb port
+                                        :address address :clients clients :stop stop
+                                        :tick (and out (lambda () (funcall 'audio-out-turn out)))
+                                        :on-key (lambda (down key) (post (list :key down key)))
+                                        :on-pointer (lambda (mask x y) (post (list :pointer mask x y))))))
              (error (e)
                (ignore-errors (format *error-output* "~&glass wm: network: ~a~%" e)
                               (force-output *error-output*))))

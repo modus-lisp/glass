@@ -21,11 +21,13 @@
 (export '(serve-desk))
 
 (defun serve-desk (port &key (width 800) (height 600) (apps *standard-apps*) (open '("Clock")) (address "127.0.0.1")
-                             clients stop)
+                             clients stop (display :rfb))
   "Serve a desk WIDTH x HEIGHT on PORT: this thread is the network (every viewer), a second
    thread composites.  APPS is a list of (LABEL MAKE-FN &key WIDTH HEIGHT), MAKE-FN a symbol
    or global function (the DESK-REGISTER-APP contract); OPEN lists labels to open at start.
-   CLIENTS and STOP are SERVE-MULTI's.  Returns when the network side does."
+   CLIENTS and STOP are SERVE-MULTI's.  DISPLAY :NATIVE shows the desk in a window of this
+   platform's instead (GLASS:SERVE-NATIVE; PORT is then unused), until it is closed.  Returns
+   when the network side does."
   ;; The faces, loaded HERE: the compositor draws text, and a font it loaded itself could not
   ;; go in the shared cache on modus.
   (glass:default-font) (glass:default-font t)
@@ -37,10 +39,14 @@
                                             :name "glass-compositor")))
     (flet ((post (m) (glass::mb-post inbox m) (glass:wake-signal wake)))
       (unwind-protect
-           (glass:serve-multi fb port
-                              :address address :clients clients :stop stop
-                              :on-key (lambda (down key) (post (list :key down key)))
-                              :on-pointer (lambda (mask x y) (post (list :pointer mask x y))))
+           (if (eq display :native)
+               (glass:serve-native fb :stop stop :title "glass desk"
+                                      :on-key (lambda (down key) (post (list :key down key)))
+                                      :on-pointer (lambda (mask x y) (post (list :pointer mask x y))))
+               (glass:serve-multi fb port
+                                  :address address :clients clients :stop stop
+                                  :on-key (lambda (down key) (post (list :key down key)))
+                                  :on-pointer (lambda (mask x y) (post (list :pointer mask x y)))))
         (post (list :stop))
         (ignore-errors (sb-thread:join-thread compositor))))))
 

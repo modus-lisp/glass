@@ -64,7 +64,9 @@ give modus a remote display, developed and tested on SBCL first."
      ;; socket.lisp moved to cl-transport/src/listeners.lisp; this borrows it back
      (:file "transports")
      (:file "rfb")
-     (:file "zrle")))))
+     (:file "zrle")
+     ;; a framebuffer in the platform's own window: SERVE-MULTI's place for :DISPLAY :NATIVE
+     (:file "native")))))
 
 (asdf:defsystem :glass/client
   :description "The other end of the wire: an RFB (VNC) CLIENT, so a glass desktop
