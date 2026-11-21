@@ -11,6 +11,9 @@
 ;;;; X8R8G8B8 pixel vector, and the window's input as (:key DOWN KEYSYM) (:pointer MASK X Y)
 ;;;; (:paint) (:close).  Nothing else provides one yet; NATIVE-DISPLAY-P says whether this Lisp
 ;;;; can.
+;;;;
+;;;; GLASS_NATIVE_STATS=1: once a second, what the window was shown -- presents, pixels, and
+;;;; the time spent presenting (the platform's W32-WINDOW-STATS) -- on *ERROR-OUTPUT*.
 
 (in-package #:glass)
 
@@ -50,6 +53,9 @@
          (present (%native-fn "W32-WINDOW-PRESENT"))
          (events (%native-fn "W32-WINDOW-EVENTS"))
          (close (%native-fn "W32-WINDOW-CLOSE"))
+         (stats (let ((v (sb-ext:posix-getenv "GLASS_NATIVE_STATS")))
+                  (and v (plusp (length v)) (string/= v "0") (%native-fn "W32-WINDOW-STATS"))))
+         (stats-at (get-internal-real-time))
          (w (fb-width fb)) (h (fb-height fb))
          (wait (max 1 (round (* 1000 interval))))
          (win (or (funcall open w h title) (error "glass: the native window did not open"))))
@@ -70,6 +76,12 @@
                      (:close (setf closed t))))
                  (when closed (return nil)))
                (when tick (funcall tick))
+               (when (and stats (>= (- (get-internal-real-time) stats-at) internal-time-units-per-second))
+                 (setf stats-at (get-internal-real-time))
+                 (destructuring-bind (n px us) (funcall stats win)
+                   (format *error-output* "~&glass: native: ~d presents, ~d Kpx, ~,1f ms presenting~%"
+                           n (floor px 1000) (/ us 1000.0))
+                   (force-output *error-output*)))
                (multiple-value-bind (frame damage copy) (fb-take-frame fb)
                  (declare (ignore frame))
                  (let ((d (%damage-with-copy damage copy)))
