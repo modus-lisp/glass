@@ -273,7 +273,12 @@
   "A rendered page's key: its kind, its zoom (when not 1), the file and the page."
   (format nil "~(~a~)~:[@~d~;~*~]|~a#~d" kind (eql zoom 1) zoom path page))
 
-(defun %dk (pn kind path page) (%doc-key kind path page (documents-zoom pn)))
+(defun %dk (pn kind path page)
+  "PN's key for a render of PAGE: the page's key, and the size of the box it is fitted into -- a
+   panel that changes size (a turned phone, Media's theater) asks for renders at its new size, and
+   one made for the old size, even one arriving late from the worker, is never shown in its place."
+  (multiple-value-bind (w h) (%doc-box pn)
+    (format nil "~a/~dx~d" (%doc-key kind path page (documents-zoom pn)) (round w) (round h))))
 
 (defun %doc-box (pn)
   "(values W H) a page is fitted into: the view, times the zoom."

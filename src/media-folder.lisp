@@ -322,10 +322,20 @@
 
 (defun %pic-pages (pn) (max 1 (ceiling (length (%pic-items pn)) (%pic-per-page pn))))
 
-(defun %pic-view-box (pn)
-  "(values X Y W H) the viewer's area: between the head and the bar."
+(defun folder-theater-p (pn)
+  "THEATER: a file open in a panel wider than it is tall (a turned phone).  The file is the whole
+   panel -- no head, no bar -- a tap on its left or right half steps back or on (the Left and Right
+   keys), and the window it is in may be shown full-screen (Media's theater)."
   (let ((fb (panel-fb pn)))
-    (values 0 *ra-head-h* (glass:fb-width fb) (max 1 (- (glass:fb-height fb) *ra-head-h* *pic-bar-h*)))))
+    (and (eq (folder-mode pn) :view) (folder-files pn)
+         (> (glass:fb-width fb) (glass:fb-height fb)) t)))
+
+(defun %pic-view-box (pn)
+  "(values X Y W H) the viewer's area: between the head and the bar -- in THEATER, all of it."
+  (let ((fb (panel-fb pn)))
+    (if (folder-theater-p pn)
+        (values 0 0 (glass:fb-width fb) (glass:fb-height fb))
+        (values 0 *ra-head-h* (glass:fb-width fb) (max 1 (- (glass:fb-height fb) *ra-head-h* *pic-bar-h*))))))
 
 (defun %pic-key (entry) (namestring (pic-entry-path entry)))
 
@@ -419,7 +429,8 @@
     (format nil "~{~a~^ / ~}" (cons (folder-label pn) (nthcdr (length root) f)))))
 
 (defun %pic-head (pn title info &optional pager)
-  "The head: TITLE at the left, INFO at the right, and the pager chevrons when PAGER."
+  "The head: TITLE at the left, INFO at the right, and the pager chevrons when PAGER.  None in THEATER."
+  (when (folder-theater-p pn) (return-from %pic-head nil))
   (let* ((fb (panel-fb pn)) (w (glass:fb-width fb)) (right (- w 8)))
     (glass:fb-rect fb 0 0 w *ra-head-h* +ra-head+)
     (when pager
@@ -495,7 +506,9 @@
 
 (defun %folder-bar (pn &key (prev t) (next t))
   "The viewer's bar: three big buttons, the whole third each -- Prev, Back, Next.  PREV / NEXT NIL:
-   that one is drawn dim (there is nothing that way) but still a target, which does nothing."
+   that one is drawn dim (there is nothing that way) but still a target, which does nothing.  None
+   in THEATER (the halves of the file are its Prev and Next)."
+  (when (folder-theater-p pn) (return-from %folder-bar nil))
   (let* ((fb (panel-fb pn)) (w (glass:fb-width fb)) (h (glass:fb-height fb))
          (y (- h *pic-bar-h*)) (third (floor w 3)))
     (loop for (label icon action on) in (list (list "Prev" :left (lambda () (folder-step pn -1)) prev)
@@ -578,17 +591,26 @@
     (when (eq edge :press) (folder-panel-press pn x y))))
 
 (defun %folder-app (pn)
-  "PN as an application: (values ON-KEY ON-POINTER DIRTY-P COPY-P CLOSE-FN RESIZE-FN) -- no TEXT-P.
-   It draws from its framebuffer's size every time, so a resize is the framebuffer and a redraw."
+  "PN as an application: (values ON-KEY ON-POINTER DIRTY-P COPY-P CLOSE-FN RESIZE-FN TEXT-P
+   SELECTION-FN DRAG-P FULLSCREEN-P) -- no text, no selection.  It draws from its framebuffer's size
+   every time, so a resize is the framebuffer and a redraw.  In THEATER (FOLDER-THEATER-P) a press
+   on the left half is Left, on the right half Right; no drag is its own; and it asks to be shown
+   full-screen (FULLSCREEN-P, past the contract's nine, read by Media)."
   (let ((down nil))
     (values (lambda (pressed keysym) (when pressed (folder-panel-key pn keysym)))
             (lambda (mask x y)
               (let ((now (logbitp 0 mask)))
-                (folder-panel-pointer pn (cond ((and now (not down)) :press) (now :drag) (down :release)
-                                               (t :move))
-                                      x y)
+                (if (folder-theater-p pn)
+                    (when (and now (not down))
+                      (folder-panel-key pn (if (< x (floor (glass:fb-width (panel-fb pn)) 2)) #xff51 #xff53)))
+                    (folder-panel-pointer pn (cond ((and now (not down)) :press) (now :drag) (down :release)
+                                                   (t :move))
+                                          x y))
                 (setf down now)))
             (lambda () (folder-panel-dirty-p pn))
             nil
             (lambda () (folder-panel-close pn))
-            (lambda (w h) (glass:fb-resize (panel-fb pn) w h +ra-bg+) (setf (panel-dirty pn) t)))))
+            (lambda (w h) (glass:fb-resize (panel-fb pn) w h +ra-bg+) (setf (panel-dirty pn) t))
+            nil nil
+            (lambda (x y) (declare (ignore x y)) (not (folder-theater-p pn)))
+            (lambda () (folder-theater-p pn)))))

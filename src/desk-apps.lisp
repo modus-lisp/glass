@@ -275,12 +275,17 @@
           ;; here is a real RESIZE-FN: the framebuffer resized, and the consumer RESYNCed -- it
           ;; forgets what it drew and lays the player out again at the new size (warp's layout reads
           ;; the viewport from the framebuffer on every pass).
+          ;; and a TENTH, past the contract's nine: is there a picture (a film) showing?  Media's
+          ;; THEATER asks it (media-radio.lisp).
           (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn consumer) (funcall make-win fb lib)
             (values on-key on-pointer dirty-p copy-p close-fn
                     (lambda (w h)
                       (glass:fb-resize fb w h #x0c0e12)
                       (let ((resync (and (find-package "WARP") (find-symbol "RESYNC" "WARP"))))
-                        (when (and resync consumer) (funcall resync consumer))))))))))
+                        (when (and resync consumer) (funcall resync consumer))))
+                    nil nil nil
+                    (let ((pic (find-symbol "HAS-PICTURE-P" "WARP-MEDIA")))
+                      (lambda () (and pic consumer (ignore-errors (funcall pic consumer)) t)))))))))
 
 (defparameter *standard-apps*
   '(("Clock" clock-app :width 260 :height 110)
