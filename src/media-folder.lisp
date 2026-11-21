@@ -217,6 +217,10 @@
    (page :initform 0 :accessor folder-page :accessor pictures-page :documentation "The list's page.")
    (targets :initform '() :accessor panel-targets)
    (dirty :initform t :accessor panel-dirty)
+   ;; THE DETAIL (glass.wm's eleventh app value): the screen's density when the window manager has
+   ;; asked for the open file drawn at it, else 1; and the last such drawing, kept until it changes
+   (detail-scale :initform 1 :accessor folder-detail-scale)
+   (detail-cache :initform nil :accessor folder-detail-cache)
    (thumbs :initform (make-hash-table :test 'equal) :reader folder-thumbs :reader pictures-thumbs
            :documentation "Key -> what the cell shows.  The window's, for as long as it is open.")
    (views :initform (make-hash-table :test 'equal) :reader folder-views :reader pictures-views
@@ -590,6 +594,11 @@
   (:method ((pn folder-panel) edge x y)
     (when (eq edge :press) (folder-panel-press pn x y))))
 
+(defgeneric folder-detail (pn scale)
+  (:documentation "The open file drawn at SCALE times the panel's pixels, for glass.wm's detail layer:
+   (values X Y FB), X and Y in the panel's pixels -- or NIL (nothing sharper to show).")
+  (:method ((pn folder-panel) scale) (declare (ignore scale)) nil))
+
 (defun %folder-app (pn)
   "PN as an application: (values ON-KEY ON-POINTER DIRTY-P COPY-P CLOSE-FN RESIZE-FN TEXT-P
    SELECTION-FN DRAG-P FULLSCREEN-P) -- no text, no selection.  It draws from its framebuffer's size
@@ -613,4 +622,5 @@
             (lambda (w h) (glass:fb-resize (panel-fb pn) w h +ra-bg+) (setf (panel-dirty pn) t))
             nil nil
             (lambda (x y) (declare (ignore x y)) (not (folder-theater-p pn)))
-            (lambda () (folder-theater-p pn)))))
+            (lambda () (folder-theater-p pn))
+            (lambda (scale) (folder-detail pn scale)))))

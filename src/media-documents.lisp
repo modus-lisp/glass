@@ -212,12 +212,12 @@
                          (%pic-scale (pigment:img-rgba img) (pigment:img-w img) (pigment:img-h img)
                                      box-w box-h +ra-row+ 1)
                        (list kind key w h px title pages)))))
-                ((:low :page)
+                ((:low :page :sharp)
                  (let ((ckey (format nil "crop|~a#~d" path page)))
                    (multiple-value-bind (pw ph) (%doc-shown-size doc page)
                      (multiple-value-bind (low crop)
                          (let ((c (gethash ckey cache)))
-                           (if (and c (eq kind :page)) (values nil c) (%doc-low doc page box-w box-h)))
+                           (if (and c (member kind '(:page :sharp))) (values nil c) (%doc-low doc page box-w box-h)))
                        (setf (gethash ckey cache) crop)
                        (multiple-value-bind (s dw dh) (%doc-geometry pw ph crop box-w box-h)
                          (let ((img (if (eq kind :low) low (%doc-render doc page s))))
@@ -313,6 +313,10 @@
             (unless (gethash (%dk pn :page (%pic-key e) p) views)
               (want :low e p w h views))
             (want :page e p w h views)
+            ;; SHARP: once the window manager has asked for the page at the screen's density
+            ;; (FOLDER-DETAIL), the page at that many times the box, for the detail layer
+            (let ((ds (folder-detail-scale pn)))
+              (when (> ds 1) (want :sharp e p (* w ds) (* h ds) views)))
             (when (or (null n) (< (1+ p) n)) (want :page e (1+ p) w h views))
             (when (plusp p) (want :page e (1- p) w h views)))))
       (multiple-value-bind (bw bh) (folder-thumb-box pn)
@@ -510,6 +514,33 @@
                      (if (> w bw) (- bx (round (* fx w))) (+ bx (floor (- bw w) 2)))
                      (if (> h bh) (- by (round (* fy h))) (+ by (floor (- bh h) 2)))
                      w h px))))))
+
+(defmethod folder-detail ((pn documents-panel) scale)
+  "The open page at SCALE times the panel's pixels, laid out as %DOC-BLIT lays the page out
+   (centred, or panned when zoomed), over the whole view box: (values BX BY FB).  The first ask
+   only records SCALE and asks for the render (FOLDER-WISH's :SHARP); NIL until it arrives."
+  (unless (eql scale (folder-detail-scale pn))
+    (setf (folder-detail-scale pn) scale (panel-dirty pn) t))
+  (let* ((e (%doc-open-entry pn))
+         (v (and e (> scale 1) (not (%doc-refusal pn e))
+                 (gethash (%dk pn :sharp (%pic-key e) (documents-page-number pn)) (folder-views pn)))))
+    (when (consp v)
+      (multiple-value-bind (bx by bw bh) (%pic-view-box pn)
+        (let ((key (list v (documents-pan pn) (documents-zoom pn) bw bh scale))
+              (c (folder-detail-cache pn)))
+          (unless (and c (equal (car c) key))
+            (destructuring-bind (w h px &rest more) v
+              (declare (ignore more))
+              (let* ((sw (* bw scale)) (sh (* bh scale))
+                     (dfb (glass:make-framebuffer sw sh +ra-bg+)))
+                (multiple-value-bind (mx my) (%doc-pan-max w h sw sh)
+                  (let ((fx (min mx (car (documents-pan pn)))) (fy (min my (cdr (documents-pan pn)))))
+                    (%pic-blit dfb
+                               (if (> w sw) (- (round (* fx w))) (floor (- sw w) 2))
+                               (if (> h sh) (- (round (* fy h))) (floor (- sh h) 2))
+                               w h px)))
+                (setf c (cons key dfb) (folder-detail-cache pn) c))))
+          (values bx by (cdr c)))))))
 
 (defun %doc-note (fb bx bw y text)
   "TEXT on a dark pill, centred across BX..BX+BW at Y: readable over a white page."

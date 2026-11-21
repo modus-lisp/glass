@@ -604,11 +604,11 @@
         (labels ((part (key)
                    (let ((cell (cdr (assoc key lazy))))
                      (or (cdr cell)
-                         (setf (cdr cell) (multiple-value-bind (k p d c x r tp sel dg fs)
+                         (setf (cdr cell) (multiple-value-bind (k p d c x r tp sel dg fs dt)
                                                           (funcall (%media-lazy-fn key) (car cell))
                                             (declare (ignore c tp sel dg))
-                                            ;; ON-KEY ON-POINTER DIRTY-P CLOSE-FN RESIZE-FN FULLSCREEN-P
-                                            (list k p d x r fs))))))
+                                            ;; ON-KEY ON-POINTER DIRTY-P CLOSE-FN RESIZE-FN FULLSCREEN-P DETAIL-FN
+                                            (list k p d x r fs dt))))))
                  (part-fb (key)
                    (case key (:music music) (:stations stations) (t (cadr (assoc key lazy))))))
           (values (lambda (down keysym)
@@ -706,4 +706,11 @@
                   ;; DRAG-P: in THEATER no drag is Media's (a swipe goes to the desk); else all are
                   (lambda (x y) (declare (ignore x y)) (not theater))
                   ;; FULLSCREEN-P, past the contract's nine: in THEATER, show me over the whole screen
-                  (lambda () theater)))))))
+                  (lambda () theater)
+                  ;; DETAIL-FN: the showing tab's sharp part (a folder tab's open file), placed in
+                  ;; Media's pixels -- under the tab strip, or (THEATER) the whole window
+                  (lambda (scale)
+                    (let ((made (and (not (member tab '(:music :stations))) (cdr (cdr (assoc tab lazy))))))
+                      (when (and made (seventh made))
+                        (multiple-value-bind (x y f) (funcall (seventh made) scale)
+                          (when f (values x (+ y (if theater 0 th)) f))))))))))))
