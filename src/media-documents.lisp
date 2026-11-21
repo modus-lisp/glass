@@ -304,20 +304,18 @@
 
 (defvar *doc-px-pool* nil
   "Page pixel arrays the main thread has finished with (FOLDER-TRIM), for %DOC-CACHE-READ to fill
-   again.  MAIN THREAD ONLY.  A sharp landscape page is 10 MB, and a fresh one a page turn lived
-   long enough for modus's region-0 collector to tenure it: old space filled with dead pages, every
-   collection copied more, and after a dozen pages the heap was exhausted.  A few arrays, reused,
-   are tenured once.")
+   again.  MAIN THREAD ONLY.  A sharp landscape page is 10 MB; making a fresh one every page turn
+   is garbage the young space must keep collecting (2 x 171 MB on the phone, the world tenured
+   below it), where a few arrays, reused, are made once.")
 
 (defparameter *doc-px-pool-size* 12)
 
 (defparameter *doc-band-pixels* 250000
   "The most pixels in one array a cached page is read into on the main thread; a bigger page is
-   read as bands of whole rows (a list of arrays, top first).  modus main 246562e3 exhausts
-   region 0 when the main thread allocates large arrays while a worker thread is alive: 4 MB
-   arrays with the worker blocked in CONDITION-WAIT (the document worker, idle), 9 MB with one
-   sleeping; 1 MB survives either.  A sharp landscape page is 9.8 MB.  Reported to the modus
-   session; this is the workaround.")
+   read as bands of whole rows (a list of arrays, top first), which the pool reuses more readily
+   than whole pages of one size.  NOT a collector workaround, whatever b66aa67 says: what looked
+   like region 0 failing with large arrays was a --script harness without the app's GC-TENURE,
+   where the ~300 MB world filled the 344 MB semispace left after the thread heaps were carved.")
 
 (defun %doc-px-get (n)
   (let ((px (find n *doc-px-pool* :key #'length)))
