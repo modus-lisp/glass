@@ -21,7 +21,7 @@
    ;; embedding it (the same shape as glass.desk's MAKE-DESK / DESK-POINTER / DESK-TICK)
    #:make-wm #:wm-register-app #:wm-register-action #:wm-actions #:wm-open #:wm-pointer #:wm-key #:wm-tick #:wm-redraw #:wm-resize-screen
    ;; the rack (rack.lisp): windows as rack units, for a phone
-   #:wm-set-layout #:wm-layout #:wm-set-obscured #:wm-obscured #:*rack-units-landscape* #:*rack-min-unit* #:*rack-max-units* #:*rack-title-scale* #:*wm-title-scale*
+   #:wm-set-layout #:wm-layout #:wm-set-obscured #:wm-obscured #:wm-wants-fullscreen #:wm-set-fullscreen #:wm-fullscreen #:*rack-units-landscape* #:*rack-min-unit* #:*rack-max-units* #:*rack-title-scale* #:*wm-title-scale*
    #:wm-fb #:wm-surfaces #:wm-apps #:wm-focus #:wm-keyboard-fn
    ;; seats: one person's screen, hands and arrangement of the session's windows
    #:wm-seat-port #:wm-session #:wm-session-port #:wm-session-seat-keys #:wm-session-seat-clipboard

@@ -69,7 +69,8 @@
 
 (defun rack-p (wm) (eq (wm-layout wm) :rack))
 (defun rack-vertical-p (wm) (>= (screen-h wm) (screen-w wm)))
-(defun rack-bar () "The overflow bar's thickness." (max 3 (round (* 3 *wm-scale*))))
+(defvar *rack-bar-hidden* nil "True while the desk is full-screen for a unit: no overflow bar.")
+(defun rack-bar () "The overflow bar's thickness." (if *rack-bar-hidden* 0 (max 3 (round (* 3 *wm-scale*)))))
 
 (defun rack-page (wm)
   "Slots to a SCREEN of the rack -- what a unit fills down to: as many of *RACK-MIN-UNIT* as the
@@ -386,7 +387,8 @@
             ;; chooses nothing
             (rack-open-apps-menu wm x y :want (rack-pos-at wm x y) :armed nil)
             (progn
-              (setf (wm-rack-lift wm) (list s (- (rack-along-of wm x y) (rack-screen-start wm s)) nil))
+              (setf (wm-rack-lift wm) (list s (- (rack-along-of wm x y) (rack-screen-start wm s)) nil
+                                            (rack-screen-start wm s)))
               (wm-raise wm s)
               (wm-composite wm)))))))
 
@@ -417,7 +419,8 @@
 (defun rack-lift-pointer (wm x y down)
   "The unit picked up: follow the finger along the rack, scrolling when it nears an end; let go,
    drop it where it is -- or, if it never moved, open its menu there."
-  (destructuring-bind (s grab moved) (wm-rack-lift wm)
+  (destructuring-bind (s grab moved &optional slot-start) (wm-rack-lift wm)
+    (declare (ignore slot-start))
     (let* ((a (rack-along-of wm x y))
            (moved (or moved (> (abs (- a (+ grab (rack-screen-start wm s)))) (rack-slop)))))
       (setf (third (wm-rack-lift wm)) moved)
@@ -428,6 +431,7 @@
                  ((> a (- along edge)) (setf (wm-rack-scroll wm) (rack-clamp-scroll wm (+ (wm-rack-scroll wm) step)))))
            (rack-layout wm :composite nil)
            (rack-place-lifted wm s (- a grab))
+           (setf (fourth (wm-rack-lift wm)) (- a grab))
            (wm-composite wm)))
         (down nil)
         (moved
@@ -480,13 +484,42 @@
           (rack-layout wm))))))
 
 (defun rack-draw-lift (wm fb)
-  "The lifted unit's outline: white over black, so it reads on any content."
+  "The lifted unit's outline, round its SLOT (where the unit is, wherever its window sits in it):
+   white over black, so it reads on any content."
   (let ((l (wm-rack-lift wm)))
     (when l
-      (destructuring-bind (x y w h) (window-box (first l))
+      (destructuring-bind (x y w h)
+          (let* ((s (first l)) (len (* (rack-unit wm) (rack-span wm s)))
+                 ;; the slot follows the finger: where the lift put its start (RACK-LIFT-POINTER)
+                 (start (or (fourth l) (rack-screen-start wm s))))
+            (if (rack-vertical-p wm)
+                (list 0 start (rack-across wm) len)
+                (list start 0 len (rack-across wm))))
         (let ((t2 (max 3 (round (* 3 *wm-scale*)))))
           (glass:fb-frame fb x y w h glass:+white+ t2)
           (glass:fb-frame fb (+ x t2) (+ y t2) (max 0 (- w (* 2 t2))) (max 0 (- h (* 2 t2))) glass:+black+ 1))))))
+
+;;; ---- full screen: a unit that asks for the whole screen (Media's theater) -------------------------
+
+(defun wm-wants-fullscreen (wm)
+  "In the rack, turned to landscape: does the unit that fills the screen want ALL of it -- the
+   host's safe-area margins too, no overflow bar (its make-fn's tenth value, FULLSCREEN-P: Media in
+   THEATER)?  A unit fills the screen when its slot covers what is on it, so a swipe that brings
+   another unit into view gives the screen back."
+  (and (rack-p wm) (not (rack-vertical-p wm))
+       (let* ((v (wm-rack-scroll wm)) (along (rack-along wm))
+              (s (find-if (lambda (w) (let ((start (rack-start wm w)))
+                                         (and (<= start (+ v 2))
+                                              (>= (+ start (* (rack-unit wm) (rack-span wm w))) (- (+ v along) 2)))))
+                          (wm-rack-order wm))))
+         (and s (surf-fullscreen-p s) (ignore-errors (funcall (surf-fullscreen-p s))) t))))
+
+(defun wm-set-fullscreen (wm on)
+  "The host now shows the desk over its whole screen (ON) or inside its margins: the overflow bar
+   goes (comes back), and the rack lays itself out again.  The host resizes the screen itself."
+  (setf (wm-fullscreen wm) (and on t) *rack-bar-hidden* (and on t))
+  (when (rack-p wm) (rack-layout wm))
+  on)
 
 ;;; ---- drawing the units -------------------------------------------------------------------------
 

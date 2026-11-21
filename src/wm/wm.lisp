@@ -115,6 +115,7 @@
   (span nil)                            ; rack units it takes in the RACK layout (rack.lisp), NIL = not placed yet
   (pos nil)                             ; the rack unit it starts at (rack.lisp), NIL = not placed yet
   (drag-p nil)                          ; (lambda (x y)): is a drag starting there the app's?  NIL: every one is
+  (fullscreen-p nil)                    ; (lambda ()): does it want the whole screen now (Media's theater)?
   (err-count 0))
 
 (defmethod print-object ((s surf) stream)
@@ -196,7 +197,8 @@
   (rack-press nil)      ; a press in a unit, not yet a tap, a drag or a long press: (s x y t0 mask)
   (rack-lift nil)       ; a unit picked up by a long press: (s grab-offset moved-p)
   (rack-want nil)       ; the empty slot the root menu was opened on: where its app goes
-  (obscured 0))         ; pixels at the bottom of the screen hidden by the host's keyboard (WM-SET-OBSCURED)
+  (obscured 0)          ; pixels at the bottom of the screen hidden by the host's keyboard (WM-SET-OBSCURED)
+  (fullscreen nil))     ; the host shows the desk over its whole screen for a unit that asked (rack.lisp)
 
 (defun make-wm (fb)
   "A window manager drawing into FB, the home seat's screen."
@@ -649,13 +651,14 @@
              (c (wm-cascade wm))
              (x (max (wm-border) (min (+ 40 c) (- sw w (wm-border)))))
              (y (max (+ (wm-titleh) (wm-border)) (min (+ 40 c (wm-titleh)) (- sh h (wm-border))))))
-        (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn resize-fn text-p selection-fn drag-p)
+        (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn resize-fn text-p selection-fn drag-p
+                              fullscreen-p)
             (funcall make-fn fb)
           (setf (wm-cascade wm) (mod (+ c 28) 200))
           (let ((s (%make-surf :fb fb :x x :y y :title lbl :on-key on-key :on-pointer on-pointer
                                :dirty-p dirty-p :copy-p copy-p :close-fn close-fn
                                :resize-fn resize-fn :text-p (and text-p t)
-                               :selection-fn selection-fn :drag-p drag-p
+                               :selection-fn selection-fn :drag-p drag-p :fullscreen-p fullscreen-p
                                :z (incf (wm-zclock wm)))))
             (push s (wm-surfaces wm))
             (%focus wm s)
