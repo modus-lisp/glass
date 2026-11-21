@@ -116,6 +116,9 @@
   (pos nil)                             ; the rack unit it starts at (rack.lisp), NIL = not placed yet
   (drag-p nil)                          ; (lambda (x y)): is a drag starting there the app's?  NIL: every one is
   (fullscreen-p nil)                    ; (lambda ()): does it want the whole screen now (Media's theater)?
+  (detail-fn nil)                       ; (lambda (scale)) -> (values X Y FB): a part drawn at SCALE, over the magnified app
+  (scale 1)                             ; DENSITY: screen pixels to one of its own -- the WM's density for an
+                                        ; app that draws in points (magnified), 1 for one that draws in pixels
   (err-count 0))
 
 (defmethod print-object ((s surf) stream)
@@ -198,7 +201,8 @@
   (rack-lift nil)       ; a unit picked up by a long press: (s grab-offset moved-p)
   (rack-want nil)       ; the empty slot the root menu was opened on: where its app goes
   (obscured 0)          ; pixels at the bottom of the screen hidden by the host's keyboard (WM-SET-OBSCURED)
-  (fullscreen nil))     ; the host shows the desk over its whole screen for a unit that asked (rack.lisp)
+  (fullscreen nil)      ; the host shows the desk over its whole screen for a unit that asked (rack.lisp)
+  (density 1))          ; screen pixels to a POINT (a phone's 3): see WM-SET-DENSITY
 
 (defun make-wm (fb)
   "A window manager drawing into FB, the home seat's screen."
@@ -247,12 +251,26 @@
     (setf (seat-pending seat) :full (seat-copy-bases seat) nil))
   (setf (seat-viewers seat) n))
 
-(defun wm-register-app (wm label make-fn &key (width 400) (height 300))
-  "Put LABEL on the root menu; choosing it opens a WIDTH x HEIGHT window running MAKE-FN."
+(defvar *density* 1
+  "While an app's MAKE-FN runs: how many of its framebuffer's pixels are a POINT.  1 for an app
+   that draws in points (the window manager magnifies it, nearest neighbour, to the screen's
+   density); the screen's density for one registered :DENSITY-AWARE, whose framebuffer is in
+   screen pixels -- it draws text at *DENSITY* times its point size, and is sharp.")
+
+(defun wm-register-app (wm label make-fn &key (width 400) (height 300) density-aware)
+  "Put LABEL on the root menu; choosing it opens a WIDTH x HEIGHT window running MAKE-FN.  WIDTH and
+   HEIGHT are POINTS (WM-SET-DENSITY's).  DENSITY-AWARE: MAKE-FN draws in screen pixels (see
+   *DENSITY*) and is not magnified; otherwise it draws in points and is, as every app that does not
+   know about density must be."
   (setf (wm-apps wm)
         (append (remove label (wm-apps wm) :key #'first :test #'string=)
-                (list (list label make-fn width height))))
+                (list (list label make-fn width height density-aware))))
   label)
+
+(defun wm-set-density (wm d)
+  "The screen has D pixels to a POINT (a phone's 3): apps are laid out in points and drawn at it --
+   those that know about density in screen pixels, the rest magnified.  Call before the first window."
+  (setf (wm-density wm) (max 1 d)))
 
 (defun wm-register-action (wm label thunk)
   "Put LABEL on the root menu, after the applications; choosing it calls THUNK and opens no window
@@ -371,8 +389,15 @@
 
 ;;; ---- geometry --------------------------------------------------------------------------------
 
-(defun surf-cw (s) (glass:fb-width (surf-fb s)))
-(defun surf-ch (s) (glass:fb-height (surf-fb s)))
+(defun surf-cw (s)
+  "S's content width ON THE SCREEN: its framebuffer magnified by its SCALE.  Everything that lays
+   out, damages or hit-tests reads this, so a magnified window is handled as the size it is drawn."
+  (* (glass:fb-width (surf-fb s)) (surf-scale s)))
+(defun surf-ch (s) (* (glass:fb-height (surf-fb s)) (surf-scale s)))
+
+(defun surf-resize (s w h)
+  "Ask S's app to make its content W x H SCREEN pixels: its own are that over its SCALE."
+  (funcall (surf-resize-fn s) (max 1 (floor w (surf-scale s))) (max 1 (floor h (surf-scale s)))))
 
 (defun window-box-at (s cx cy)
   "The decorated (x y w h) S would occupy with its content at (CX,CY)."
@@ -527,18 +552,29 @@
   (let ((cx (sx s)) (cy (sy s)))
     (wm-frame fb cx cy (surf-cw s) (surf-ch s) (surf-deco s)
               (lambda ()
-                (let ((c (ignore-errors (surf-screen-copy wm s fb)))
+                (let ((c (and (= (surf-scale s) 1) (ignore-errors (surf-screen-copy wm s fb))))
                       (cur (wm-frame-copy wm)))
                   (when (and c (or (null cur) (> (* (fifth c) (sixth c)) (* (fifth cur) (sixth cur)))))
                     (setf (wm-frame-copy wm) c)))
-                (blit-fb (surf-fb s) cx cy fb)))))
+                (if (= (surf-scale s) 1)
+                    (blit-fb (surf-fb s) cx cy fb)
+                    (progn
+                      (blit-fb-scaled (surf-fb s) cx cy fb (surf-scale s))
+                      ;; THE DETAIL: a part the app can draw at the screen's density -- a page, a
+                      ;; picture, a film -- over its magnified self, 1:1 (the app contract's
+                      ;; eleventh value; X and Y in the app's own pixels)
+                      (when (surf-detail-fn s)
+                        (multiple-value-bind (dx dy dfb) (ignore-errors (funcall (surf-detail-fn s) (surf-scale s)))
+                          (when dfb
+                            (blit-fb dfb (+ cx (* dx (surf-scale s))) (+ cy (* dy (surf-scale s))) fb))))))))))
 
 (defun composite-scroll (wm fb box)
   "Paint this composite as a window's scroll -- move what the screen holds, blit only the strip
    it exposed -- when the topmost window containing BOX reports a believable translation.  True
    if it did; the wire hint is kept either way."
   (when-let (s (and *wm-scroll-copyrect* box
-                    (find-if (lambda (w) (and (surf-copy-p w) (box-inside-p box (window-box w))))
+                    (find-if (lambda (w) (and (surf-copy-p w) (= (surf-scale w) 1)
+                                              (box-inside-p box (window-box w))))
                              (stack wm))))
     (multiple-value-bind (wire screen allowed)
         (handler-case (surf-screen-copy wm s fb) (error () (values nil nil nil)))
@@ -643,22 +679,26 @@
    own -- with the current seat's keys (only: a window appearing on my screen must not take the
    keys from under you).  Placed for the current seat's screen.  Returns the window."
   (when-let (app (find label (wm-apps wm) :key #'first :test #'string=))
-    (destructuring-bind (lbl make-fn w h) app
-      (let* ((sw (screen-w wm)) (sh (screen-h wm))
-             (w (max 32 (min w (- sw (* 2 (wm-border))))))
-             (h (max 32 (min h (- sh (wm-titleh) (* 2 (wm-border))))))
-             (fb (glass:make-framebuffer w h glass:+white+))
+    (destructuring-bind (lbl make-fn w h &optional aware) app
+      (let* ((d (wm-density wm))
+             (scale (if aware 1 d))           ; screen pixels to one of the app's
+             (sw (screen-w wm)) (sh (screen-h wm))
+             ;; W and H were points: the window on the screen is that times the density
+             (w (max 32 (min (* w d) (- sw (* 2 (wm-border))))))
+             (h (max 32 (min (* h d) (- sh (wm-titleh) (* 2 (wm-border))))))
+             (fb (glass:make-framebuffer (max 1 (floor w scale)) (max 1 (floor h scale)) glass:+white+))
              (c (wm-cascade wm))
              (x (max (wm-border) (min (+ 40 c) (- sw w (wm-border)))))
              (y (max (+ (wm-titleh) (wm-border)) (min (+ 40 c (wm-titleh)) (- sh h (wm-border))))))
         (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn resize-fn text-p selection-fn drag-p
-                              fullscreen-p)
-            (funcall make-fn fb)
+                              fullscreen-p detail-fn)
+            (let ((*density* (if aware d 1))) (funcall make-fn fb))
           (setf (wm-cascade wm) (mod (+ c 28) 200))
           (let ((s (%make-surf :fb fb :x x :y y :title lbl :on-key on-key :on-pointer on-pointer
                                :dirty-p dirty-p :copy-p copy-p :close-fn close-fn
                                :resize-fn resize-fn :text-p (and text-p t)
                                :selection-fn selection-fn :drag-p drag-p :fullscreen-p fullscreen-p
+                               :scale scale :detail-fn detail-fn
                                :z (incf (wm-zclock wm)))))
             (push s (wm-surfaces wm))
             (%focus wm s)
@@ -708,7 +748,7 @@
       (unless (and (= w (surf-cw s)) (= h (surf-ch s)))
         (let ((old (window-box s)))
           (with-others-damaged (wm s)
-            (handler-case (funcall (surf-resize-fn s) w h)
+            (handler-case (surf-resize s w h)
               (error (e) (note-surface-error wm s e))))
           (forget-copy-bases wm s)
           (wm-composite wm (box-union (list old (window-box s)))))))))
@@ -722,11 +762,11 @@
             (destructuring-bind (x y w h) (surf-saved-geom s)
               (seat-move wm s x y)
               (setf (surf-saved-geom s) nil)
-              (ignore-errors (funcall (surf-resize-fn s) w h)))
+              (ignore-errors (surf-resize s w h)))
             (progn
               (setf (surf-saved-geom s) (list (sx s) (sy s) (surf-cw s) (surf-ch s)))
               (seat-move wm s (wm-border) (+ (wm-titleh) (wm-border)))
-              (ignore-errors (funcall (surf-resize-fn s) (- (screen-w wm) (* 2 (wm-border)))
+              (ignore-errors (surf-resize s (- (screen-w wm) (* 2 (wm-border)))
                                       (- (screen-h wm) (wm-titleh) (* 2 (wm-border))))))))
       (forget-copy-bases wm s)
       (wm-composite wm (box-union (list old (window-box s)))))))
@@ -766,7 +806,7 @@
           (let ((mw (- w (* 2 (wm-border)))) (mh (- h (wm-titleh) (* 2 (wm-border)))))
             (when (and (surf-resize-fn s) (or (> (surf-cw s) mw) (> (surf-ch s) mh)))
               (with-others-damaged (wm s)
-                (handler-case (funcall (surf-resize-fn s) (max 32 (min mw (surf-cw s)))
+                (handler-case (surf-resize s (max 32 (min mw (surf-cw s)))
                                        (max 32 (min mh (surf-ch s))))
                   (error (e) (note-surface-error wm s e))))
               (forget-copy-bases wm s))))
@@ -1000,8 +1040,9 @@ in its seat's clipboard -- the home seat's is the session's -- rfb.lisp READ-CLI
 ;;; ---- the pointer -----------------------------------------------------------------------------
 
 (defun %to-app (s mask x y)
+  "A pointer event to S's app, in its own pixels (the screen's over its SCALE)."
   (when (surf-on-pointer s)
-    (funcall (surf-on-pointer s) mask (- x (sx s)) (- y (sy s)))))
+    (funcall (surf-on-pointer s) mask (floor (- x (sx s)) (surf-scale s)) (floor (- y (sy s)) (surf-scale s)))))
 
 (defun wm-pointer (wm mask x y &optional seat)
   "One pointer event of SEAT's (default: the current seat, i.e. the home seat), in its screen's

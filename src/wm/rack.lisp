@@ -57,7 +57,7 @@
 
 (defparameter *rack-units-landscape* 2 "Units across the screen in landscape.")
 (defparameter *rack-min-unit* 250
-  "A portrait unit's least height, in screen pixels: the units are as many as fit, two or three.")
+  "A portrait unit's least height, in POINTS (times WM-DENSITY): the units are as many as fit, two or three.")
 (defparameter *rack-max-units* 3 "The most units a portrait screen is divided into.")
 (defparameter *rack-title-scale* 0
   "The rack's title bars' density (*WM-TITLE-SCALE*): 0, none -- a unit is all content, and its
@@ -76,7 +76,7 @@
   "Slots to a SCREEN of the rack -- what a unit fills down to: as many of *RACK-MIN-UNIT* as the
    screen's LONG side holds, two or three.  The same both ways up: turning the phone keeps the
    arrangement, and landscape shows fewer of its slots at a time (RACK-UNITS) and scrolls."
-  (max 2 (min *rack-max-units* (floor (max (screen-w wm) (screen-h wm)) *rack-min-unit*))))
+  (max 2 (min *rack-max-units* (floor (max (screen-w wm) (screen-h wm)) (* *rack-min-unit* (wm-density wm))))))
 
 (defun rack-units (wm)
   "Slots on the screen at once: a screen's worth in portrait, *RACK-UNITS-LANDSCAPE* across."
@@ -206,7 +206,7 @@
              (cw (max 32 (- (if vert across len) (* 2 b))))
              (ch (max 32 (- (if vert len across) th (* 2 b)))))
         (when (and (surf-resize-fn s) (not (and (= cw (surf-cw s)) (= ch (surf-ch s)))))
-          (handler-case (funcall (surf-resize-fn s) cw ch)
+          (handler-case (surf-resize s cw ch)
             (error (e) (note-surface-error wm s e)))
           (forget-copy-bases wm s))
         ;; an app that keeps a size of its own is CENTRED in its slot both ways (one bigger than
@@ -372,7 +372,8 @@
    function; else its DRAG-P's answer, and an app that has none takes every drag (as it always did)."
   (and s (surf-on-pointer s) (rack-in-content-p s x y)
        (or (null (surf-drag-p s))
-           (ignore-errors (funcall (surf-drag-p s) (- x (sx s)) (- y (sy s)))))))
+           (ignore-errors (funcall (surf-drag-p s) (floor (- x (sx s)) (surf-scale s))
+                                   (floor (- y (sy s)) (surf-scale s)))))))
 
 (defun rack-tick (wm)
   "Each tick: a press held still long enough picks its unit up."
@@ -460,8 +461,8 @@
 
 (defun rack-on-bar-p (wm x y)
   (if (rack-vertical-p wm)
-      (>= x (- (screen-w wm) (max (rack-bar) *rack-bar-touch*)))
-      (<= (- (screen-h wm) (wm-obscured wm) (max (rack-bar) *rack-bar-touch*)) y (- (screen-h wm) (wm-obscured wm)))))
+      (>= x (- (screen-w wm) (max (rack-bar) (* *rack-bar-touch* (wm-density wm)))))
+      (<= (- (screen-h wm) (wm-obscured wm) (max (rack-bar) (* *rack-bar-touch* (wm-density wm)))) y (- (screen-h wm) (wm-obscured wm)))))
 
 (defun rack-press-bar (wm x y)
   (setf (wm-rack-drag wm) (list :bar (rack-along-of wm x y) (wm-rack-scroll wm) nil)))
