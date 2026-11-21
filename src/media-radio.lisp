@@ -477,6 +477,10 @@
 
 (defparameter *media-tab-h* 36 "Media's tab strip: a fingertip tall.")
 (defparameter *media-hidden-look* 0.5d0 "Seconds between looks at the tabs Media is not showing.")
+(defvar *media-theater* t
+  "True: a film showing in a window wider than it is tall (a turned phone) is THEATER, the whole window.  NIL
+   where windows are wide as a rule (a Mac's desk): Media keeps its tabs and the player its list -- warp's
+   WARP-MEDIA-GLASS:*THEATER* is the player's half of the same choice.")
 
 (defparameter +media-tab-labels+ '((:music . "Music") (:stations . "Stations") (:pictures . "Pictures")
                                    (:documents . "Documents")))
@@ -656,7 +660,8 @@
                             when (or (eq tab key) (and made look))
                               do (push (cons key (and (funcall (third (part key))) t)) changed))
                       ;; into or out of THEATER, the player resized to what it then has
-                      (let ((want (and (> (glass:fb-width fb) (glass:fb-height fb))
+                      (let ((want (and *media-theater*
+                                       (> (glass:fb-width fb) (glass:fb-height fb))
                                        (case tab
                                          (:music (and music picture-p (funcall picture-p)))
                                          (:stations nil)
