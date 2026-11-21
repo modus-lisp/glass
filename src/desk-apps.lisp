@@ -284,7 +284,8 @@
                       (let ((resync (and (find-package "WARP") (find-symbol "RESYNC" "WARP"))))
                         (when (and resync consumer) (funcall resync consumer))))
                     nil nil nil
-                    (let ((pic (find-symbol "HAS-PICTURE-P" "WARP-MEDIA")))
+                    ;; a FILM: a song's cover is a picture too, but THEATER is for films
+                    (let ((pic (or (find-symbol "HAS-VIDEO-P" "WARP-MEDIA") (find-symbol "HAS-PICTURE-P" "WARP-MEDIA"))))
                       (lambda () (and pic consumer (ignore-errors (funcall pic consumer)) t)))))))))
 
 (defparameter *standard-apps*
