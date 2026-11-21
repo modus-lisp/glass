@@ -548,6 +548,13 @@
     (ignore-errors (%forget wm s))
     (dolist (seat (wm-seats wm)) (seat-damage seat nil))))
 
+(defun %blit-detail (dfb x y fb)
+  "A detail layer's DFB at X,Y: one framebuffer, or a list of (DY . FB) bands stacked from Y."
+  (if (listp dfb)
+      (dolist (band dfb)
+        (blit-fb (cdr band) x (+ y (car band)) fb))
+      (blit-fb dfb x y fb)))
+
 (defun draw-surface (wm s fb)
   (let ((cx (sx s)) (cy (sy s)))
     (wm-frame fb cx cy (surf-cw s) (surf-ch s) (surf-deco s)
@@ -573,8 +580,8 @@
                               (if box
                                   (glass:with-fb-clip (fb (+ cx (first box)) (+ cy (second box))
                                                           (third box) (fourth box))
-                                    (blit-fb dfb (+ cx dx) (+ cy dy) fb))
-                                  (blit-fb dfb (+ cx dx) (+ cy dy) fb))))))))))))
+                                    (%blit-detail dfb (+ cx dx) (+ cy dy) fb))
+                                  (%blit-detail dfb (+ cx dx) (+ cy dy) fb))))))))))))
 
 (defun composite-scroll (wm fb box)
   "Paint this composite as a window's scroll -- move what the screen holds, blit only the strip

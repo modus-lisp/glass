@@ -98,14 +98,17 @@
 
 ;;; ---- pixels (the worker's side) ------------------------------------------------------------------------
 
-(defun %pic-scale (rgba iw ih box-w box-h bg cap)
+(defun %pic-scale (rgba iw ih box-w box-h bg cap &optional (shared t))
   "(values DW DH PIXELS): straight-alpha RGBA IWxIH fitted into BOX-WxBOX-H, aspect kept, made
    at most CAP times bigger, composited onto BG, as X8R8G8B8 in a shared array.  Smaller is an
    area average (a photo's thumbnail would shimmer by nearest neighbour); bigger is bilinear."
   (declare (type (simple-array (unsigned-byte 8) (*)) rgba) (type fixnum iw ih))
   (let* ((s (min (/ box-w iw) (/ box-h ih) cap))
          (dw (max 1 (min box-w (round (* iw s))))) (dh (max 1 (min box-h (round (* ih s)))))
-         (out (glass::%shared-array (* dw dh) :element-type '(unsigned-byte 32)))
+         ;; SHARED: in memory every thread may hold (a worker's reply); NIL, the caller's own
+         (out (if shared
+                  (glass::%shared-array (* dw dh) :element-type '(unsigned-byte 32))
+                  (make-array (* dw dh) :element-type '(unsigned-byte 32))))
          (br (ldb (byte 8 16) bg)) (bgg (ldb (byte 8 8) bg)) (bb (ldb (byte 8 0) bg)))
     (declare (type fixnum dw dh br bgg bb) (type (simple-array (unsigned-byte 32) (*)) out))
     (flet ((over (i)
