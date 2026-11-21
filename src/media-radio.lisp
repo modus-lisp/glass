@@ -591,10 +591,14 @@
            (tab (if (%ra-active-p *radio-tuner*) :stations (first keys)))
            (shown nil)                        ; the tab last copied into FB, NIL = draw it all
            (hidden-next 0)                    ; when the hidden tabs are next looked at
-           (grab nil))
-      (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn music-resize)
-          (if music (%warp-media-window music) (values nil nil nil nil nil nil))
-        (declare (ignore copy-p))          ; a move hint in a part's coordinates is not one in FB's
+           (grab nil)
+           ;; THEATER: a film showing in a window wider than it is tall (a turned phone) is the
+           ;; whole window -- no tab strip, warp's player given every row of it, a tap plays or
+           ;; pauses, and every drag is the desk's (DRAG-P: a phone's rack swipes to its neighbours)
+           (theater nil))
+      (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn music-resize m7 m8 m9 picture-p)
+          (if music (%warp-media-window music) (values nil nil nil nil nil nil nil nil nil nil))
+        (declare (ignore copy-p m7 m8 m9))  ; a move hint in a part's coordinates is not one in FB's
         (labels ((part (key)
                    (let ((cell (cdr (assoc key lazy))))
                      (or (cdr cell)
@@ -602,13 +606,30 @@
                                             (declare (ignore c))
                                             (list k p d x r))))))
                  (part-fb (key)
-                   (case key (:music music) (:stations stations) (t (cadr (assoc key lazy))))))
+                   (case key (:music music) (:stations stations) (t (cadr (assoc key lazy)))))
+                 (top () (if theater 0 th))
+                 (theater-check ()
+                   ;; into or out of THEATER, the player resized to what it then has
+                   (let ((want (and music (eq tab :music) picture-p (funcall picture-p)
+                                    (> (glass:fb-width fb) (glass:fb-height fb)))))
+                     (unless (eq (and want t) theater)
+                       (setf theater (and want t) shown nil)
+                       (let ((ph (max 1 (- (glass:fb-height fb) (top)))))
+                         (if music-resize
+                             (funcall music-resize (glass:fb-width fb) ph)
+                             (glass:fb-resize music (glass:fb-width fb) ph #x0c0e12)))))))
           (values (lambda (down keysym)
                     (case tab
                       (:music (when on-key (funcall on-key down keysym)))
                       (:stations nil)
                       (t (funcall (first (part tab)) down keysym))))
                   (lambda (mask x y)
+                   (block media-app-pointer
+                    (when theater                     ; a tap: play / pause; nothing else
+                      (when (and (logbitp 0 mask) (null grab) on-key)
+                        (funcall on-key t #x20) (funcall on-key nil #x20))
+                      (setf grab (if (zerop mask) nil :theater))
+                      (return-from media-app-pointer nil))
                     (let ((to (or grab (if (< y th) :tabs tab))))
                       (when (and (logbitp 0 mask) (null grab))
                         (setf grab to)
@@ -621,7 +642,7 @@
                         ((:tabs :stations) nil)
                         (:music (when on-pointer (funcall on-pointer mask x (max 0 (- y th)))))
                         (t (funcall (second (part to)) mask x (max 0 (- y th)))))
-                      (when (zerop mask) (setf grab nil))))
+                      (when (zerop mask) (setf grab nil)))))
                   (lambda ()
                     ;; every part stays painted, so a tab shows at once what it last showed -- but a
                     ;; HIDDEN part is looked at only every *MEDIA-HIDDEN-LOOK* seconds.  Music's look is
@@ -638,12 +659,13 @@
                       (loop for (key . (nil . made)) in lazy
                             when (or (eq tab key) (and made look))
                               do (push (cons key (and (funcall (third (part key))) t)) changed))
+                      (theater-check)
                       (cond ((not (eq shown tab))
-                             (%media-tabs fb tab keys)
-                             (glass:fb-blit-clipped fb (part-fb tab) 0 th)
+                             (unless theater (%media-tabs fb tab keys))
+                             (glass:fb-blit-clipped fb (part-fb tab) 0 (top))
                              (setf shown tab)
                              t)
-                            ((cdr (assoc tab changed)) (glass:fb-blit-clipped fb (part-fb tab) 0 th) t))))
+                            ((cdr (assoc tab changed)) (glass:fb-blit-clipped fb (part-fb tab) 0 (top)) t))))
                   nil
                   (lambda ()
                     (unwind-protect (when close-fn (funcall close-fn))
@@ -655,6 +677,7 @@
                   ;; yet just get the new size, and draw at it when first shown
                   (lambda (nw nh)
                     (let ((nbh (max 1 (- nh th))))
+                      (setf theater nil)                ; THEATER-CHECK decides again at the new size
                       (glass:fb-resize fb nw nh +ra-bg+)
                       (setf w nw)
                       (when music
@@ -666,4 +689,6 @@
                                    (funcall (fifth made) nw nbh)
                                    (glass:fb-resize pfb nw nbh +ra-bg+)))
                       (setf shown nil)))
-                  nil))))))
+                  nil nil
+                  ;; DRAG-P: in THEATER no drag is Media's (a swipe goes to the desk); else all are
+                  (lambda (x y) (declare (ignore x y)) (not theater))))))))
