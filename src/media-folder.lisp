@@ -221,6 +221,8 @@
    ;; asked for the open file drawn at it, else 1; and the last such drawing, kept until it changes
    (detail-scale :initform 1 :accessor folder-detail-scale)
    (detail-cache :initform nil :accessor folder-detail-cache)
+   ;; what FOLDER-WISH last looked at (FOLDER-WISH-KEY): unchanged, and no reply in, it is not asked again
+   (wish-key :initform nil :accessor folder-last-wish-key)
    (thumbs :initform (make-hash-table :test 'equal) :reader folder-thumbs :reader pictures-thumbs
            :documentation "Key -> what the cell shows.  The window's, for as long as it is open.")
    (views :initform (make-hash-table :test 'equal) :reader folder-views :reader pictures-views
@@ -243,6 +245,15 @@
 (defgeneric folder-wish (pn) (:documentation "The jobs wanted now, most wanted first."))
 (defgeneric folder-store (pn reply) (:documentation "Keep an answer; T if it changes what is on show."))
 (defgeneric folder-trim (pn) (:method ((pn folder-panel)) nil))
+
+(defgeneric folder-wish-key (pn)
+  (:documentation "Everything FOLDER-WISH and FOLDER-TRIM read but the worker's replies: while it is
+   EQUAL and no reply has come in, neither is asked again.  They build every job's key, strings
+   and all, and asked each frame they were most of the main thread's time.")
+  (:method ((pn folder-panel))
+    (list (folder-mode pn) (folder-index pn) (folder-page pn) (folder-files pn)
+          (glass:fb-width (panel-fb pn)) (glass:fb-height (panel-fb pn))
+          (folder-theater-p pn) (folder-detail-scale pn))))
 (defgeneric folder-draw-cell (pn entry x y w h) (:documentation "A file's cell (and its target)."))
 (defgeneric folder-draw-view (pn) (:documentation "The opened file, filling the panel."))
 (defgeneric folder-list-info (pn ndirs nfiles) (:documentation "The head's right-hand count."))
@@ -365,10 +376,15 @@
 
 (defun %pic-pump (pn)
   "Take the worker's answers and tell it what is wanted now.  T if something on show changed."
-  (let ((changed nil))
+  (let ((changed nil) (got nil))
     (when (folder-replies pn)
       (dolist (r (%pic-take (folder-replies pn)))
+        (setf got t)
         (when (folder-store pn r) (setf changed t))))
+    (let ((key (folder-wish-key pn)))
+      (when (and (folder-threads-p pn) (not got) (equal key (folder-last-wish-key pn)))
+        (return-from %pic-pump changed))
+      (setf (folder-last-wish-key pn) key))
     (folder-trim pn)
     (let ((wish (folder-wish pn)))
       (if (folder-threads-p pn)
@@ -596,7 +612,8 @@
 
 (defgeneric folder-detail (pn scale)
   (:documentation "The open file drawn at SCALE times the panel's pixels, for glass.wm's detail layer:
-   (values X Y FB), X and Y in the panel's pixels -- or NIL (nothing sharper to show).")
+   (values X Y FB BOX) -- FB at X,Y confined to BOX (X Y W H), all in SCREEN pixels from the
+   panel's corner -- or NIL (nothing sharper to show).")
   (:method ((pn folder-panel) scale) (declare (ignore scale)) nil))
 
 (defun %folder-app (pn)

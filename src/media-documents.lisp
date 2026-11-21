@@ -61,6 +61,13 @@
 (defparameter *documents-relist-seconds* 5 "How often the open folder is looked at again.")
 (defparameter *documents-keep-parsed* 4 "Parsed PDFs a worker keeps (the most recently used).")
 (defparameter *document-max-scale* 3 "A page is never shown at more than this many px per pt.")
+
+(defparameter *document-strip-pixels* 400000
+  "A :SHARP page (glass.wm's detail layer: the screen's full density) is rendered in strips of
+   about this many pixels (folio's :WINDOW), each packed into the page and dropped.  A phone's
+   document worker has 64 MB and keeps the parsed PDF live (a 10 MB deck: its bytes and streams);
+   gesso's working arrays are the canvas's size, doubles.  Measured on modus: a whole page of
+   800K pixels thrashed the collector for minutes, and stalled the main thread with it.")
 (defparameter *document-low-fraction* 0.35 "The low render's resolution, of the full one's.")
 (defparameter *document-min-crop* 0.66
   "The trimmed area is at least this fraction of the page, across and down.")
@@ -188,12 +195,116 @@
           (replace out px :start1 (* 4 y cw) :start2 (* 4 (+ x0 (* (+ y y0) w))) :end2 (* 4 (+ x1 (* (+ y y0) w)))))
         (values out cw ch)))))
 
+(defun %doc-sharp (doc n crop box-w box-h)
+  "(values W H PIXELS): the CROP of page N fitted into BOX-WxBOX-H at full size, rendered a strip
+   at a time (*DOCUMENT-STRIP-PIXELS*) straight into the X8R8G8B8 result, composited on the
+   page's background.  No whole page of RGBA is ever held."
+  (multiple-value-bind (pw ph) (%doc-shown-size doc n)
+    (let ((s (%doc-geometry pw ph crop box-w box-h)))
+      (multiple-value-bind (iw ih) (sb-thread:with-mutex (*documents-folio-lock*) (folio:page-pixel-size doc n :scale s))
+        (destructuring-bind (fx0 fy0 fx1 fy1) crop
+          (let* ((x0 (max 0 (min (1- iw) (floor (* fx0 iw))))) (y0 (max 0 (min (1- ih) (floor (* fy0 ih)))))
+                 (w (max 1 (min (round box-w) (- (min iw (ceiling (* fx1 iw))) x0))))
+                 (h (max 1 (min (round box-h) (- (min ih (ceiling (* fy1 ih))) y0))))
+                 (band (max 8 (floor *document-strip-pixels* w)))
+                 (out (glass::%shared-array (* w h) :element-type '(unsigned-byte 32)))
+                 (br (ldb (byte 8 16) +ra-bg+)) (bg (ldb (byte 8 8) +ra-bg+)) (bb (ldb (byte 8 0) +ra-bg+)))
+            (declare (type (simple-array (unsigned-byte 32) (*)) out) (type fixnum w h band br bg bb))
+            ;; each image decoded once for the page, not once a strip (folio:*image-memo*)
+            (let ((folio:*image-memo* (make-hash-table :test 'eq)))
+            (loop for sy of-type fixnum from 0 below h by band
+                  do (let* ((sh (min band (- h sy)))
+                            (img (sb-thread:with-mutex (*documents-folio-lock*)
+                                   (folio:render-page doc n :scale s :window (list x0 (+ y0 sy) w sh))))
+                            (px (pigment:img-rgba img)))
+                       (declare (type (simple-array (unsigned-byte 8) (*)) px) (type fixnum sh))
+                       (dotimes (i (* w sh))
+                         (let* ((j (* 4 i)) (a (aref px (+ j 3))) (na (- 255 a)))
+                           (declare (type fixnum j a na))
+                           (setf (aref out (+ (* sy w) i))
+                                 (logior (ash (floor (+ (* (aref px j) a) (* br na)) 255) 16)
+                                         (ash (floor (+ (* (aref px (+ j 1)) a) (* bg na)) 255) 8)
+                                         (floor (+ (* (aref px (+ j 2)) a) (* bb na)) 255))))))))
+            (values w h out)))))))
+
 (defun %doc-low (doc n box-w box-h)
   "Page N rendered small: (values IMG CROP)."
   (multiple-value-bind (pw ph) (%doc-shown-size doc n)
     (let* ((fit (min (/ box-w pw) (/ box-h ph) *document-max-scale*))
            (img (%doc-render doc n (max 0.05 (* fit *document-low-fraction*)))))
       (values img (%doc-crop (%doc-inked img))))))
+
+;;; ---- rendered pages on disk ------------------------------------------------------------------------
+;;;
+;;; A page is rendered once.  The worker keeps each :PAGE and :SHARP render it makes in the cache
+;;; directory, named by the file (its path and date), the page, the kind and the box it was fitted
+;;; to, and reads it back instead of rendering again: turning back to a page, reopening a deck, a
+;;; relaunch.  Raw X8R8G8B8 behind its width and height -- nothing to decode.  Any failure here is
+;;; only a miss.
+
+(defparameter *document-cache-files* 200 "Rendered pages kept on disk; the oldest go first.")
+
+(defun %doc-cache-dir ()
+  "GLASS_PAGE_CACHE, else HOME's Library/Caches/glass-pages/ (an iOS app's own caches), made if need be."
+  (ignore-errors
+    (let* ((env (ignore-errors (sb-ext:posix-getenv "GLASS_PAGE_CACHE")))
+           (d (if (and env (plusp (length env)))
+                  (pathname (if (char= (char env (1- (length env))) #\/) env (concatenate 'string env "/")))
+                  (merge-pathnames "Library/Caches/glass-pages/" (user-homedir-pathname)))))
+      (ensure-directories-exist d)
+      d)))
+
+(defun %doc-cache-file (path page kind box-w box-h)
+  (let ((dir (%doc-cache-dir)) (date (ignore-errors (file-write-date path))))
+    (when (and dir date)
+      (merge-pathnames (format nil "~36r-~d-~(~a~)-~dx~d-v2.px"
+                               (sxhash (format nil "~a|~d" (namestring path) date)) page kind
+                               (round box-w) (round box-h))
+                       dir))))
+
+(defun %doc-cache-read (file)
+  "(values W H PIXELS) from FILE, or NIL."
+  (ignore-errors
+    (when (and file (probe-file file))
+      (with-open-file (in file :element-type '(unsigned-byte 8))
+        (let ((hd (make-array 8 :element-type '(unsigned-byte 8))))
+          (when (= 8 (read-sequence hd in))
+            (let* ((w (logior (ash (aref hd 0) 24) (ash (aref hd 1) 16) (ash (aref hd 2) 8) (aref hd 3)))
+                   (h (logior (ash (aref hd 4) 24) (ash (aref hd 5) 16) (ash (aref hd 6) 8) (aref hd 7)))
+                   (n (* w h)))
+              (when (and (plusp n) (= (file-length in) (+ 8 (* 4 n))))
+                (let ((b (make-array (* 4 n) :element-type '(unsigned-byte 8)))
+                      (px (glass::%shared-array n :element-type '(unsigned-byte 32))))
+                  (declare (type (simple-array (unsigned-byte 8) (*)) b)
+                           (type (simple-array (unsigned-byte 32) (*)) px))
+                  (read-sequence b in)
+                  (dotimes (i n)
+                    (let ((j (* 4 i)))
+                      (setf (aref px i) (logior (ash (aref b j) 24) (ash (aref b (+ j 1)) 16)
+                                                (ash (aref b (+ j 2)) 8) (aref b (+ j 3))))))
+                  (values w h px))))))))))
+
+(defun %doc-cache-write (file w h px)
+  "PX (W x H) to FILE, then the oldest past *DOCUMENT-CACHE-FILES* out."
+  (declare (type (simple-array (unsigned-byte 32) (*)) px))
+  (ignore-errors
+    (when file
+      (let* ((n (* w h)) (b (make-array (+ 8 (* 4 n)) :element-type '(unsigned-byte 8))))
+        (declare (type (simple-array (unsigned-byte 8) (*)) b))
+        (loop for v in (list w h) for o from 0 by 4
+              do (setf (aref b o) (ldb (byte 8 24) v) (aref b (+ o 1)) (ldb (byte 8 16) v)
+                       (aref b (+ o 2)) (ldb (byte 8 8) v) (aref b (+ o 3)) (ldb (byte 8 0) v)))
+        (dotimes (i n)
+          (let ((v (aref px i)) (j (+ 8 (* 4 i))))
+            (setf (aref b j) (ldb (byte 8 24) v) (aref b (+ j 1)) (ldb (byte 8 16) v)
+                  (aref b (+ j 2)) (ldb (byte 8 8) v) (aref b (+ j 3)) (ldb (byte 8 0) v))))
+        (with-open-file (out file :direction :output :if-exists :supersede :element-type '(unsigned-byte 8))
+          (write-sequence b out)))
+      (let ((all (directory (merge-pathnames "*.px" (%doc-cache-dir)))))
+        (when (> (length all) *document-cache-files*)
+          (dolist (old (nthcdr *document-cache-files*
+                               (sort all #'> :key (lambda (f) (or (ignore-errors (file-write-date f)) 0)))))
+            (ignore-errors (delete-file old))))))))
 
 (defun %doc-run-job (job cache)
   "JOB is (KIND KEY PATH PAGE BOX-W BOX-H MAX-BYTES).  The reply: (KIND KEY W H PIXELS TITLE PAGES),
@@ -213,17 +324,26 @@
                                      box-w box-h +ra-row+ 1)
                        (list kind key w h px title pages)))))
                 ((:low :page :sharp)
-                 (let ((ckey (format nil "crop|~a#~d" path page)))
+                 (let* ((ckey (format nil "crop|~a#~d" path page))
+                        (file (and (member kind '(:page :sharp)) (%doc-cache-file path page kind box-w box-h))))
+                  (multiple-value-bind (cw ch cpx) (%doc-cache-read file)
+                   (if cpx
+                    (list kind key cw ch cpx title pages)
                    (multiple-value-bind (pw ph) (%doc-shown-size doc page)
                      (multiple-value-bind (low crop)
                          (let ((c (gethash ckey cache)))
                            (if (and c (member kind '(:page :sharp))) (values nil c) (%doc-low doc page box-w box-h)))
                        (setf (gethash ckey cache) crop)
+                       (if (eq kind :sharp)
+                        (multiple-value-bind (w h px) (%doc-sharp doc page crop box-w box-h)
+                          (%doc-cache-write file w h px)
+                          (list kind key w h px title pages))
                        (multiple-value-bind (s dw dh) (%doc-geometry pw ph crop box-w box-h)
                          (let ((img (if (eq kind :low) low (%doc-render doc page s))))
                            (multiple-value-bind (rgba iw ih) (%doc-cut img crop)
                              (multiple-value-bind (w h px) (%pic-scale rgba iw ih dw dh +ra-bg+ 100)
-                               (list kind key w h px title pages))))))))))
+                               (%doc-cache-write file w h px)
+                               (list kind key w h px title pages)))))))))))))
             (serious-condition () (list kind key nil :page-fail title pages)))))))
 
 ;;; ---- the panel ---------------------------------------------------------------------------------------
@@ -296,6 +416,9 @@
   (let ((th (gethash (%pic-key e) (folder-thumbs pn))))
     (and (keywordp th) (not (eq th :page-fail)) th)))
 
+(defmethod folder-wish-key ((pn documents-panel))
+  (list* (documents-page-number pn) (documents-zoom pn) (call-next-method)))
+
 (defmethod folder-wish ((pn documents-panel))
   "Opened: this page small, this page, the next, the previous; then the list's thumbnails, this
    page's and the next's."
@@ -318,6 +441,9 @@
             (let ((ds (folder-detail-scale pn)))
               (when (> ds 1) (want :sharp e p (* w ds) (* h ds) views)))
             (when (or (null n) (< (1+ p) n)) (want :page e (1+ p) w h views))
+            ;; ... and the next page's, ahead of the turn (kept on disk, so it is done once)
+            (let ((ds (folder-detail-scale pn)))
+              (when (and (> ds 1) (or (null n) (< (1+ p) n))) (want :sharp e (1+ p) (* w ds) (* h ds) views)))
             (when (plusp p) (want :page e (1- p) w h views)))))
       (multiple-value-bind (bw bh) (folder-thumb-box pn)
         (dolist (page (list (folder-page pn) (1+ (folder-page pn))))
@@ -350,10 +476,11 @@
 
 (defmethod folder-trim ((pn documents-panel))
   "Rendered pages: the open page and its two neighbours, at the zoom shown (and the open page's small
-   one until it is rendered); nothing when no document is open."
+   one until it is rendered), and the open page's and the next one's :SHARP (FOLDER-DETAIL) -- kept
+   here or FOLDER-WISH asks for them again, forever; nothing when no document is open."
   (let* ((e (%doc-open-entry pn)) (p (documents-page-number pn))
          (keep (and e (let ((path (%pic-key e)))
-                        (list* (%dk pn :low path p)
+                        (list* (%dk pn :low path p) (%dk pn :sharp path p) (%dk pn :sharp path (1+ p))
                                (mapcar (lambda (d) (%dk pn :page path (+ p d))) '(0 1 -1)))))))
     (when (and e (gethash (%dk pn :page (%pic-key e) p) (folder-views pn)))
       (setf keep (remove (%dk pn :low (%pic-key e) p) keep :test #'equal)))
@@ -517,30 +644,32 @@
 
 (defmethod folder-detail ((pn documents-panel) scale)
   "The open page at SCALE times the panel's pixels, laid out as %DOC-BLIT lays the page out
-   (centred, or panned when zoomed), over the whole view box: (values BX BY FB).  The first ask
-   only records SCALE and asks for the render (FOLDER-WISH's :SHARP); NIL until it arrives."
+   (centred, or panned when zoomed), confined to the view box: (values X Y FB BOX) in SCREEN
+   pixels.  FB is the worker's own pixels, wrapped, not copied -- a landscape page is 10 MB, and
+   copying it on the main thread stalled the desk for seconds.  The first ask only records SCALE
+   and asks for the render (FOLDER-WISH's :SHARP); NIL until it arrives."
   (unless (eql scale (folder-detail-scale pn))
     (setf (folder-detail-scale pn) scale (panel-dirty pn) t))
   (let* ((e (%doc-open-entry pn))
          (v (and e (> scale 1) (not (%doc-refusal pn e))
                  (gethash (%dk pn :sharp (%pic-key e) (documents-page-number pn)) (folder-views pn)))))
     (when (consp v)
-      (multiple-value-bind (bx by bw bh) (%pic-view-box pn)
-        (let ((key (list v (documents-pan pn) (documents-zoom pn) bw bh scale))
-              (c (folder-detail-cache pn)))
-          (unless (and c (equal (car c) key))
-            (destructuring-bind (w h px &rest more) v
-              (declare (ignore more))
-              (let* ((sw (* bw scale)) (sh (* bh scale))
-                     (dfb (glass:make-framebuffer sw sh +ra-bg+)))
-                (multiple-value-bind (mx my) (%doc-pan-max w h sw sh)
-                  (let ((fx (min mx (car (documents-pan pn)))) (fy (min my (cdr (documents-pan pn)))))
-                    (%pic-blit dfb
-                               (if (> w sw) (- (round (* fx w))) (floor (- sw w) 2))
-                               (if (> h sh) (- (round (* fy h))) (floor (- sh h) 2))
-                               w h px)))
-                (setf c (cons key dfb) (folder-detail-cache pn) c))))
-          (values bx by (cdr c)))))))
+      (destructuring-bind (w h px &rest more) v
+        (declare (ignore more))
+        (multiple-value-bind (bx by bw bh) (%pic-view-box pn)
+          (let* ((sw (* bw scale)) (sh (* bh scale))
+                 (c (folder-detail-cache pn))
+                 (pfb (if (and c (eq (car c) px))
+                          (cdr c)
+                          (let ((f (glass::%make-framebuffer :width w :height h :pixels px)))
+                            (setf (folder-detail-cache pn) (cons px f))
+                            f))))
+            (multiple-value-bind (mx my) (%doc-pan-max w h sw sh)
+              (let ((fx (min mx (car (documents-pan pn)))) (fy (min my (cdr (documents-pan pn)))))
+                (values (+ (* bx scale) (if (> w sw) (- (round (* fx w))) (floor (- sw w) 2)))
+                        (+ (* by scale) (if (> h sh) (- (round (* fy h))) (floor (- sh h) 2)))
+                        pfb
+                        (list (* bx scale) (* by scale) sw sh))))))))))
 
 (defun %doc-note (fb bx bw y text)
   "TEXT on a dark pill, centred across BX..BX+BW at Y: readable over a white page."

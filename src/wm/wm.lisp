@@ -116,7 +116,7 @@
   (pos nil)                             ; the rack unit it starts at (rack.lisp), NIL = not placed yet
   (drag-p nil)                          ; (lambda (x y)): is a drag starting there the app's?  NIL: every one is
   (fullscreen-p nil)                    ; (lambda ()): does it want the whole screen now (Media's theater)?
-  (detail-fn nil)                       ; (lambda (scale)) -> (values X Y FB): a part drawn at SCALE, over the magnified app
+  (detail-fn nil)                       ; (lambda (scale)) -> (values X Y FB BOX): a part drawn at SCALE (DRAW-SURFACE)
   (scale 1)                             ; DENSITY: screen pixels to one of its own -- the WM's density for an
                                         ; app that draws in points (magnified), 1 for one that draws in pixels
   (err-count 0))
@@ -562,11 +562,19 @@
                       (blit-fb-scaled (surf-fb s) cx cy fb (surf-scale s))
                       ;; THE DETAIL: a part the app can draw at the screen's density -- a page, a
                       ;; picture, a film -- over its magnified self, 1:1 (the app contract's
-                      ;; eleventh value; X and Y in the app's own pixels)
+                      ;; eleventh value, (lambda (scale)) -> (values X Y FB BOX): FB at X,Y and
+                      ;; confined to BOX (X Y W H) -- all SCREEN pixels from the window's corner --
+                      ;; and to the window.  The app's FB is drawn as it is: no copy is made)
                       (when (surf-detail-fn s)
-                        (multiple-value-bind (dx dy dfb) (ignore-errors (funcall (surf-detail-fn s) (surf-scale s)))
+                        (multiple-value-bind (dx dy dfb box)
+                            (ignore-errors (funcall (surf-detail-fn s) (surf-scale s)))
                           (when dfb
-                            (blit-fb dfb (+ cx (* dx (surf-scale s))) (+ cy (* dy (surf-scale s))) fb))))))))))
+                            (glass:with-fb-clip (fb cx cy (surf-cw s) (surf-ch s))
+                              (if box
+                                  (glass:with-fb-clip (fb (+ cx (first box)) (+ cy (second box))
+                                                          (third box) (fourth box))
+                                    (blit-fb dfb (+ cx dx) (+ cy dy) fb))
+                                  (blit-fb dfb (+ cx dx) (+ cy dy) fb))))))))))))
 
 (defun composite-scroll (wm fb box)
   "Paint this composite as a window's scroll -- move what the screen holds, blit only the strip
