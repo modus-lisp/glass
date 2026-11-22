@@ -109,6 +109,34 @@
       (unless (same-as-full) (setf ok nil))))
   (check "damage repaint equals full repaint" ok))
 
+;; a drag is a MOVE (fb-move-rect + the uncovered strips), and it must still equal a full repaint:
+;; several pointer events between ticks, over another window, diagonal and purely horizontal,
+;; and pushed against the screen's edge (where it falls back to damage)
+(let* ((screen (glass:make-framebuffer 400 500)) (d (glass.desk:make-desk screen)) (ok t) (moved 0))
+  (glass.desk:desk-register-app d "A" (lambda (fb) (glass:fb-fill fb #xaa0000) (glass:fb-rect fb 10 10 20 20 #x0000ff) (values nil nil (lambda () nil))) :width 150 :height 100)
+  (glass.desk:desk-register-app d "B" (lambda (fb) (glass:fb-fill fb #x00aa00) (values nil nil (lambda () nil))) :width 120 :height 140)
+  (glass.desk:desk-open d "B") (glass.desk:desk-open d "A") (glass.desk:desk-tick d)
+  (let* ((a (first (glass.desk:desk-windows d))) (gx (+ (win-x a) 10)) (gy (- (win-y a) 10)))
+    (glass.desk:desk-pointer d 1 gx gy)
+    (glass.desk:desk-tick d)
+    (dolist (step '((5 3) (7 -2) (0 9) (-11 0) (4 4) (13 0) (0 -6) (300 300) (-30 -20)))
+      (destructuring-bind (ddx ddy) step
+        (incf gx (floor ddx 2)) (incf gy (floor ddy 2))
+        (glass.desk:desk-pointer d 1 gx gy)                 ; two events per tick
+        (incf gx (- ddx (floor ddx 2))) (incf gy (- ddy (floor ddy 2)))
+        (glass.desk:desk-pointer d 1 gx gy)
+        (let ((orig #'glass:fb-move-rect))
+          (setf (fdefinition 'glass:fb-move-rect)
+                (lambda (&rest args) (incf moved) (apply orig args)))
+          (unwind-protect (glass.desk:desk-tick d)
+            (setf (fdefinition 'glass:fb-move-rect) orig)))
+        (let ((partial (copy-seq (glass:fb-pixels screen))))
+          (glass.desk:desk-redraw d) (glass.desk:desk-tick d)
+          (unless (equalp partial (glass:fb-pixels screen)) (setf ok nil)))))
+    (glass.desk:desk-pointer d 0 gx gy))
+  (check "a drag moves pixels (not into, or out of, the screen edge)" (= moved 7))
+  (check "moved drag equals full repaint" ok))
+
 ;; the keyboard follows the focus: up for a text window, down when you tap elsewhere
 (let* ((screen (glass:make-framebuffer 600 800)) (d (glass.desk:make-desk screen)) (calls '()) (keys nil))
   (setf (glass.desk:desk-keyboard-fn d) (lambda (on) (push on calls)))
