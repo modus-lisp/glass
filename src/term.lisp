@@ -114,6 +114,7 @@
   (last-char 32)                        ; the last graphic character, for REP (CSI b)
   (drawn-chars nil) (drawn-colors nil)  ; the grid as last drawn: RENDER redraws only what differs
   (drawn-cx -1) (drawn-cy -1) (drawn-vis nil)
+  (gen 0) (drawn-gen -1)                ; FEED-CHAR counts in GEN; RENDER skips its scan if unchanged
   (alt-key nil)                         ; keyboard: Alt / Meta held (sends ESC first)?
   (exited nil)                          ; the pty reached EOF: the shell is gone
   (dirty t))                            ; fb changed since the compositor last consumed it?
@@ -339,6 +340,9 @@
     (t nil)))                                          ; ignore the rest
 
 (defun feed-char (tm c)
+  ;; every change to the grid comes through here (or a resize, which redraws all): RENDER
+  ;; compares cells only when this has moved
+  (setf (terminal-gen tm) (logand (1+ (terminal-gen tm)) most-positive-fixnum))
   (let ((code (char-code c)))
     (ecase (terminal-pstate tm)
       (:ground
@@ -620,7 +624,14 @@
            (full (or (null dc) (/= (length dc) n) (terminal-graphics tm)))
            (vis (terminal-cursor-vis tm)) (cx (terminal-cx tm)) (cy (terminal-cy tm))
            (ocx (terminal-drawn-cx tm)) (ocy (terminal-drawn-cy tm)) (ovis (terminal-drawn-vis tm))
+           ;; the cursor's cells are redrawn when the cursor MOVED or changed visibility, not on
+           ;; every call: that made an idle terminal dirty every frame, and its compositor copy
+           ;; the whole window again
+           (moved (or (/= cx ocx) (/= cy ocy) (not (eq vis ovis))))
            (any nil))
+      ;; nothing fed and the cursor still: nothing can differ, so do not compare every cell
+      (when (and (not full) (not moved) (= (terminal-gen tm) (terminal-drawn-gen tm)))
+        (return-from render nil))
       (when (or (null dc) (/= (length dc) n))
         (setf dc (make-array n :element-type '(unsigned-byte 32))
               dco (make-array n :element-type '(unsigned-byte 64))
@@ -630,11 +641,12 @@
           (let ((i (+ (* y cols) x)))
             (when (or full
                       (/= (aref chars i) (aref dc i)) (/= (aref colors i) (aref dco i))
-                      (and (= x cx) (= y cy) (or vis ovis))
-                      (and (= x ocx) (= y ocy) ovis))
+                      (and moved (= x cx) (= y cy) (or vis ovis))
+                      (and moved (= x ocx) (= y ocy) ovis))
               (draw-cell tm x y)
               (setf (aref dc i) (aref chars i) (aref dco i) (aref colors i) any t)))))
-      (setf (terminal-drawn-cx tm) cx (terminal-drawn-cy tm) cy (terminal-drawn-vis tm) vis)
+      (setf (terminal-drawn-cx tm) cx (terminal-drawn-cy tm) cy (terminal-drawn-vis tm) vis
+            (terminal-drawn-gen tm) (terminal-gen tm))
       (dolist (g (reverse (terminal-graphics tm)))       ; sixel images on top, oldest first
         (blit-image (cddr g) (car g) (cadr g) (terminal-fb tm)))
       (when any (setf (terminal-dirty tm) t)))))
