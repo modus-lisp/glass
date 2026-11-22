@@ -34,10 +34,21 @@
    glass-audio/1 -- the McCLIM desktop's convention is PORT + 10, where the WebRTC gateway
    looks -- and needs glass/wm-sound loaded (sound.lisp).  DISPLAY :NATIVE shows the desktop
    in a window of this platform's instead of serving it (GLASS:SERVE-NATIVE; PORT is then
-   unused, and closing the window ends it).  Returns when the network side does."
+   unused, and closing the window ends it), at the display's density: WIDTH and HEIGHT are
+   then 100% pixels, the screen is made in device pixels, *WM-SCALE* is the display's scale
+   (chrome drawn sharp at it) and apps are magnified by whole numbers (*WM-APP-SCALE*).
+   Returns when the network side does."
   ;; The faces, loaded HERE: the compositor draws text, and a font it loaded itself could not go
   ;; in the shared cache on modus.
   (glass:default-font) (glass:default-font t) (glass-term:term-fonts)
+  ;; A native window at the display's density: the screen in device pixels, the chrome at the
+  ;; display's scale.  Set here, on main, before the compositor starts: it reads the global.
+  (when (eq display :native)
+    (let ((scale (/ (glass:native-display-dpi) 96)))
+      (unless (= scale 1)
+        (setf *wm-scale* scale
+              width (round (* width scale))
+              height (round (* height scale))))))
   (let* ((sound (and (or audio-port audio-path)
                      (if (fboundp 'audio-out-open)
                          t
@@ -85,7 +96,7 @@
                        (format *error-output* "~&glass wm: no audio stream (~a); the desktop runs silent~%" e)
                        (force-output *error-output*))))
                  (if (eq display :native)
-                     (glass:serve-native fb :stop stop :title "glass"
+                     (glass:serve-native fb :stop stop :title "glass" :device t
                                             :on-resize (lambda (w h) (post (list :screen-size w h)))
                                             :tick (and out (lambda () (funcall 'audio-out-turn out)))
                                             :on-key (lambda (down key) (post (list :key down key)))
@@ -155,8 +166,8 @@
         (input nil) (last-tick 0)
         (poll (floor internal-time-units-per-second 80)))   ; 1/60 s, less a wake's slop
     (dolist (a apps)
-      (destructuring-bind (label make-fn &key (width 400) (height 300)) a
-        (wm-register-app wm label make-fn :width width :height height)))
+      (destructuring-bind (label make-fn &key (width 400) (height 300) (content-scale :assume-unaware)) a
+        (wm-register-app wm label make-fn :width width :height height :content-scale content-scale)))
     (dolist (label open) (%app-guard "open" (wm-open wm label)))
     (wm-redraw wm)
     (loop

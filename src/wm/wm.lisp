@@ -71,6 +71,11 @@
   (deco-fb nil) (deco-w -1)             ; cached title bar, and the width it was drawn for
   on-key on-pointer dirty-p copy-p close-fn resize-fn
   (text-p nil)
+  ;; CONTENT-SCALE: the whole number the app's framebuffer is magnified by on screen (an app
+  ;; that does not know about density draws at 1x; backend/wm.lisp's CONTENT-SCALE).  Every
+  ;; size below is the DRAWN one -- the frame, the title bar and the damage agree without
+  ;; knowing -- and the pointer and a resize are divided back into the app's pixels.
+  (cscale 1)
   (copy-base nil)                       ; content box as of the last composite that drew it whole
   (saved-geom nil)                      ; (x y w h) saved by Full Size
   (err-count 0))
@@ -101,11 +106,26 @@
   "A window manager drawing into FB, the screen."
   (%make-wm :fb fb))
 
-(defun wm-register-app (wm label make-fn &key (width 400) (height 300))
-  "Put LABEL on the root menu; choosing it opens a WIDTH x HEIGHT window running MAKE-FN."
+(defvar *wm-app-scale* nil
+  "The whole number an app that does not know about density is magnified by.  NIL: *WM-SCALE*
+   rounded half up, at least 1 -- so at 150% the chrome is drawn at 1.5 and apps at 2, crisp
+   rather than at the exact size with uneven pixels.")
+
+(defun app-content-scale (requested)
+  "The magnification for an app registered with :CONTENT-SCALE REQUESTED: :ASSUME-UNAWARE (the
+   default) is *WM-APP-SCALE*'s; a number is taken as given (1 for an app that draws in
+   device pixels)."
+  (if (eq requested :assume-unaware)
+      (or *wm-app-scale* (max 1 (floor (+ *wm-scale* 1/2))))
+      (max 1 (round requested))))
+
+(defun wm-register-app (wm label make-fn &key (width 400) (height 300) (content-scale :assume-unaware))
+  "Put LABEL on the root menu; choosing it opens a WIDTH x HEIGHT window running MAKE-FN.
+   WIDTH and HEIGHT are the app's own pixels; CONTENT-SCALE says how it is magnified on screen
+   (APP-CONTENT-SCALE)."
   (setf (wm-apps wm)
         (append (remove label (wm-apps wm) :key #'first :test #'string=)
-                (list (list label make-fn width height))))
+                (list (list label make-fn width height content-scale))))
   label)
 
 (defun wm-redraw (wm) (setf (wm-pending wm) :full))
@@ -175,8 +195,8 @@
 
 ;;; ---- geometry --------------------------------------------------------------------------------
 
-(defun surf-cw (s) (glass:fb-width (surf-fb s)))
-(defun surf-ch (s) (glass:fb-height (surf-fb s)))
+(defun surf-cw (s) (* (glass:fb-width (surf-fb s)) (surf-cscale s)))
+(defun surf-ch (s) (* (glass:fb-height (surf-fb s)) (surf-cscale s)))
 
 (defun window-box-at (s cx cy)
   "The decorated (x y w h) S would occupy with its content at (CX,CY)."
@@ -223,7 +243,9 @@
    (values WIRE SCREEN ALLOWED): the hint for the RFB update, the hint the compositor may also
    apply to the screen itself (refused more often: nothing repairs a wrong in-RAM translation),
    and S's visible content in this composite.  See backend/wm.lisp WM-SURFACE-SCREEN-COPY."
-  (let* ((take (surf-copy-p s))
+  ;; A magnified window's hint is a translation in the APP's pixels, which are not the screen's:
+  ;; declined (backend/wm.lisp does the same).
+  (let* ((take (and (= 1 (surf-cscale s)) (surf-copy-p s)))
          (hint (and take (funcall take)))
          (content (list (surf-x s) (surf-y s) (surf-cw s) (surf-ch s)))
          (clipb (or (clip-box fb) (screen-box wm)))
@@ -262,7 +284,9 @@
                       (cur (wm-frame-copy wm)))
                   (when (and c (or (null cur) (> (* (fifth c) (sixth c)) (* (fifth cur) (sixth cur)))))
                     (setf (wm-frame-copy wm) c)))
-                (blit-fb (surf-fb s) cx cy fb)))))
+                (if (= 1 (surf-cscale s))
+                    (blit-fb (surf-fb s) cx cy fb)
+                    (blit-fb-scaled (surf-fb s) cx cy fb (surf-cscale s)))))))
 
 (defun composite-scroll (wm fb box)
   "Paint this composite as a window's scroll -- move what the screen holds, blit only the strip
@@ -361,20 +385,24 @@
 (defun wm-open (wm label)
   "Open the application LABEL in a new window on top, with the keys.  Returns the window."
   (when-let (app (find label (wm-apps wm) :key #'first :test #'string=))
-    (destructuring-bind (lbl make-fn w h) app
+    (destructuring-bind (lbl make-fn w h &optional (requested :assume-unaware)) app
       (let* ((sw (screen-w wm)) (sh (screen-h wm))
-             (w (max 32 (min w (- sw (* 2 (wm-border))))))
-             (h (max 32 (min h (- sh (wm-titleh) (* 2 (wm-border))))))
+             (k (app-content-scale requested))
+             ;; W and H are the app's pixels; the window is K times that, and must fit
+             (w (max 32 (min w (floor (- sw (* 2 (wm-border))) k))))
+             (h (max 32 (min h (floor (- sh (wm-titleh) (* 2 (wm-border))) k))))
              (fb (glass:make-framebuffer w h glass:+white+))
-             (c (wm-cascade wm))
-             (x (max (wm-border) (min (+ 40 c) (- sw w (wm-border)))))
-             (y (max (+ (wm-titleh) (wm-border)) (min (+ 40 c (wm-titleh)) (- sh h (wm-border))))))
+             (c0 (wm-cascade wm))
+             (c (round (* c0 *wm-scale*)))
+             (x (max (wm-border) (min (+ (round (* 40 *wm-scale*)) c) (- sw (* w k) (wm-border)))))
+             (y (max (+ (wm-titleh) (wm-border))
+                     (min (+ (round (* 40 *wm-scale*)) c (wm-titleh)) (- sh (* h k) (wm-border))))))
         (multiple-value-bind (on-key on-pointer dirty-p copy-p close-fn resize-fn text-p)
             (funcall make-fn fb)
-          (setf (wm-cascade wm) (mod (+ c 28) 200))
+          (setf (wm-cascade wm) (mod (+ c0 28) 200))
           (let ((s (%make-surf :fb fb :x x :y y :title lbl :on-key on-key :on-pointer on-pointer
                                :dirty-p dirty-p :copy-p copy-p :close-fn close-fn
-                               :resize-fn resize-fn :text-p (and text-p t))))
+                               :resize-fn resize-fn :text-p (and text-p t) :cscale k)))
             (push s (wm-surfaces wm))
             (%focus wm s)
             (damage wm (window-box s))
@@ -403,6 +431,11 @@
   (setf (wm-surfaces wm) (append (remove s (wm-surfaces wm)) (list s)))
   (wm-composite wm (window-box s)))
 
+(defun %resize-app (s w h)
+  "Ask S's app for content W x H screen pixels: its own pixels, divided by its magnification."
+  (let ((k (surf-cscale s)))
+    (funcall (surf-resize-fn s) (max 1 (floor w k)) (max 1 (floor h k)))))
+
 (defun wm-resize (wm s w h)
   "Resize S's content to W x H (clamped), through its RESIZE-FN, and repaint old and new."
   (when (surf-resize-fn s)
@@ -410,7 +443,7 @@
           (h (max 32 (min h (- (screen-h wm) (wm-titleh) (* 2 (wm-border)))))))
       (unless (and (= w (surf-cw s)) (= h (surf-ch s)))
         (let ((old (window-box s)))
-          (handler-case (funcall (surf-resize-fn s) w h)
+          (handler-case (%resize-app s w h)
             (error (e) (note-surface-error wm s e)))
           (setf (surf-copy-base s) nil)
           (wm-composite wm (box-union (list old (window-box s)))))))))
@@ -422,12 +455,12 @@
       (if (surf-saved-geom s)
           (destructuring-bind (x y w h) (surf-saved-geom s)
             (setf (surf-x s) x (surf-y s) y (surf-saved-geom s) nil)
-            (ignore-errors (funcall (surf-resize-fn s) w h)))
+            (ignore-errors (%resize-app s w h)))
           (progn
             (setf (surf-saved-geom s) (list (surf-x s) (surf-y s) (surf-cw s) (surf-ch s))
                   (surf-x s) (wm-border) (surf-y s) (+ (wm-titleh) (wm-border)))
-            (ignore-errors (funcall (surf-resize-fn s) (- (screen-w wm) (* 2 (wm-border)))
-                                    (- (screen-h wm) (wm-titleh) (* 2 (wm-border)))))))
+            (ignore-errors (%resize-app s (- (screen-w wm) (* 2 (wm-border)))
+                                        (- (screen-h wm) (wm-titleh) (* 2 (wm-border)))))))
       (setf (surf-copy-base s) nil)
       (wm-composite wm (box-union (list old (window-box s)))))))
 
@@ -608,8 +641,11 @@
 ;;; ---- the pointer -----------------------------------------------------------------------------
 
 (defun %to-app (s mask x y)
+  "The pointer, in S's app's own pixels: screen position less the content's, divided by the
+   magnification (or the pointer drifts from the cursor the further into the window it goes)."
   (when (surf-on-pointer s)
-    (funcall (surf-on-pointer s) mask (- x (surf-x s)) (- y (surf-y s)))))
+    (let ((k (surf-cscale s)))
+      (funcall (surf-on-pointer s) mask (floor (- x (surf-x s)) k) (floor (- y (surf-y s)) k)))))
 
 (defun wm-pointer (wm mask x y)
   "One pointer event, in screen pixels.  MASK bit 0 is the left button (a touch), bit 2 the right."

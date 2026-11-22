@@ -20,5 +20,5 @@
    #:make-wm #:wm-register-app #:wm-open #:wm-pointer #:wm-key #:wm-tick #:wm-redraw
    #:wm-fb #:wm-surfaces #:wm-apps #:wm-focus #:wm-keyboard-fn
    ;; tunables
-   #:*wm-scale* #:*wm-bg* #:*drag-adaptive* #:*wireframe-queue-kb* #:*wireframe-lag-ms*
+   #:*wm-scale* #:*wm-app-scale* #:*wm-bg* #:*drag-adaptive* #:*wireframe-queue-kb* #:*wireframe-lag-ms*
    #:*wm-scroll-copyrect* #:*wm-log*))

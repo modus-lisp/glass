@@ -24,7 +24,7 @@
 
 (in-package #:glass)
 
-(export '(serve-native native-display-p))
+(export '(serve-native native-display-p native-display-dpi))
 
 (defun %native-fn (name)
   ;; INTERN, not FIND-SYMBOL: modus interns its own functions' names lazily (the reader makes
@@ -39,6 +39,11 @@
   "True when this Lisp can show a framebuffer in a native window (SERVE-NATIVE)."
   (and (%native-fn "W32-WINDOW-OPEN") t))
 
+(defun native-display-dpi ()
+  "The display's DPI, 96 being 100% (the platform's W32-DISPLAY-DPI); 96 when there is none."
+  (let ((f (%native-fn "W32-DISPLAY-DPI")))
+    (or (and f (funcall f)) 96)))
+
 (defun %damage-with-copy (damage copy)
   "DAMAGE ((x0 y0 x1 y1), :FULL or NIL) grown to cover a move COPY (sx sy dx dy w h): a
    window has no CopyRect, so the moved pixels are presented like any others."
@@ -49,11 +54,13 @@
                           (list dx dy (+ dx w) (+ dy h))))))
 
 (defun serve-native (fb &key on-key on-pointer on-resize tick stop (title *desktop-name*)
-                          (interval 1/60))
+                          (interval 1/60) device)
   "Show FB in a native window on this thread until it is closed or STOP (a predicate polled
    each turn) says so: the window's input goes to ON-KEY (DOWN KEYSYM) and ON-POINTER (MASK X
    Y) as SERVE-MULTI's does, a resize of the window to ON-RESIZE (W H), TICK (no arguments) runs
-   each turn, and what the compositor marks (FB-MARK-FRAME) is presented.  The window must be pumped by the thread that opened it, so
+   each turn, and what the compositor marks (FB-MARK-FRAME) is presented.  DEVICE: FB is in the
+   display's own pixels (the caller handles density, as SERVE-WM does); otherwise the platform
+   magnifies it by the display's scale.  The window must be pumped by the thread that opened it, so
    this thread is the display.  Signals if there is no native display (NATIVE-DISPLAY-P)."
   (unless (eq (fb-format fb) :xrgb)
     (error "glass: a native window shows an :XRGB framebuffer, not ~s" (fb-format fb)))
@@ -66,7 +73,7 @@
          (stats-at (get-internal-real-time))
          (w (fb-width fb)) (h (fb-height fb))
          (wait (max 1 (round (* 1000 interval))))
-         (win (or (funcall open w h title) (error "glass: the native window did not open"))))
+         (win (or (funcall open w h title device) (error "glass: the native window did not open"))))
     (declare (ignorable w h))
     ;; Under the lock, and at FB's size now: a resize replaces the pixels.
     (flet ((show (x0 y0 x1 y1)
