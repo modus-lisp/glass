@@ -308,15 +308,26 @@ would not have to visit every call site in the tree."
                                              :initial-element (logand fill #xffffff))))
         (%make-framebuffer :width width :height height :pixels px))))
 
-(defun fb-resize (fb width height &optional (fill +black+))
+(defun fb-resize (fb width height &optional (fill +black+) share)
   "Resize FB in place to WIDTH x HEIGHT (contents reset to FILL).  Atomic against
-   readers that snapshot under WITH-FB-LOCKED.  No-op if the size is unchanged."
+   readers that snapshot under WITH-FB-LOCKED.  No-op if the size is unchanged.
+   SHARE: FB is shared between threads (a screen made on main, resized by its
+   compositor), so the new pixels must be too -- on modus a thread may not store an
+   object of its own into a shared one (MODUS:MAKE-SHARED-ARRAY)."
   (with-fb-locked (fb)
     (unless (and (= width (fb-width fb)) (= height (fb-height fb)))
       (if (eq (fb-format fb) :i420)
           (%i420-planes fb width height fill)
-          (setf (fb-pixels fb) (make-array (* width height) :element-type '(unsigned-byte 32)
-                                                            :initial-element (logand fill #xffffff))))
+          (setf (fb-pixels fb)
+                (if share
+                    ;; made in shared memory to begin with (MODUS:SHARE does not copy a
+                    ;; pixel vector, and a copy of a screen would be waste anyway)
+                    #+modus (modus:make-shared-array (* width height) :element-type '(unsigned-byte 32)
+                                                                      :initial-element (logand fill #xffffff))
+                    #-modus (make-array (* width height) :element-type '(unsigned-byte 32)
+                                                         :initial-element (logand fill #xffffff))
+                    (make-array (* width height) :element-type '(unsigned-byte 32)
+                                                 :initial-element (logand fill #xffffff)))))
       (setf (fb-width fb) width
             (fb-height fb) height)
       (fb-touch fb)))

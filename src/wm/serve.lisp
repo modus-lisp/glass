@@ -86,6 +86,7 @@
                        (force-output *error-output*))))
                  (if (eq display :native)
                      (glass:serve-native fb :stop stop :title "glass"
+                                            :on-resize (lambda (w h) (post (list :screen-size w h)))
                                             :tick (and out (lambda () (funcall 'audio-out-turn out)))
                                             :on-key (lambda (down key) (post (list :key down key)))
                                             :on-pointer (lambda (mask x y) (post (list :pointer mask x y))))
@@ -168,6 +169,10 @@
                    (case (first m)
                      (:listeners (when snd (funcall 'wm-sound-listen snd (second m))))
                      (:key (wm-key wm (second m) (third m)))
+                     ;; the display was resized (a native window): the screen follows it
+                     (:screen-size (destructuring-bind (w h) (rest m)
+                                     (glass:fb-resize fb w h *wm-bg* t)
+                                     (wm-redraw wm)))
                      (:pointer (destructuring-bind (mask x y) (rest m) (wm-pointer wm mask x y)))))))
       ;; the sound first: a frame due now is mixed from what the player has queued, and the
       ;; tick after it (the player's query) decodes the next
