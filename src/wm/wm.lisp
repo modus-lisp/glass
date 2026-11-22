@@ -893,16 +893,56 @@
     (values (max (- keep (surf-cw s)) (min (- sw keep) ncx))
             (max (+ (wm-titleh) (wm-border)) (min (- sh (round (* 4 *wm-scale*))) ncy)))))
 
+(defparameter *wm-move-copyrect* t
+  "Move a dragged window's pixels where the screen holds them, repainting only what the move
+   uncovered?  NIL recomposites old and new whole each step -- always correct.")
+
+(defvar *wm-moves-in-place* 0 "Drag steps that moved pixels rather than recompositing, for a test.")
+
+(defun drag-move-in-place (wm s old new)
+  "One drag step as the screen's own CopyRect: what the screen shows of S at OLD moved to NEW
+   (FB-MOVE-RECT -- the part whose source and destination are both on the screen, so a window
+   wider than the screen or dragged into its edge moves too), and only the rest of OLD and NEW
+   composited.  T if it could; NIL, having drawn nothing, when the screen's pixels at OLD cannot
+   be trusted to be S as it looks now -- anything drawn above S on either box (a window, the
+   wireframe, a menu), a magnified seat's box of another size, or damage pending over OLD (a press
+   that raised S this tick: the screen does not hold it yet)."
+  (let* ((fb (wm-fb wm)) (p (wm-pending wm))
+         (copy (and *wm-move-copyrect* (not (rack-p wm))
+                    (= (third old) (third new)) (= (fourth old) (fourth new))
+                    (not (eq p :full)) (not (and p (boxes-overlap-p p old)))
+                    (not (obstructed-p wm s (list old new)))
+                    (clip-copy (list (first old) (second old) (first new) (second new)
+                                     (third old) (fourth old))
+                               (screen-box wm))))
+         (bare (and copy (box-intersect (box-union (list old new)) (screen-box wm)))))
+    (when bare
+      (destructuring-bind (sx sy dx dy w h) copy
+        (glass:with-fb-locked (fb)
+          (setf (wm-frame-copy wm) nil)
+          (glass:fb-move-rect fb sx sy dx dy w h)
+          (dolist (band (box-difference bare (list dx dy w h)))
+            (destructuring-bind (bx by bw bh) band
+              (glass:with-fb-clip (fb bx by bw bh) (composite-whole wm fb band))))
+          (destructuring-bind (ux uy uw uh) bare
+            (glass:fb-mark-frame fb (list ux uy (+ ux uw) (+ uy uh)) copy))
+          (setf (wm-frame-copy wm) nil)
+          (glass:fb-touch fb)))
+      (incf *wm-moves-in-place*)
+      t)))
+
 (defun drag-move-opaque (wm s ncx ncy)
-  "Move S to (NCX,NCY) and composite old+new with a CopyRect hint for the move."
+  "Move S to (NCX,NCY): its pixels moved where they lie when nothing hides them, else old+new
+   composited whole; a CopyRect hint for the senders either way."
   (let ((old (window-box s)))
     (seat-move wm s ncx ncy)
     (let ((new (window-box s)))
       (unless (equal old new)
         (incf (wm-opaque-moves wm))
-        (wm-composite wm (box-union (list old new))
-                      (list (first old) (second old) (first new) (second new)
-                            (third old) (fourth old)))))))
+        (unless (drag-move-in-place wm s old new)
+          (wm-composite wm (box-union (list old new))
+                        (list (first old) (second old) (first new) (second new)
+                              (third old) (fourth old))))))))
 
 (defun drag-wire-to (wm s ncx ncy)
   "Move only the outline; the window stays put (its pixels stay on the client)."

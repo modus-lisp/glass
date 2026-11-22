@@ -54,6 +54,24 @@
     (check "opaque drag moved Paint by the pointer" (and (= 140 (glass.wm::surf-x paint)) (= 162 (glass.wm::surf-y paint))))
     (check "opaque drag never went wireframe" (zerop (glass.wm::wm-wire-drags wm)))
     (check "screen = full repaint after opaque drag" (same-as-full-p wm))
+    ;; a drag MOVES the window's pixels where it can (FB-MOVE-RECT + the strips it uncovered):
+    ;; every step must still equal a full repaint -- over Notes, two events a step, diagonal,
+    ;; purely horizontal and vertical, and into the screen's edge (the move clipped to the screen)
+    (let ((glass.wm:*wireframe-lag-ms* 1000000) (glass.wm:*wireframe-queue-kb* 1d9)
+          (gx 250) (gy 150) (ok t) (before glass.wm::*wm-moves-in-place*))
+      (ptr wm 1 gx gy)
+      (dolist (step '((5 3) (7 -2) (0 9) (-11 0) (-40 -30) (13 0) (0 -6) (900 900) (-30 -20) (-700 -700)))
+        (destructuring-bind (ddx ddy) step
+          (incf gx (floor ddx 2)) (incf gy (floor ddy 2))
+          (glass.wm:wm-pointer wm 1 gx gy)
+          (incf gx (- ddx (floor ddx 2))) (incf gy (- ddy (floor ddy 2)))
+          (ptr wm 1 gx gy)
+          (unless (same-as-full-p wm) (setf ok nil))))
+      (ptr wm 0 gx gy)
+      (check "each step of a stepped drag = a full repaint" ok)
+      (check "every step that moved, moved pixels in place (edges too)" (= (- glass.wm::*wm-moves-in-place* before) 18))
+      (glass.wm::seat-move wm paint 140 162)              ; back where the checks below expect it
+      (glass.wm::wm-composite wm nil))
     ;; the same drag with the link lagging: wireframe, the window lands on release
     (let ((glass.wm:*wireframe-lag-ms* -1) (glass.wm:*wm-log* nil))
       (ptr wm 1 250 150) (ptr wm 1 280 180)
