@@ -25,7 +25,7 @@
 
 (defun serve-wm (port &key (width 800) (height 600) (apps *wm-apps*) (open '("Clock"))
                            (address "127.0.0.1") clients stop audio-port audio-path
-                           (display :rfb))
+                           (display :rfb) audio)
   "Serve the window manager WIDTH x HEIGHT on PORT: a network thread (every viewer), a
    compositor thread, and this thread the Lisp listener REPL windows evaluate on.  APPS is a
    list of (LABEL MAKE-FN &key WIDTH HEIGHT), MAKE-FN a symbol or global function returning the
@@ -37,7 +37,8 @@
    unused, and closing the window ends it), at the display's density: WIDTH and HEIGHT are
    then 100% pixels, the screen is made in device pixels, *WM-SCALE* is the display's scale
    (chrome drawn sharp at it) and apps are magnified by whole numbers (*WM-APP-SCALE*).
-   Returns when the network side does."
+   AUDIO :DEVICE plays the desktop's sound on this machine's own output instead of serving it
+   (needs glass/wm-sound; AUDIO-DEVICE-OPEN, sound.lisp).  Returns when the network side does."
   ;; The faces, loaded HERE: the compositor draws text, and a font it loaded itself could not go
   ;; in the shared cache on modus.
   (glass:default-font) (glass:default-font t) (glass-term:term-fonts)
@@ -49,7 +50,7 @@
         (setf *wm-scale* scale
               width (round (* width scale))
               height (round (* height scale))))))
-  (let* ((sound (and (or audio-port audio-path)
+  (let* ((sound (and (or audio-port audio-path (eq audio :device))
                      (if (fboundp 'audio-out-open)
                          t
                          (progn (warn "glass wm: no sound -- load glass/wm-sound for AUDIO-PORT") nil))))
@@ -68,7 +69,7 @@
                                          :arguments (list fb port address clients stop
                                                           inbox wake listener
                                                           sound sound-box audio-port audio-path
-                                                          display)
+                                                          display audio)
                                          :name "glass-wm-network")))
     (unwind-protect (glass-repl:run-listener listener)
       (ignore-errors (sb-thread:join-thread network))
@@ -76,7 +77,7 @@
       (when (eq glass-repl:*listener* listener) (setf glass-repl:*listener* nil)))))
 
 (defun %wm-network (fb port address clients stop inbox wake listener
-                    sound sound-box audio-port audio-path display)
+                    sound sound-box audio-port audio-path display audio)
   "The network thread: every viewer, and the sound's listeners, until SERVE-MULTI returns; then
    stop the others."
   (let ((out nil))
@@ -89,28 +90,31 @@
                  ;; mixer is the player's clock -- and posts nothing, nobody having said they listen.
                  (when sound
                    (handler-case
-                       (setf out (funcall 'audio-out-open sound-box :port audio-port :path audio-path
-                                                                    :address address
-                                                                    :notify (lambda (n) (post (list :listeners n)))))
+                       (setf out (if (eq audio :device)
+                                     (funcall 'audio-device-open sound-box
+                                              :notify (lambda (n) (post (list :listeners n))))
+                                     (funcall 'audio-out-open sound-box :port audio-port :path audio-path
+                                                                        :address address
+                                                                        :notify (lambda (n) (post (list :listeners n))))))
                      (error (e)
                        (format *error-output* "~&glass wm: no audio stream (~a); the desktop runs silent~%" e)
                        (force-output *error-output*))))
                  (if (eq display :native)
                      (glass:serve-native fb :stop stop :title "glass" :device t
                                             :on-resize (lambda (w h) (post (list :screen-size w h)))
-                                            :tick (and out (lambda () (funcall 'audio-out-turn out)))
+                                            :tick (and out (lambda () (funcall (if (eq audio :device) 'audio-device-turn 'audio-out-turn) out)))
                                             :on-key (lambda (down key) (post (list :key down key)))
                                             :on-pointer (lambda (mask x y) (post (list :pointer mask x y))))
                      (glass:serve-multi fb port
                                         :address address :clients clients :stop stop
-                                        :tick (and out (lambda () (funcall 'audio-out-turn out)))
+                                        :tick (and out (lambda () (funcall (if (eq audio :device) 'audio-device-turn 'audio-out-turn) out)))
                                         :on-key (lambda (down key) (post (list :key down key)))
                                         :on-pointer (lambda (mask x y) (post (list :pointer mask x y))))))
              (error (e)
                (ignore-errors (format *error-output* "~&glass wm: network: ~a~%" e)
                               (force-output *error-output*))))
         (post (list :stop))
-        (when out (ignore-errors (funcall 'audio-out-close out)))
+        (when out (ignore-errors (funcall (if (eq audio :device) 'audio-device-close 'audio-out-close) out)))
         (glass-repl:stop-listener listener)))))
 
 (defun %wm-backtrace (fault &optional condition)

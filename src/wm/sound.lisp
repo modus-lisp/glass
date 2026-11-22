@@ -228,3 +228,72 @@
                                   (glass::sink-drops s) (glass::sink-underruns s))
                           "(hello)")))
                   (audio-out-clients out))))
+
+;;; ---- a speaker of this machine's own ---------------------------------------------------------
+;;;
+;;; The mix to a sound device instead of a socket: SERVE-WM :AUDIO :DEVICE, in a native window
+;;; (SERVE-NATIVE) where the desktop is on this machine and so is the listener.  The platform's
+;;; speaker is found by name, as the native window is: modus on Windows provides W32-AUDIO-OPEN /
+;;; -WRITE / -QUEUED / -CLOSE (waveOut on the default output, Bluetooth included) -- kiln's
+;;; speaker's shape.  The compositor's clock decides when frames are mixed, the device's when they
+;;; are played; the two drift a little, so the queue is kept between a priming cushion and a
+;;; ceiling: frames beyond the ceiling are dropped (a gap, never a growing delay), and after the
+;;; device runs dry it primes again before playing.
+
+(defparameter *audio-device-prime-frames* 3
+  "Frames held back before the device starts (or restarts after running dry): 60 ms of cushion
+   against the display thread's turns, which are 16 ms apart and not exactly so.")
+
+(defparameter *audio-device-max-frames* 10
+  "Frames the device may hold queued: 200 ms.  A frame beyond is dropped rather than heard late.")
+
+(defstruct (audio-device (:constructor %make-audio-device))
+  spk inbox (held '()) (frame-samples 960 :type fixnum)
+  (written 0 :type fixnum) (drops 0 :type fixnum) (primes 0 :type fixnum))
+
+(defun %speaker-fn (name) (glass::%native-fn name))
+
+(defun audio-device-available-p ()
+  (and (%speaker-fn "W32-AUDIO-OPEN") t))
+
+(defun audio-device-open (inbox &key notify (rate 48000))
+  "The default sound output, on the calling thread (the display's), playing the compositor's
+   mixed frames (48 kHz mono s16) from INBOX.  NOTIFY is called with 1 at once: the compositor
+   posts frames only while somebody listens.  NIL if this machine has no output."
+  (let* ((open (or (%speaker-fn "W32-AUDIO-OPEN") (error "glass wm: no sound device here")))
+         (spk nil) (why nil))
+    (multiple-value-setq (spk why) (funcall open rate 1))
+    (unless spk (error "glass wm: the sound device did not open~@[: ~a~]" why))
+    (format *error-output* "~&glass wm: audio to this machine's speaker (~d Hz)~%" rate)
+    (force-output *error-output*)
+    (when notify (funcall notify 1))
+    (%make-audio-device :spk spk :inbox inbox)))
+
+(defun audio-device-turn (dev)
+  "The frames the compositor has sent, to the device.  T if any came."
+  (let ((frames (glass::mb-take (audio-device-inbox dev)))
+        (write (%speaker-fn "W32-AUDIO-WRITE"))
+        (queued (%speaker-fn "W32-AUDIO-QUEUED"))
+        (n (audio-device-frame-samples dev)))
+    (when frames
+      (let ((q (funcall queued (audio-device-spk dev))))
+        (when (and frames (plusp (length (first frames))))
+          (setf n (length (first frames)) (audio-device-frame-samples dev) n))
+        ;; dry: hold frames back until the cushion is there again
+        (setf (audio-device-held dev) (append (audio-device-held dev) frames))
+        (when (or (plusp q) (>= (length (audio-device-held dev)) *audio-device-prime-frames*))
+          (when (zerop q) (incf (audio-device-primes dev)))
+          (dolist (f (audio-device-held dev))
+            (if (or (>= q (* *audio-device-max-frames* n))
+                    (not (funcall write (audio-device-spk dev) f)))
+                (incf (audio-device-drops dev))
+                (progn (incf (audio-device-written dev)) (incf q (length f)))))
+          (setf (audio-device-held dev) '())))
+      t)))
+
+(defun audio-device-close (dev)
+  (ignore-errors (funcall (%speaker-fn "W32-AUDIO-CLOSE") (audio-device-spk dev))))
+
+(defun audio-device-report (dev)
+  (format nil "audio-device written=~d drops=~d primes=~d" (audio-device-written dev)
+          (audio-device-drops dev) (audio-device-primes dev)))
