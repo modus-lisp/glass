@@ -61,6 +61,7 @@
   (drag nil)               ; (window dx dy) while a title bar is held
   (cascade 0)
   (damage '())             ; ((x y w h) ...) to repaint at the next tick
+  (moves '())              ; ((window old-x old-y) ...): drags to apply as moves at the next tick
   (keyboard-fn nil)        ; (lambda (on)): show or hide the host's on-screen keyboard; NIL = none
   (focus nil)              ; the window typing goes to: the last one tapped into, or opened
   (keyboard-up nil)        ; what KEYBOARD-FN was last told
@@ -183,11 +184,13 @@
          ;; keep 40 pixels of title bar on screen: a window dragged out of reach could never
          ;; be dragged back, and on a touch screen there is nothing else to grab it by
          (let ((sw (glass:fb-width (desk-fb desk))) (sh (glass:fb-height (desk-fb desk))))
-           ;; where it was and where it is now: everything a move can change
-           (%damage-frame desk win)
+           ;; A MOVE, applied at the next tick (%APPLY-MOVES): the window's pixels are shifted
+           ;; where they lie and only what it uncovered is repainted.  Several pointer events
+           ;; between ticks are one move, from where the window was at the last tick.
+           (unless (assoc win (desk-moves desk))
+             (push (list win (win-x win) (win-y win)) (desk-moves desk)))
            (setf (win-x win) (max (- 40 (win-w win)) (min (- sw 40) (- x dx)))
-                 (win-y win) (max (+ *title-h* *border*) (min (+ sh -4) (- y dy))))
-           (%damage-frame desk win))
+                 (win-y win) (max (+ *title-h* *border*) (min (+ sh -4) (- y dy)))))
          (unless down (setf (desk-drag desk) nil))))
       ;; a window's content holds the pointer until the lift, wherever it goes
       ((find-if #'win-pressed (desk-windows desk))
@@ -319,6 +322,47 @@
           (when (%overlaps-p x y w h (1- mx) (1- my) (+ mw 2) (+ mh 2))
             (%draw-menu desk)))))))
 
+(defun %rect-minus (ax ay aw ah bx by bw bh)
+  "Rectangle A less rectangle B, as at most four ((x y w h) ...) that do not overlap."
+  (let ((x0 (max ax bx)) (y0 (max ay by))
+        (x1 (min (+ ax aw) (+ bx bw))) (y1 (min (+ ay ah) (+ by bh))))
+    (if (or (>= x0 x1) (>= y0 y1))
+        (list (list ax ay aw ah))
+        (remove-if-not (lambda (r) (and (plusp (third r)) (plusp (fourth r))))
+                       (list (list ax ay aw (- y0 ay))                          ; above B
+                             (list ax y1 aw (- (+ ay ah) y1))                   ; below B
+                             (list ax y0 (- x0 ax) (- y1 y0))                   ; left of B
+                             (list x1 y0 (- (+ ax aw) x1) (- y1 y0)))))))       ; right of B
+
+(defun %apply-moves (desk)
+  "Carry out the drags since the last tick.  A window moved while on top, with both its old and
+   new frames wholly on the screen and no damage pending over the old one, is MOVED: FB-MOVE-RECT shifts the frame's pixels, and only
+   the strips it uncovered are returned, to be repainted one by one.  Otherwise both frames are
+   damaged, as a repaint.  Returns the strips, and the rectangle the moves touched."
+  (let ((fb (desk-fb desk)) (strips '()) (x0 nil) (y0 nil) (x1 nil) (y1 nil))
+    (flet ((grow (x y w h)
+             (setf x0 (if x0 (min x0 x) x) y0 (if y0 (min y0 y) y)
+                   x1 (if x1 (max x1 (+ x w)) (+ x w)) y1 (if y1 (max y1 (+ y h)) (+ y h)))))
+      (dolist (m (reverse (desk-moves desk)))
+        (destructuring-bind (win ox oy) m
+          (multiple-value-bind (nfx nfy fw fh) (%frame-box win)
+            (let* ((ofx (- nfx (- (win-x win) ox))) (ofy (- nfy (- (win-y win) oy)))
+                   (fbw (glass:fb-width fb)) (fbh (glass:fb-height fb))
+                   (inside (lambda (x y) (and (>= x 0) (>= y 0) (<= (+ x fw) fbw) (<= (+ y fh) fbh)))))
+              (cond
+                ((and (= ofx nfx) (= ofy nfy)))
+                ((and (member win (desk-windows desk)) (eq win (first (desk-windows desk)))
+                      (null (desk-menu desk)) (funcall inside ofx ofy) (funcall inside nfx nfy)
+                      ;; the screen must hold the frame as it was: not if it is still to be
+                      ;; repainted (a window raised by this very press is under damage)
+                      (notany (lambda (r) (apply #'%overlaps-p ofx ofy fw fh r)) (desk-damage desk)))
+                 (glass:fb-move-rect fb ofx ofy nfx nfy fw fh)
+                 (setf strips (append (%rect-minus ofx ofy fw fh nfx nfy fw fh) strips))
+                 (grow ofx ofy fw fh) (grow nfx nfy fw fh))
+                (t (%damage desk ofx ofy fw fh) (%damage desk nfx nfy fw fh)))))))
+      (setf (desk-moves desk) '())
+      (values strips (and x0 (list x0 y0 (- x1 x0) (- y1 y0)))))))
+
 (defun desk-tick (desk)
   "Poll the windows and bring the screen up to date.  Returns NIL when nothing changed, else
    (values T X Y W H): the rectangle of FB that changed, so a host need only show that.
@@ -328,7 +372,11 @@
    menu's box, content under another window -- and only the rectangle around it is repainted,
    clipped.  Dragging a small window repainted the whole desk and magnified the whole screen,
    and stuttered; now it costs about the window.  A host's DESK-REDRAW still repaints all."
-  (let ((fb (desk-fb desk)) (copied '()))
+  (let ((fb (desk-fb desk)) (copied '()) (strips '()) (moved nil))
+    ;; moves first: they shift what the screen holds now, before anything is drawn over it
+    (if (desk-dirty desk)
+        (setf (desk-moves desk) '())
+        (multiple-value-setq (strips moved) (%apply-moves desk)))
     (dolist (w (desk-windows desk))
       (when (and (win-dirty-p w) (funcall (win-dirty-p w)))
         (if (%covered-p desk w)
@@ -348,6 +396,9 @@
              (dolist (r (desk-damage desk)) (apply #'grow r))
              (setf (desk-damage desk) '())
              (%redraw-region desk x0 y0 (- x1 x0) (- y1 y0)))
+           ;; a move's uncovered strips, each on its own: their bounding box is the whole frame
+           (dolist (r strips) (apply #'%redraw-region desk r))
+           (when moved (apply #'grow moved))
            (dolist (w copied) (grow (win-x w) (win-y w) (win-w w) (win-h w))))))
       (when any
         (glass:fb-touch fb)
