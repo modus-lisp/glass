@@ -1,5 +1,5 @@
 ;;;; term-gallery.lisp — a font/rendering gallery for the glass terminal.  Feeds a
-;;;; showcase straight to the VT parser (no shell) — JetBrains Mono text + operators,
+;;;; showcase straight to the VT parser (no shell) — Iosevka Term text + operators,
 ;;;; ANSI/256/truecolour, box-drawing + blocks, Symbols Nerd Font icons, a powerline
 ;;;; prompt, and Twemoji colour emoji — renders it, and dumps a PNG.
 ;;;;   sbcl --dynamic-space-size 4096 --non-interactive --load inspect/term-gallery.lisp
@@ -30,7 +30,7 @@
          (nl () (feed-string tm (format nil "~a[0m~C~C" *e* #\Return #\Linefeed))))
     (macrolet ((line (&rest parts) `(progn ,@(loop for p in parts collect `(out ,p)) (nl))))
       ;; ---- title ----
-      (line (format nil "~a[1;38;5;81m  glass terminal  ~a[0;38;5;245m· JetBrains Mono · Symbols Nerd Font · Twemoji" e e))
+      (line (format nil "~a[1;38;5;81m  glass terminal  ~a[0;38;5;245m· Iosevka Term · Symbols Nerd Font · Twemoji" e e))
       (line "")
       ;; ---- text + programming operators ----
       (line (format nil "~a[38;5;252mABCDEFGHIJKLMNOPQRSTUVWXYZ  abcdefghijklmnopqrstuvwxyz  0123456789" e))

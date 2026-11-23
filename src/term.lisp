@@ -781,8 +781,8 @@
   (and path (ignore-errors (glass:load-font path))))
 
 (defun %term-font (name)
-  "Load a bundled terminal font from glass's fonts/ (JetBrains Mono + Symbols Nerd
-   Font — WezTerm's default set; colour emoji comes from scribe's Twemoji fallback)."
+  "Load a bundled terminal font from glass's fonts/ (Iosevka Term Regular + Symbols Nerd
+   Font; colour emoji comes from scribe's Twemoji fallback)."
   (glass:load-font (asdf:system-relative-pathname :glass/term (format nil "fonts/~a" name))))
 
 (defvar *term-fonts* nil "(REGULAR . NERD): the bundled faces, once loaded on a thread that may cache.")
@@ -793,7 +793,7 @@
    cache: it gets faces of its own, uncached.  A host whose terminals open on another thread
    calls this on main first (SERVE-WM does), so they share one copy."
   (or *term-fonts*
-      (let ((f (cons (%term-font "JetBrainsMono-Regular.ttf")
+      (let ((f (cons (%term-font "IosevkaTerm-Regular.ttf")
                      (ignore-errors (%term-font "SymbolsNerdFontMono-Regular.ttf")))))
         (if #+modus (sb-thread:main-thread-p) #-modus t
             (setf *term-fonts* f)
@@ -838,7 +838,7 @@
    read, and the far end puts its output on the screen with TERMINAL-WRITE -- glass/repl's
    listener does.
 
-   FONT (a scribe font) replaces the bundled JetBrains Mono, and NERD-FONT the symbol font
+   FONT (a scribe font) replaces the bundled Iosevka Term, and NERD-FONT the symbol font
    (NIL for none): for an image with no glass/fonts/ directory beside it.  FB, if given, is the
    framebuffer to draw into (resized to the grid) instead of a new one: a window's own."
   (let* ((bundled (and (null font) (term-fonts)))
