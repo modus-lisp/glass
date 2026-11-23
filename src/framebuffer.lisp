@@ -158,6 +158,7 @@ would not have to visit every call site in the tree."
   (frameno 0)
   (damage nil)                          ; accumulated (x0 y0 x1 y1), or :FULL, since last take
   (copy nil)                            ; composed move: (src-x src-y dst-x dst-y w h) -> CopyRect
+  (copy-exact nil)                      ; T while every mark since the last take was an EXACT move
   (mark-time 0 :type fixnum)            ; when the oldest unsent change was marked (backlog clock)
   ;; NAMED APART, because a deadlock report is only as useful as the names in it.  Every
   ;; framebuffer has TWO of these and both used to be called "framebuffer", so a cycle
@@ -209,7 +210,7 @@ would not have to visit every call site in the tree."
                      (+ ndx (- x0 nsx)) (+ ndy (- y0 nsy))               ; on to NEW's destination
                      w h))))))))
 
-(defun fb-mark-frame (fb damage &optional copy)
+(defun fb-mark-frame (fb damage &optional copy exact)
   "Record that a composite changed region DAMAGE ((x0 y0 x1 y1) or :FULL) and, if it was a
    window MOVE, COPY = (src-x src-y dst-x dst-y w h) so the sender can CopyRect the moved
    pixels.  ACCUMULATES onto whatever the sender has not taken yet: damage is unioned and
@@ -217,6 +218,12 @@ would not have to visit every call site in the tree."
    behind still gets ONE snapshot->current CopyRect instead of re-encoding.  Advances the
    frame counter."
   (%with-frame-lock (fb)
+    ;; EXACT (a host's question, not a sender's): the mark is a move and nothing else -- DAMAGE is
+    ;; the moved box and the strips it uncovered, the destination holds exactly the source's
+    ;; pixels.  It stays true only while every mark since the last take was one, so a host that
+    ;; replays COPY on its own screen and copies only DAMAGE less COPY's destination is exact; a
+    ;; sender, which applies COPY and diffs all of DAMAGE, need not ask.
+    (setf (fb-copy-exact fb) (and copy exact (or (null (fb-damage fb)) (fb-copy-exact fb)) t))
     (when (null (fb-damage fb))           ; first change since the sender's last take: start the
       (setf (fb-mark-time fb) (get-internal-real-time)))  ; backlog clock for this batch
     ;; Shared: the compositor that marks is often not the sender that takes (%SHARE).
@@ -225,12 +232,15 @@ would not have to visit every call site in the tree."
           (fb-frameno fb) (logand (1+ (fb-frameno fb)) most-positive-fixnum))))
 
 (defun fb-take-frame (fb)
-  "Atomically read the accumulated (FRAMENO DAMAGE COPY MARK-TIME) and clear DAMAGE/COPY, so the
-   next composite starts a fresh accumulation from where the client now is.  MARK-TIME is when
-   the oldest change in this batch was marked, so the sender can measure its backlog (now -
-   MARK-TIME = how long the change waited).  The sender calls this once per update it sends."
+  "Atomically read the accumulated (FRAMENO DAMAGE COPY MARK-TIME EXACT) and clear DAMAGE/COPY,
+   so the next composite starts a fresh accumulation from where the client now is.  MARK-TIME is
+   when the oldest change in this batch was marked, so the sender can measure its backlog (now -
+   MARK-TIME = how long the change waited).  EXACT is true when every change in the batch was a
+   move marked exact (FB-MARK-FRAME): replaying COPY and showing DAMAGE less COPY's destination
+   reproduces the framebuffer.  The sender calls this once per update it sends."
   (%with-frame-lock (fb)
-    (multiple-value-prog1 (values (fb-frameno fb) (fb-damage fb) (fb-copy fb) (fb-mark-time fb))
+    (multiple-value-prog1 (values (fb-frameno fb) (fb-damage fb) (fb-copy fb) (fb-mark-time fb)
+                                  (and (fb-copy fb) (fb-copy-exact fb)))
       (setf (fb-damage fb) nil (fb-copy fb) nil))))
 
 (defun fb-take-copy (fb)

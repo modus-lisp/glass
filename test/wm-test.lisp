@@ -72,6 +72,22 @@
       (check "every step that moved, moved pixels in place (edges too)" (= (- glass.wm::*wm-moves-in-place* before) 18))
       (glass.wm::seat-move wm paint 140 162)              ; back where the checks below expect it
       (glass.wm::wm-composite wm nil))
+    ;; a host replaying the move on its own screen (a GPU blitter) needs to know the frame is
+    ;; EXACTLY a move and its uncovered strips: FB-TAKE-FRAME's fifth value
+    (let ((exact t) (glass.wm:*wireframe-lag-ms* 1000000) (glass.wm:*wireframe-queue-kb* 1d9)
+          (x 250) (y 150))
+      (ptr wm 1 x y)
+      (dolist (d '((7 3) (13 -4) (-9 11) (21 0)))
+        (incf x (first d)) (incf y (second d))
+        (glass:fb-take-frame (glass.wm:wm-fb wm))
+        (glass.wm:wm-pointer wm 1 x y)
+        (unless (nth-value 4 (glass:fb-take-frame (glass.wm:wm-fb wm))) (setf exact nil)))
+      (check "each drag step's frame is an exact move (FB-TAKE-FRAME's fifth value)" exact)
+      (glass.wm::wm-composite wm nil)
+      (check "and a full composite's frame is not" (not (nth-value 4 (glass:fb-take-frame (glass.wm:wm-fb wm)))))
+      (ptr wm 0 x y)
+      (glass.wm::seat-move wm paint 140 162)
+      (glass.wm::wm-composite wm nil))
     ;; the same drag with the link lagging: wireframe, the window lands on release
     (let ((glass.wm:*wireframe-lag-ms* -1) (glass.wm:*wm-log* nil))
       (ptr wm 1 250 150) (ptr wm 1 280 180)
