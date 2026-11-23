@@ -54,6 +54,20 @@
     (check "opaque drag moved Paint by the pointer" (and (= 140 (glass.wm::surf-x paint)) (= 162 (glass.wm::surf-y paint))))
     (check "opaque drag never went wireframe" (zerop (glass.wm::wm-wire-drags wm)))
     (check "screen = full repaint after opaque drag" (same-as-full-p wm))
+    (check "the opaque drag moved the screen's pixels" (plusp (glass.wm::wm-moves-in-place wm)))
+    ;; a drag in small steps across Notes, every step = a full repaint
+    (let ((ok t) (glass.wm:*wireframe-lag-ms* 1000000) (glass.wm:*wireframe-queue-kb* 1d9)
+          (x 250) (y 150))
+      (ptr wm 1 x y)
+      (dolist (d '((7 3) (13 -4) (-9 11) (21 0) (0 17) (-30 -12) (5 5) (40 25)))
+        (incf x (first d)) (incf y (second d))
+        (glass.wm:wm-pointer wm 1 x y)
+        (unless (same-as-full-p wm) (setf ok nil)))
+      (ptr wm 0 x y)
+      (check "a stepwise drag over another window = full repaint at every step"
+             (and ok (same-as-full-p wm)))
+      ;; and back where the tests below expect Paint
+      (ptr wm 1 x y) (ptr wm 1 250 150) (ptr wm 0 250 150))
     ;; the same drag with the link lagging: wireframe, the window lands on release
     (let ((glass.wm:*wireframe-lag-ms* -1) (glass.wm:*wm-log* nil))
       (ptr wm 1 250 150) (ptr wm 1 280 180)

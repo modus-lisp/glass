@@ -167,7 +167,8 @@
    (views      :initform nil :accessor seat-views)
    (copy-bases :initform nil :accessor seat-copy-bases)
    (wire-drags :initform 0 :accessor seat-wire-drags)   ; counts, for a test or a curious host
-   (opaque-moves :initform 0 :accessor seat-opaque-moves))
+   (opaque-moves :initform 0 :accessor seat-opaque-moves)
+   (moves-in-place :initform 0 :accessor seat-moves-in-place))   ; of those, done by moving pixels
   (:documentation "One person's screen, hands and arrangement of the session's windows."))
 
 (defmethod print-object ((seat seat) stream)
@@ -223,7 +224,8 @@
            wm-drag-wire seat-drag-wire  wm-drag-wire-box seat-drag-wire-box  wm-menu seat-menu
            wm-last-mask seat-last-mask  wm-pending seat-pending  wm-frame-copy seat-frame-copy
            wm-keyboard-fn seat-keyboard-fn  wm-keyboard-up seat-keyboard-up
-           wm-wire-drags seat-wire-drags  wm-opaque-moves seat-opaque-moves))
+           wm-wire-drags seat-wire-drags  wm-opaque-moves seat-opaque-moves
+           wm-moves-in-place seat-moves-in-place))
 
 (defun wm-find-seat (wm id)
   "The seat numbered ID (NIL or 0: the home seat), or NIL if there is none."
@@ -893,16 +895,50 @@
     (values (max (- keep (surf-cw s)) (min (- sw keep) ncx))
             (max (+ (wm-titleh) (wm-border)) (min (- sh (round (* 4 *wm-scale*))) ncy)))))
 
+(defun move-in-place-p (wm s old new)
+  "Can S's move from OLD to NEW (window boxes) be done by moving the pixels the screen holds?
+   Only when what is there is S as it was: S on top, nothing drawn over it (no menu, no
+   wireframe), no repaint pending over OLD, and both boxes wholly on the screen."
+  (let ((p (wm-pending wm)) (scr (screen-box wm)))
+    (and (not (rack-p wm))
+         (eq s (wm-topmost wm))
+         (null (wm-menu wm))
+         (not (wm-drag-wire wm))
+         (box-inside-p old scr) (box-inside-p new scr)
+         (or (null p) (and (consp p) (not (boxes-overlap-p p old)))))))
+
+(defun composite-move (wm old new copy)
+  "Move the window at OLD to NEW by moving the screen's own pixels (FB-MOVE-RECT: RFB's
+   CopyRect, in RAM) and repaint only what it uncovered; mark the frame as WM-COMPOSITE would,
+   with the same damage and COPY, so a sender's view of it is unchanged."
+  (let ((fb (wm-fb wm)))
+    (glass:with-fb-locked (fb)
+      (setf (wm-frame-copy wm) nil)
+      (destructuring-bind (ox oy w h) old
+        (glass:fb-move-rect fb ox oy (first new) (second new) w h))
+      (dolist (band (box-difference old new))
+        (destructuring-bind (bx by bw bh) band
+          (glass:with-fb-clip (fb bx by bw bh) (composite-whole wm fb band))))
+      (destructuring-bind (ux uy uw uh) (box-union (list old new))
+        (glass:fb-mark-frame fb (list ux uy (+ ux uw) (+ uy uh)) copy))
+      (setf (wm-frame-copy wm) nil)
+      (glass:fb-touch fb))))
+
 (defun drag-move-opaque (wm s ncx ncy)
-  "Move S to (NCX,NCY) and composite old+new with a CopyRect hint for the move."
+  "Move S to (NCX,NCY) with a CopyRect hint for the move.  The screen's pixels are moved and only
+   the uncovered strips repainted where that is exact (MOVE-IN-PLACE-P); otherwise old+new are
+   composited.  The move was a composite of the whole old+new box -- the window, its title and
+   everything under both -- per pointer event: ~4 ms on a T420 for a 600x320 window."
   (let ((old (window-box s)))
     (seat-move wm s ncx ncy)
     (let ((new (window-box s)))
       (unless (equal old new)
         (incf (wm-opaque-moves wm))
-        (wm-composite wm (box-union (list old new))
-                      (list (first old) (second old) (first new) (second new)
-                            (third old) (fourth old)))))))
+        (let ((copy (list (first old) (second old) (first new) (second new)
+                          (third old) (fourth old))))
+          (if (move-in-place-p wm s old new)
+              (progn (incf (wm-moves-in-place wm)) (composite-move wm old new copy))
+              (wm-composite wm (box-union (list old new)) copy)))))))
 
 (defun drag-wire-to (wm s ncx ncy)
   "Move only the outline; the window stays put (its pixels stay on the client)."
