@@ -56,13 +56,19 @@
     (check "screen = full repaint after opaque drag" (same-as-full-p wm))
     (check "the opaque drag moved the screen's pixels" (plusp (glass.wm::wm-moves-in-place wm)))
     ;; a drag in small steps across Notes, every step = a full repaint
-    (let ((ok t) (glass.wm:*wireframe-lag-ms* 1000000) (glass.wm:*wireframe-queue-kb* 1d9)
+    (let ((ok t) (exact t) (glass.wm:*wireframe-lag-ms* 1000000) (glass.wm:*wireframe-queue-kb* 1d9)
           (x 250) (y 150))
       (ptr wm 1 x y)
       (dolist (d '((7 3) (13 -4) (-9 11) (21 0) (0 17) (-30 -12) (5 5) (40 25)))
         (incf x (first d)) (incf y (second d))
+        (glass:fb-take-frame (glass.wm:wm-fb wm))
         (glass.wm:wm-pointer wm 1 x y)
+        ;; a host replaying the move: the frame says it is exactly one
+        (unless (nth-value 4 (glass:fb-take-frame (glass.wm:wm-fb wm))) (setf exact nil))
         (unless (same-as-full-p wm) (setf ok nil)))
+      (check "each step's frame is an exact move (FB-TAKE-FRAME's fifth value)" exact)
+      (glass.wm::wm-composite wm nil)
+      (check "and a full composite is not" (not (nth-value 4 (glass:fb-take-frame (glass.wm:wm-fb wm)))))
       (ptr wm 0 x y)
       (check "a stepwise drag over another window = full repaint at every step"
              (and ok (same-as-full-p wm)))

@@ -920,7 +920,7 @@
         (destructuring-bind (bx by bw bh) band
           (glass:with-fb-clip (fb bx by bw bh) (composite-whole wm fb band))))
       (destructuring-bind (ux uy uw uh) (box-union (list old new))
-        (glass:fb-mark-frame fb (list ux uy (+ ux uw) (+ uy uh)) copy))
+        (glass:fb-mark-frame fb (list ux uy (+ ux uw) (+ uy uh)) copy t))   ; an exact move
       (setf (wm-frame-copy wm) nil)
       (glass:fb-touch fb))))
 
