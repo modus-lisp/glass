@@ -89,6 +89,9 @@
 
 ;;; ---- terminal ---------------------------------------------------------------
 
+(defparameter *scrollback-lines* 2000
+  "Rows of scrollback a new terminal keeps.")
+
 (defstruct (terminal (:constructor %make-terminal))
   cols rows chars colors                ; grid: two parallel (u32 chars / u64 colors) arrays
   (cx 0) (cy 0)                         ; cursor
@@ -117,6 +120,11 @@
   (gen 0) (drawn-gen -1)                ; FEED-CHAR counts in GEN; RENDER skips its scan if unchanged
   (alt-key nil)                         ; keyboard: Alt / Meta held (sends ESC first)?
   (exited nil)                          ; the pty reached EOF: the shell is gone
+  ;; scrollback: rows that scrolled off the top of the main screen, as (CHARS . COLORS) of their
+  ;; width then, in a ring of HIST-MAX; VIEW is how many rows back the window shows (0 = live)
+  (hist nil) (hist-start 0) (hist-count 0) (hist-max *scrollback-lines*)
+  (view 0)
+  (shift-key nil)                       ; keyboard: Shift held (Shift+PgUp/PgDn scroll back)?
   (dirty t))                            ; fb changed since the compositor last consumed it?
 
 (declaim (inline tidx tchar tcolor))
@@ -176,7 +184,30 @@
                                (+ (terminal-cx tm) w)
                                (min (+ (terminal-cx tm) w) (1- (terminal-cols tm)))))))
 
+(defun hist-push (tm y)
+  "Save row Y of the grid as the newest scrollback row."
+  (let* ((cols (terminal-cols tm)) (max (terminal-hist-max tm)) (a (* y cols)) (b (+ a cols)))
+    (when (plusp max)
+      (unless (terminal-hist tm) (setf (terminal-hist tm) (make-array max :initial-element nil)))
+      (let ((row (cons (subseq (terminal-chars tm) a b) (subseq (terminal-colors tm) a b)))
+            (h (terminal-hist tm)))
+        (if (< (terminal-hist-count tm) max)
+            (progn (setf (svref h (mod (+ (terminal-hist-start tm) (terminal-hist-count tm)) max)) row)
+                   (incf (terminal-hist-count tm)))
+            (progn (setf (svref h (terminal-hist-start tm)) row)
+                   (setf (terminal-hist-start tm) (mod (1+ (terminal-hist-start tm)) max))))))))
+
+(defun hist-row (tm k)
+  "The scrollback row K back from the newest (1 = the row that scrolled off last), or NIL."
+  (let ((n (terminal-hist-count tm)))
+    (and (<= 1 k n)
+         (svref (terminal-hist tm)
+                (mod (+ (terminal-hist-start tm) (- n k)) (terminal-hist-max tm))))))
+
 (defun scroll-up (tm)
+  ;; the main screen's top row, scrolling off a region that starts at the top, is kept
+  (when (and (zerop (terminal-top tm)) (null (terminal-alt tm)))
+    (hist-push tm 0))
   (let ((cols (terminal-cols tm)))
     (loop for y from (terminal-top tm) below (terminal-bot tm) do
       (grid-move tm (* y cols) (* (1+ y) cols) (* (1+ y) cols)))
@@ -342,7 +373,8 @@
 (defun feed-char (tm c)
   ;; every change to the grid comes through here (or a resize, which redraws all): RENDER
   ;; compares cells only when this has moved
-  (setf (terminal-gen tm) (logand (1+ (terminal-gen tm)) most-positive-fixnum))
+  (setf (terminal-gen tm) (logand (1+ (terminal-gen tm)) most-positive-fixnum)
+        (terminal-view tm) 0)                       ; new output: back to the live screen
   (let ((code (char-code c)))
     (ecase (terminal-pstate tm)
       (:ground
@@ -576,14 +608,17 @@
   (or (gethash code (terminal-glyphs tm))
       (setf (gethash code (terminal-glyphs tm)) (render-glyph tm code))))
 
-(defun draw-cell (tm x y)
-  (let ((c (tchar tm x y)) (col (tcolor tm x y)))
+(defun draw-cell (tm x y &optional chars colors)
+  "Draw cell X,Y from CHARS / COLORS (the grid, or RENDER's view of the scrollback)."
+  (let* ((i (tidx tm x y))
+         (c (if chars (aref chars i) (tchar tm x y))) (col (if colors (aref colors i) (tcolor tm x y))))
     (when (ch-spacer-p c) (return-from draw-cell))   ; right half of a wide char
   (let* ((fb (terminal-fb tm))
          (cw (terminal-cell-w tm)) (ch (terminal-cell-h tm))
          (span (if (ch-wide-p c) 2 1))
          (px0 (* x cw)) (py0 (* y ch))
-         (cursor (and (terminal-cursor-vis tm) (= x (terminal-cx tm)) (= y (terminal-cy tm))))
+         (cursor (and (terminal-cursor-vis tm) (zerop (terminal-view tm))
+                      (= x (terminal-cx tm)) (= y (terminal-cy tm))))
          (fg (if cursor (color-bg col) (color-fg col)))
          (bg (if cursor (color-fg col) (color-bg col))))   ; cursor = inverse block
     (glass:fb-rect fb px0 py0 (* cw span) ch bg)
@@ -613,12 +648,37 @@
               (let ((dx (+ ox xx)))
                 (when (< -1 dx dw) (setf (aref dp (+ drow dx)) (aref sp (+ srow xx))))))))))))
 
+(defun view-grid (tm)
+  "(values CHARS COLORS) as the window shows them VIEW rows back: the newest VIEW scrollback rows
+   above the grid's first ROWS - VIEW.  A row saved at another width is cut or blank-padded."
+  (let* ((cols (terminal-cols tm)) (rows (terminal-rows tm)) (v (terminal-view tm)))
+    (multiple-value-bind (ch co) (make-grid cols rows)
+      (dotimes (y rows)
+        (if (< y v)
+            (let ((row (hist-row tm (- v y))))
+              (when row
+                (let ((n (min cols (length (car row)))))
+                  (replace ch (car row) :start1 (* y cols) :end2 n)
+                  (replace co (cdr row) :start1 (* y cols) :end2 n))))
+            (let ((src (* (- y v) cols)))
+              (replace ch (terminal-chars tm) :start1 (* y cols) :start2 src :end2 (+ src cols))
+              (replace co (terminal-colors tm) :start1 (* y cols) :start2 src :end2 (+ src cols)))))
+      (values ch co))))
+
+(defun scroll-view (tm delta)
+  "Move the window DELTA rows further back (negative: forward), within the scrollback."
+  (let ((v (max 0 (min (terminal-hist-count tm) (+ (terminal-view tm) delta)))))
+    (unless (= v (terminal-view tm))
+      (setf (terminal-view tm) v
+            (terminal-gen tm) (logand (1+ (terminal-gen tm)) most-positive-fixnum)))))
+
 (defun render (tm)
   "Draw what changed since the last RENDER: cells whose character or colours differ from the
    copy kept of what was drawn, and the cells the cursor left and entered.  Everything when
    there are sixel images (they lie over cells) or nothing has been drawn yet."
   (glass:with-fb-locked ((terminal-fb tm))
     (let* ((cols (terminal-cols tm)) (rows (terminal-rows tm)) (n (* cols rows))
+           (viewing (plusp (terminal-view tm)))
            (chars (terminal-chars tm)) (colors (terminal-colors tm))
            (dc (terminal-drawn-chars tm)) (dco (terminal-drawn-colors tm))
            (full (or (null dc) (/= (length dc) n) (terminal-graphics tm)))
@@ -632,6 +692,8 @@
       ;; nothing fed and the cursor still: nothing can differ, so do not compare every cell
       (when (and (not full) (not moved) (= (terminal-gen tm) (terminal-drawn-gen tm)))
         (return-from render nil))
+      (when viewing
+        (multiple-value-setq (chars colors) (view-grid tm)))
       (when (or (null dc) (/= (length dc) n))
         (setf dc (make-array n :element-type '(unsigned-byte 32))
               dco (make-array n :element-type '(unsigned-byte 64))
@@ -643,12 +705,13 @@
                       (/= (aref chars i) (aref dc i)) (/= (aref colors i) (aref dco i))
                       (and moved (= x cx) (= y cy) (or vis ovis))
                       (and moved (= x ocx) (= y ocy) ovis))
-              (draw-cell tm x y)
+              (draw-cell tm x y chars colors)
               (setf (aref dc i) (aref chars i) (aref dco i) (aref colors i) any t)))))
       (setf (terminal-drawn-cx tm) cx (terminal-drawn-cy tm) cy (terminal-drawn-vis tm) vis
             (terminal-drawn-gen tm) (terminal-gen tm))
-      (dolist (g (reverse (terminal-graphics tm)))       ; sixel images on top, oldest first
-        (blit-image (cddr g) (car g) (cadr g) (terminal-fb tm)))
+      (unless viewing                                    ; sixel images on top, oldest first
+        (dolist (g (reverse (terminal-graphics tm)))     ; (screen-placed: not in the scrollback)
+          (blit-image (cddr g) (car g) (cadr g) (terminal-fb tm))))
       (when any (setf (terminal-dirty tm) t)))))
 
 (defun terminal-take-dirty (tm)
@@ -690,8 +753,13 @@
   (cond
     ((member keysym '(#xffe3 #xffe4)) (setf (terminal-ctrl tm) down))   ; Control L/R
     ((member keysym '(#xffe9 #xffea #xffe7 #xffe8)) (setf (terminal-alt-key tm) down))  ; Alt, Meta
+    ((member keysym '(#xffe1 #xffe2)) (setf (terminal-shift-key tm) down))           ; Shift L/R
     ((not down) nil)
-    (t (let ((bytes (cond
+    ;; Shift+PgUp / PgDn page the scrollback (the main screen only); the keys go no further
+    ((and (terminal-shift-key tm) (member keysym '(#xff55 #xff56)) (null (terminal-alt tm)))
+     (scroll-view tm (* (if (= keysym #xff55) 1 -1) (max 1 (1- (terminal-rows tm))))))
+    (t (scroll-view tm (- (terminal-view tm)))          ; typing: back to the live screen
+       (let ((bytes (cond
                       ((%app-key tm keysym))
                       ((<= #xffbe keysym #xffc9) (aref *function-keys* (- keysym #xffbe)))
                       ((= keysym #xff63) (format nil "~c[2~~" (code-char 27)))      ; Insert
@@ -749,6 +817,10 @@
 (defun on-mouse (tm mask lx ly)
   "Feed a pointer event (RFB button MASK; content-pixel LX,LY).  If the app has
    enabled mouse tracking, encode it (SGR or legacy) and write it to the shell."
+  ;; the wheel scrolls the scrollback when the application is not tracking the mouse
+  (when (and (null (terminal-mouse-mode tm)) (null (terminal-alt tm)))
+    (when (logtest mask 8) (scroll-view tm 3))
+    (when (logtest mask 16) (scroll-view tm -3)))
   (when (terminal-mouse-mode tm)
     (let* ((col (max 1 (1+ (floor lx (terminal-cell-w tm)))))
            (row (max 1 (1+ (floor ly (terminal-cell-h tm)))))
