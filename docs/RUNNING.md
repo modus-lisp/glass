@@ -28,38 +28,23 @@ default serves a single client and returns — that is what the tests use.
 ## 3. The OPEN LOOK desktop
 
 ```sh
-sbcl --control-stack-size 256 --dynamic-space-size 4096 \
-     --load backend/inspect/serve-desktop.lisp
+sbcl --dynamic-space-size 4096 --eval '(require :asdf)' \
+     --eval '(asdf:load-system "glass/wm")' \
+     --eval '(glass.wm:serve-wm 5900 :width 1024 :height 700)'
 ```
 
-Blocks, serving a wallpapered workspace with the Apps menu (Calculator, Browser,
-Inspector, Debugger, Image Viewer, Listener, …) and one terminal.
+Blocks, serving glass's window manager (`:glass/wm`) with its root menu of glass windows
+on `localhost:5900`.  modus's `scripts/glass-desk.lisp` does the same from a source tree
+(`DESK_PORT`, `DESK_SIZE`), and also loads Files (warren) and Browser (loom) when they are
+there.
 
-`GLASS_DISPLAY` picks the display number, X-style — **every port the desktop owns
-is derived from it**, so a second desktop is one environment variable, not a fork
-of the file:
-
-| what | port | display 1 (default) |
-| --- | --- | --- |
-| VNC / RFB | `5900 + N` | 5901 |
-| session audio | `5910 + N` | 5911 |
-| control + eval socket | `4008 + N` | 4009 |
-
-The control socket reads one form, evals it in `clim-glass`, and writes the printed
-result — live perf and every knob, on the *running* desktop with no restart:
-
-```sh
-echo '(glass:perf-report)' | nc -q1 127.0.0.1 4009
-```
-
-The VNC password comes from `~/.glass-vnc-pass` if that file exists (create it
-yourself, mode 600 — it is not in the repo). Absent, the server keeps the open
-posture described in the README.
+The McCLIM desktop this section used to start (`backend/inspect/serve-desktop.lisp`, with
+its display-numbered ports and control socket) was removed on 2026-11-25.
 
 ## Or skip all of it
 
 [kiln](https://github.com/modus-lisp/kiln) packages every prerequisite below —
-SBCL, Quicklisp, McCLIM and all 38 sibling repos — into one container image:
+SBCL, Quicklisp and all 38 sibling repos — into one container image:
 
 ```sh
 kiln build && kiln vnc
@@ -71,9 +56,8 @@ if you would rather run the desktop directly.
 ## Prerequisites
 
 - **SBCL.** The only platform dependency is `sb-bsd-sockets`; the desktop also uses
-  `sb-thread` and `sb-concurrency`.
-- **Quicklisp at `~/quicklisp`.** Every script under `inspect/` and
-  `backend/inspect/` opens with `(load "~/quicklisp/setup.lisp")`. A Quicklisp
+  `sb-thread`.
+- **Quicklisp at `~/quicklisp`.** Every script under `inspect/` opens with `(load "~/quicklisp/setup.lisp")`. A Quicklisp
   installed anywhere else needs that line changed, or ASDF configured by hand.
 - **The sibling repos on your ASDF path.** glass is one repo in a workspace of
   them; nothing vendors anything. The usual arrangement is a symlink per `.asd`
@@ -91,13 +75,8 @@ Which sibling each system wants:
 | `glass/audio`, `glass/audio-stream`, `glass/mic-stream` | `reed` | sibling repo |
 | `glass/speech` | `chord` + a voice model | sibling repo + model file |
 | `glass/hearing` | `stave` + recognizer models | sibling repo + model files |
-| `mcclim-glass` (`backend/`) | `mcclim`, `mcclim-render` | Quicklisp dist |
 | desktop extras | `pigment`, `loom`, `warren` | sibling repos, all optional |
 
-`backend/mcclim-glass.asd` is **not** registered by `glass.asd` — the scripts under
-`backend/inspect/` load it themselves, relative to their own `*load-truename*`. To
-use the backend from your own REPL, `(asdf:load-asd "…/glass/backend/mcclim-glass.asd")`
-first, or symlink that file into `local-projects/` too.
 
 ### Voice and ears
 
@@ -121,19 +100,16 @@ shrinks rather than gets rediscovered.
    environment variable, or falling back to an already-loaded ASDF, would let the
    scripts run against any Quicklisp (or none).
 2. **Nothing links the sibling repos for a REPL.** The scripts under `inspect/`
-   and `backend/inspect/` no longer need it — each registers the whole workspace
+   no longer need it — each registers the whole workspace
    with ASDF, derived from its own `*load-truename*` — but working from your own
    REPL still means wiring `local-projects/` (or a `CL_SOURCE_REGISTRY`) by hand,
    and the failure mode, a `SYSTEM-NOT-FOUND` deep in a quickload, does not say
    which repo is missing or where to get it.
-3. **`backend/mcclim-glass.asd` is invisible to ASDF** unless a script loads it.
-   `glass.asd` does not reference it, so the same REPL caveat applies.
-4. **The `*wav*` fixture in the audio gates** points at a path inside stave's
+3. **The `*wav*` fixture in the audio gates** points at a path inside stave's
    checkout, unlike the voice and ears models it has no environment-variable
    override.
 
-*Fixed since this list was written:* the gates under `inspect/` and
-`backend/inspect/` used to name one container's absolute paths in their
+*Fixed since this list was written:* the gates under `inspect/` used to name one container's absolute paths in their
 `(asdf:load-asd ...)` calls, so they could not run from any other checkout. That
 was not cosmetic — it is why a client-side ZRLE regression went unnoticed, since
 `inspect/remote-gate.lisp` is exactly the test for it and could not be run. Every
@@ -141,8 +117,3 @@ such call now derives the `.asd` from the loading file's own `*load-truename*`,
 and `climacs-gate.lisp`, which uses a path as *test data* for a directory
 predicate, asks about this checkout's own root.
 
-scribe used to define a `DEFLATE` package
-that collided with the Quicklisp `deflate` system McCLIM pulls in through
-opticl → retrospectiff, so `(asdf:load-system :mcclim-glass)` failed on the
-package-variance warning unless it was muffled. scribe now uses
-[cram](https://github.com/modus-lisp/cram)'s inflate and its own copy is gone.

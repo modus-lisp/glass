@@ -119,7 +119,7 @@ Kept separate so the core framebuffer + RFB server stay dependency-light."
 (asdf:defsystem :glass/desk
   :description "A minimal desktop on a glass framebuffer with no McCLIM: windows you drag by the
 title bar and close, raise on touch, and a root menu of applications.  Applications use the same
-MAKE-FN contract as the full desktop's surface apps (mcclim-glass's REGISTER-APP :surface)."
+MAKE-FN contract as the full desktop's surface apps (the removed McCLIM desktop's REGISTER-APP :surface)."
   :depends-on ("glass/fb" "glass/text")
   :serial t
   :components ((:module "src" :serial t :components ((:file "desk")))))
@@ -174,7 +174,7 @@ own -- the phone's platform speech -- installs that instead."
   :components ((:module "src" :serial t :components ((:file "voice-apps")))))
 
 (asdf:defsystem :glass/mixer-desk
-  :description "The Mixer as a desk application with no McCLIM (backend/mixer-app.lisp's window, drawn by
+  :description "The Mixer as a desk application with no McCLIM (the McCLIM desktop's Mixer window, removed, drawn by
 hand, as Speak and Listen are): each source's level, mute and gain; the session's level; the listeners."
   :depends-on ("glass/voice-apps" "glass/audio")
   :components ((:module "src" :serial t :components ((:file "mixer-desk")))))

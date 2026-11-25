@@ -21,7 +21,7 @@ security, keyboard/pointer input, and lossless encodings — Raw, Hextile, ZRLE
 **CopyRect** for window moves and a **stored-block ZRLE** fast path — with
 dirty-region tracking so a mostly-static screen costs almost nothing.
 Interoperates with **TigerVNC** and **macOS Screen Sharing**. On top of the server
-sits an optional **McCLIM OPEN LOOK desktop** (see below). **Research /
+sits an **OPEN LOOK desktop** drawn by glass itself (see below). **Research /
 educational; not audited.**
 No warranty (see [LICENSE](LICENSE)).
 
@@ -77,30 +77,18 @@ client. See [Build & test](#build--test).
 
 ## An OPEN LOOK desktop over VNC (no X)
 
-[`backend/`](backend/) is an optional **McCLIM backend** (`mcclim-glass`) that
-renders CLIM applications into a glass framebuffer and serves them over VNC —
-`(clim-glass:run-frame 'my-frame :port 5900)`, then point any VNC client at
-`localhost:5900`. Pure Lisp end to end: McCLIM's software renderer draws into an
-image, glass ships it, RFB input comes back as CLIM events. Stock apps
-(`clim-demo::gadget-test`, the calculator, the listener, …) render and interact.
+`:glass/wm` is a window manager glass draws itself: OPEN LOOK chrome (title bars,
+drag, raise, resize, close, a root menu), seats, and windows that are glass
+framebuffers, composited and served over RFB --
+`(glass.wm:serve-wm 5900 :width 1024 :height 700)`, then point any VNC client at
+`localhost:5900`.  Its applications are glass windows: Clock, Notes, Paint, Media, a Lisp
+listener and a terminal, and Files (warren), Browser (loom), Podcasts (spool), Speak,
+Listen, Mixer and Remote where their systems are loaded.  modus's
+`scripts/glass-desk.lisp` starts it from a source tree with nothing else installed.
 
-`(clim-glass:run-wm …)` goes further — a tiny **OPEN LOOK** window manager (Sun
-teal workspace, title bars, drag/raise/resize/close, a workspace root menu) that
-composites McCLIM apps, PTY terminals, and a browser side by side. The compositor
-does the interesting work:
-
-- **Damage-tracked, coalesced compositing** — a repaint recomposites (and
-  re-encodes) only the region that actually changed, and a burst of McCLIM
-  repaints coalesces to one composite per tick, not twenty.
-- **Adaptive window drag** — moving a window is opaque (with `CopyRect`) while the
-  connection keeps up; if the socket send-queue backs up (a big window on a client
-  that can't `CopyRect`, e.g. macOS), the drag switches to a **wireframe** outline
-  and snaps into place on release — so it never lags behind the cursor.
-- **Live perf + control socket** — standing per-frame counters (composite/encode
-  time, bytes, fps, send-queue backlog) readable, and every knob tunable, on the
-  *running* server with no restart.
-
-See [backend/README](backend/README.md).
+It replaced an earlier desktop built on McCLIM (`backend/`, `mcclim-glass`), removed on
+2026-11-25: McCLIM did not run where glass runs, and every application it offered has a
+glass window now.
 
 ## The other end of the wire (`:glass/client`)
 
@@ -112,18 +100,9 @@ own and never blocks its caller on the socket. No McCLIM, no window manager —
 `glass-client:connect-remote` gives you a framebuffer and two input functions, so
 it is equally a screen scraper or a bandwidth-measuring instrument.
 
-Which makes a remote desktop a `wm-surface`: `mcclim-glass/remote` wraps it as one
-and registers **"Remote desktop"** in the root menu, so another glass session runs
-as a window on this one, decorated, dragged, raised and typed into like a
-terminal. The part worth having is that the scroll optimisation **composes across
-the boundary**: a CopyRect arriving from the inner desktop becomes this window's
-translation hint, which the compositor turns into a screen strip-blit and a
-CopyRect on the outer connection. Measured on a nested pair
-([`inspect/nested-copyrect.lisp`](inspect/nested-copyrect.lisp)), a scroll two
-desktops deep costs **153 KB/frame on the outer hop instead of 1168 KB** — 7.5x —
-while the inner hop is unchanged. Deliberately carries **no clipboard and no
-audio** across the boundary: ours is a session-wide selection, and bridging one
-across a trust boundary automatically is a channel, not a feature.
+The McCLIM desktop used it to show another glass session as a window, with a scroll in
+the inner desktop arriving as a CopyRect on the outer connection (153 KB/frame instead of
+1168 KB, two desktops deep); that window went with the McCLIM desktop.
 
 ## Sound (`:glass/audio`)
 
@@ -161,8 +140,7 @@ load-bearing ones are the ones a single-listener test cannot make).
 
 ### One bus, a mix per person (`:glass/headset`)
 
-A session with two **seats** (two people watching, see
-[backend/README](backend/README.md)) has two of everything a person owns, and
+A session with two **seats** (two people watching) has two of everything a person owns, and
 sound is no exception: *my mix is not yours*. It splits the way the screen does.
 
 ```lisp

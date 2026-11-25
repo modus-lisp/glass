@@ -20,8 +20,8 @@
 ;;;;     bind() refuses a path that exists, so this is the UNIX version of the trap
 ;;;;     CLOSE-LISTENER documents, and there is no SO_REUSEADDR for it.
 ;;;;   * closing a listener actually stopping it — `ss -x', the file gone, a connect refused
-;;;;     and a rebind that works — the same questions backend/inspect/seat-transport-gate.lisp
-;;;;     asks of a TCP port, because a listener that only THINKS it has closed is the bug
+;;;;     and a rebind that works — the same questions the McCLIM desktop's seat-transport gate
+;;;;     asked of a TCP port, because a listener that only THINKS it has closed is the bug
 ;;;;     that made those questions necessary in the first place.
 ;;;;
 ;;;; And, throughout: TCP STILL WORKS AND IS STILL THE DEFAULT.  Every protocol here is run

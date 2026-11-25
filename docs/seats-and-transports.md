@@ -1,5 +1,9 @@
 # Seats and transports — what you connect to, and what carries it
 
+> **The McCLIM desktop this document describes in places** -- `backend/`, the `CLIM-GLASS`
+> package, its launchers and gates -- **was removed on 2026-11-25.**  glass's own window
+> manager (`:glass/wm`) carries seats now; the design below is kept as it was written.
+
 A design note, written before it is built, in the shape `warp/DESIGN.md` uses: the argument first,
 the refusals recorded, and the things we are choosing *not* to do said out loud so nobody has to
 re-derive them later.
