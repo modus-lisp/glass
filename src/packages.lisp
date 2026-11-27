@@ -155,7 +155,7 @@
    #:nostr-bot #:nostr-bot-p #:nostr-bot-report #:nostr-bot-pubkey #:nostr-bot-npub
    #:nostr-bot-received #:nostr-bot-answered #:nostr-bot-denied #:nostr-bot-ignored
    #:*session-nostr-bot* #:start-session-nostr #:send-login-link
-   #:nostr-bot-service #:nostr-bot-run #:nostr-bot-stopped-p
+   #:nostr-bot-service #:nostr-bot-run #:nostr-bot-stopped-p #:nostr-owner-service #:*owner-timeout*
    ;; publishing the client this box hands out links to (the :glass/site system) — the OTHER half
    ;; of a login link, in the same image as the mint, because a URL carried between two processes
    ;; in an environment variable is a URL that freezes the day one of them moves

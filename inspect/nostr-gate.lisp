@@ -41,6 +41,24 @@
       (progn (incf *fail*) (format t "  FAIL ~a~@[ — ~a~]~%" name detail)))
   (finish-output))
 (defun banner (s) (format t "~&~%== ~a ==~%" s))
+;;; THREADS IN THIS SUITE ASK THE STORES' OWNER, WHICH IS THIS THREAD.  A store function called
+;;; off the main thread is a request the main thread answers (src/nostr.lisp, `the stores' owner'),
+;;; so while workers run, main serves -- it never just joins.  And a worker hands its result back
+;;; as its RETURN VALUE, not by storing into an array main made: on modus that store is refused.
+(defun serve-until-dead (threads)
+  (loop while (some #'sb-thread:thread-alive-p threads) do (glass:nostr-owner-service 0.01))
+  (mapcar (lambda (th) (sb-thread:join-thread th :default nil)) threads))
+
+(defun run-threads (thunks &key before-serve)
+  "A thread per THUNK (closures made here), BEFORE-SERVE called once they exist, main serving until
+they end; their values, in order."
+  (let ((ths (mapcar (lambda (f) (sb-thread:make-thread f :name "gate-worker")) thunks)))
+    (when before-serve (funcall before-serve))
+    (serve-until-dead ths)))
+
+;; modus runs ~15 threads, and every thread here is a spawn under qemu on the slower boards: the
+;; races run narrower and shorter there, and still race
+(defparameter *wide* #+modus 8 #-modus 32)
 
 ;;; ---- the fixture, in /tmp, and never anywhere else ---------------------------
 
@@ -330,21 +348,20 @@ wherever it matters, because the file is the half that survives a restart."
 (let ((floor* (glass:enrolment-count)) (dips 0) (stop nil))
   (let ((watcher (sb-thread:make-thread
                   (lambda ()
-                    (loop until stop do
-                      (when (< (glass:enrolment-count) floor*) (incf dips))))
+                    (let ((d 0))
+                      (loop until stop do
+                        (when (< (glass:enrolment-count) floor*) (incf d)))
+                      d))
                   :name "enrolment-reader")))
-    (let ((writers (loop for i below 12
-                         collect (let ((i i))
-                                   (sb-thread:make-thread
-                                    (lambda ()
-                                      (dotimes (k 20)
-                                        (glass:enrol-device
-                                         (namedkey (format nil "c0~2,'0d~2,'0d00" i k))
-                                         glass:*enrolment-ttl* :via :code)))
-                                    :name "enrolment-writer")))))
-      (mapc #'sb-thread:join-thread writers))
+    (run-threads (loop for i below 12
+                       collect (let ((i i))
+                                 (lambda ()
+                                   (dotimes (k 20)
+                                     (glass:enrol-device
+                                      (namedkey (format nil "c0~2,'0d~2,'0d00" i k))
+                                      glass:*enrolment-ttl* :via :code))))))
     (setf stop t)
-    (sb-thread:join-thread watcher))
+    (setf dips (first (serve-until-dead (list watcher)))))
   (ok "240 concurrent enrolments, read continuously: THE COUNT NEVER DIPS"
       (zerop dips)
       (format nil "started at ~d, ended at ~d, dips: ~d" floor* (glass:enrolment-count) dips))
@@ -601,8 +618,8 @@ wherever it matters, because the file is the half that survives a restart."
 ;;; instructions wide and a single-threaded suite never opens it.
 
 (format t "~&   -- N threads, one code, many rounds --~%")
-(defparameter *race-threads* 32)
-(defparameter *race-rounds* 150)
+(defparameter *race-threads* *wide*)
+(defparameter *race-rounds* #+modus 30 #-modus 150)
 
 (let ((two-winners 0) (no-winner 0) (wrong-holder 0) (total 0) (t0 (get-internal-real-time)))
   (dotimes (round *race-rounds*)
@@ -610,22 +627,20 @@ wherever it matters, because the file is the half that survives a restart."
            (nonce (nth-value 1 (glass:verify-login-token code)))
            (exp (nth-value 2 (glass:verify-login-token code)))
            (start (sb-thread:make-semaphore))
-           (results (make-array *race-threads* :initial-element nil))
-           (threads
-             (loop for i below *race-threads*
-                   collect (let ((i i))
-                             (sb-thread:make-thread
-                              (lambda ()
-                                ;; every thread parks on the semaphore and is released together, so
-                                ;; they arrive at the critical section at once rather than in the
-                                ;; order they were spawned
-                                (sb-thread:wait-on-semaphore start)
-                                (setf (aref results i)
-                                      (multiple-value-list
-                                       (glass:redeem-nonce nonce (hexkey (+ #x100000 i)) exp))))
-                              :name "race")))))
-      (sb-thread:signal-semaphore start *race-threads*)
-      (mapc #'sb-thread:join-thread threads)
+           (results
+             (coerce
+              (run-threads
+               (loop for i below *race-threads*
+                     collect (let ((i i))
+                               (lambda ()
+                                 ;; every thread parks on the semaphore and is released together, so
+                                 ;; they arrive at the critical section at once rather than in the
+                                 ;; order they were spawned
+                                 (sb-thread:wait-on-semaphore start)
+                                 (multiple-value-list
+                                  (glass:redeem-nonce nonce (hexkey (+ #x100000 i)) exp)))))
+               :before-serve (lambda () (sb-thread:signal-semaphore start *race-threads*)))
+              'vector)))
       (incf total *race-threads*)
       (let* ((winners (loop for r across results when (eq :bound (second r)) collect (third r)))
              (held (holder-of code)))
@@ -646,29 +661,26 @@ wherever it matters, because the file is the half that survives a restart."
     (ok "  …and the winner is the key the store says holds the code" (zerop wrong-holder))))
 
 (format t "~&   -- and the same race through the whole of ADMIT-PEER, enrolment and all --~%")
-(let ((bad 0) (rounds 30) (n 12))
+(let ((bad 0) (rounds #+modus 10 #-modus 30) (n (min 12 *wide*)))
   (dotimes (round rounds)
     (let* ((code (glass:mint-login-token :ttl 900))
            (start (sb-thread:make-semaphore))
-           (out (make-array n :initial-element nil))
            (keys (loop for i below n collect (hexkey (+ #x200000 (* round 100) i))))
-           (threads (loop for i below n
-                          for k in keys
-                          collect (let ((i i) (k k))
-                                    (sb-thread:make-thread
-                                     (lambda ()
-                                       ;; BOUND INSIDE THE THREAD.  A new SBCL thread starts from
-                                       ;; the GLOBAL value of a special, not from the binding in
-                                       ;; force where MAKE-THREAD was called — so a LET around the
-                                       ;; spawn loop silences nothing, and the n-1 leak alarms come
-                                       ;; out interleaved across the suite's own output.
-                                       (let ((*error-output* (make-broadcast-stream)))
-                                         (sb-thread:wait-on-semaphore start)
-                                         (setf (aref out i)
-                                               (multiple-value-list (glass:admit-peer k code)))))
-                                     :name "admit-race")))))
-      (sb-thread:signal-semaphore start n)
-      (mapc #'sb-thread:join-thread threads)
+           (out (coerce
+                 (run-threads
+                  (loop for k in keys
+                        collect (let ((k k))
+                                  (lambda ()
+                                    ;; BOUND INSIDE THE THREAD.  A new SBCL thread starts from
+                                    ;; the GLOBAL value of a special, not from the binding in
+                                    ;; force where MAKE-THREAD was called — so a LET around the
+                                    ;; spawn loop silences nothing, and the n-1 leak alarms come
+                                    ;; out interleaved across the suite's own output.
+                                    (let ((*error-output* (make-broadcast-stream)))
+                                      (sb-thread:wait-on-semaphore start)
+                                      (multiple-value-list (glass:admit-peer k code))))))
+                  :before-serve (lambda () (sb-thread:signal-semaphore start n)))
+                 'vector)))
       (let ((admitted (loop for r across out count (eq :code (first r))))
             (enrolled (count-if #'glass:device-enrolled-p keys)))
         ;; exactly one admitted on the code, and exactly one enrolment bought with it
@@ -722,21 +734,18 @@ wherever it matters, because the file is the half that survives a restart."
       (eq :code (glass:admit-peer sitting link))))
 
 (format t "~&   -- superseding is atomic with minting: N mints for one recipient, one survivor --~%")
-(let ((bad 0) (rounds 60) (n 16))
+(let ((bad 0) (rounds #+modus 20 #-modus 60) (n (min 16 *wide*)))
   (dotimes (round rounds)
     (let* ((rcpt (hexkey (+ #x300000 round)))
            (start (sb-thread:make-semaphore))
-           (out (make-array n :initial-element nil))
-           (threads (loop for i below n
-                          collect (let ((i i))
-                                    (sb-thread:make-thread
-                                     (lambda ()
-                                       (sb-thread:wait-on-semaphore start)
-                                       (setf (aref out i)
-                                             (glass:mint-login-token :ttl 900 :for rcpt)))
-                                     :name "mint-race")))))
-      (sb-thread:signal-semaphore start n)
-      (mapc #'sb-thread:join-thread threads)
+           (out (coerce
+                 (run-threads
+                  (loop repeat n
+                        collect (lambda ()
+                                  (sb-thread:wait-on-semaphore start)
+                                  (glass:mint-login-token :ttl 900 :for rcpt)))
+                  :before-serve (lambda () (sb-thread:signal-semaphore start n)))
+                 'vector)))
       ;; whichever mint landed last, EXACTLY ONE of the N codes may still be outstanding
       (let ((live (count :outstanding (coerce out 'list) :key #'state-of)))
         (unless (= 1 live) (incf bad)))))
@@ -1022,6 +1031,8 @@ wherever it matters, because the file is the half that survives a restart."
                                                             :element-type 'character
                                                             :buffering :full :timeout 5)))
              (write-string line s) (write-char #\Newline s) (force-output s)
+             ;; the service answers through the stores' owner -- this thread -- so wait serving it
+             (glass::%await-answer sock 5)
              (let ((head (read-line s nil "")))
                (values head (loop repeat expect-rows collect (read-line s nil ""))))))
       (ignore-errors (sb-bsd-sockets:socket-close sock)))))

@@ -356,7 +356,7 @@ a desktop without it starts exactly as before and simply admits nobody of its ow
   :version "0.0.1"
   :author "ynniv"
   :license "MIT"
-  :depends-on ("glass" "cl-nostr" "natrium")
+  :depends-on ("glass" "cl-nostr" "natrium" "bobbin")
   :serial t
   :components ((:module "src" :serial t :components ((:file "nostr")))))
 

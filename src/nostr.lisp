@@ -327,6 +327,158 @@ depend on ENCODE-UNIVERSAL-TIME's timezone handling being what we assumed it was
 
 (defun unix-now () (- (get-universal-time) +unix-epoch-universal+))
 
+;;; ---- the stores' owner -------------------------------------------------------
+;;;
+;;; THREADS SHARE NOTHING, so the stores below -- the enrolments, the login codes, and what the
+;;; command surface and the admission service do with them -- are written by ONE thread: the
+;;; OWNER, the main thread (on modus the only thread whose objects other threads may hold, so
+;;; the only one that may put a new record where another thread can read it; on SBCL the thread
+;;; launchers run on).  Every public function that reads or writes a store is DEFINE-OWNED: on the
+;;; owner it runs as written; anywhere else it is a REQUEST -- its name and arguments, copied over
+;;; a bobbin channel -- that the owner answers with the values, copied back.  The same path on
+;;; both Lisps.  So these functions take and return plain data (strings, numbers, keywords,
+;;; lists); the few that return records (DEVICE-ENROLMENT, LIST-ENROLMENT-RECORDS,
+;;; FIND-LOGIN-CODE ...) are for the owner, and asked from elsewhere they signal saying so.
+;;;
+;;; THE OWNER MUST BE SERVED.  NOSTR-OWNER-SERVICE answers the requests waiting; it is an owner
+;;; hook from load (GLASS:RUN-OWNER-HOOKS, which SERVE-WM's listener runs every turn), the bot's
+;;; and the admission service's :SERVICE :THREAD loop it (SBCL), and a caller on the owner whose
+;;; own loop is elsewhere calls it (ADMISSION-REQUEST does, while it waits on the owner thread).
+;;; A request nobody answers within *OWNER-TIMEOUT* seconds signals rather than hanging.
+;;;
+;;; WHAT IT ALSO BUYS: the stores are written one request at a time.  Their locks stay, for the
+;;; thread that serves on SBCL beside main.
+
+(defvar *serving-store* nil
+  "The thread answering the owner's requests, while it is (bound by NOSTR-OWNER-SERVICE).
+
+A THREAD AND NOT T, because on modus the main thread's dynamic bindings are SHALLOW -- a LET of a
+special there writes the global cell, which every other thread reads -- so a T bound on main while
+it serves would make every worker believe it is the owner.  Compared with the current thread, the
+leak is harmless.")
+
+(defparameter *owner-timeout* 30
+  "Seconds a store request off the owner waits for an answer before it signals.")
+
+(defun %store-owner-p ()
+  (or (sb-thread:main-thread-p) (eq *serving-store* sb-thread:*current-thread*)))
+
+(defconstant +owner-reply-slots+ 8)
+
+(defparameter *owner-reply-bytes* (* 128 1024))
+
+(defvar *owner-requests* (bobbin:make-channel :capacity (* 256 1024) :name "glass nostr owner")
+  "Requests to the owner: (SERIAL SLOT NAME ARGS).")
+(defvar *owner-replies*
+  (let ((v (make-array +owner-reply-slots+)))
+    (dotimes (i +owner-reply-slots+ v)
+      (setf (svref v i) (bobbin:make-channel :capacity *owner-reply-bytes*
+                                             :name "glass nostr owner reply"))))
+  "Per reply slot, the channel its answer comes back on: (SERIAL :OK VALUES) / (SERIAL :ERROR TEXT).")
+(defvar *owner-slots-taken* (make-array +owner-reply-slots+ :initial-element 0)
+  "1 while a waiting caller holds the slot.  Fixnums, so any thread may write them.")
+(defvar *owner-serials* (make-array 1 :initial-element 0))
+(defvar *owner-lock* (sb-thread:make-mutex :name "glass-nostr-owner"))
+
+(defun %owner-claim ()
+  "A free reply slot and a fresh serial, waiting for a slot if all are taken."
+  (loop
+    (let ((got (sb-thread:with-mutex (*owner-lock*)
+                 (let ((i (position 0 *owner-slots-taken*)))
+                   (when i
+                     (setf (svref *owner-slots-taken* i) 1)
+                     (cons i (setf (svref *owner-serials* 0)
+                                   (logand (1+ (svref *owner-serials* 0)) most-positive-fixnum))))))))
+      (when got (return (values (car got) (cdr got))))
+      (sleep 0.005))))
+
+(defun %owner-call (name args)
+  "Ask the owner to run (APPLY NAME ARGS); its values, or signal what went wrong there."
+  (multiple-value-bind (slot serial) (%owner-claim)
+    (unwind-protect
+         (let ((reply (svref *owner-replies* slot))
+               (end (+ (get-internal-real-time) (* *owner-timeout* internal-time-units-per-second))))
+           (bobbin:channel-drain reply)
+           (unless (bobbin:channel-send *owner-requests* (list serial slot name args)
+                                        :timeout *owner-timeout*)
+             (error "glass: the store owner is not taking requests (~(~a~))" name))
+           (loop
+             (let ((left (/ (- end (get-internal-real-time)) internal-time-units-per-second)))
+               (when (<= left 0)
+                 (error "glass: nobody answered ~(~a~) for the store owner in ~ds -- the main ~
+                         thread must run GLASS:RUN-OWNER-HOOKS or NOSTR-OWNER-SERVICE"
+                        name *owner-timeout*))
+               (multiple-value-bind (m ok) (bobbin:channel-receive reply :timeout (min left 1))
+                 (when (and ok (eql (first m) serial))
+                   (if (eq (second m) :ok)
+                       (return (values-list (third m)))
+                       (error "glass: ~(~a~) on the store owner: ~a" name (third m))))))))
+      (sb-thread:with-mutex (*owner-lock*) (setf (svref *owner-slots-taken* slot) 0)))))
+
+(defun %owner-answer (m)
+  (destructuring-bind (serial slot name args) m
+    (let* ((reply (svref *owner-replies* slot))
+           (answer (handler-case (list serial :ok (multiple-value-list (apply name args)))
+                     (serious-condition (e) (list serial :error (%one-line e))))))
+      (unless (ignore-errors (bobbin:channel-send reply answer :timeout 2))
+        ;; a value a channel cannot carry (a record), or a caller that gave up
+        (ignore-errors
+         (bobbin:channel-send reply (list serial :error
+                                          (format nil "its result cannot be passed between ~
+                                                       threads; call ~(~a~) on the owner" name))
+                              :timeout 1))))))
+
+(defun nostr-owner-service (&optional (timeout 0))
+  "Answer the store requests waiting -- for up to TIMEOUT seconds (0: what is there now).  On the
+owner (the main thread), or on the thread that serves it on SBCL.  Returns how many it answered."
+  (let ((*serving-store* sb-thread:*current-thread*)
+        (end (+ (get-internal-real-time) (round (* timeout internal-time-units-per-second))))
+        (n 0))
+    (loop
+      (loop (multiple-value-bind (m ok) (bobbin:channel-try-receive *owner-requests*)
+              (unless ok (return))
+              (incf n) (ignore-errors (%owner-answer m))))
+      (let ((left (/ (- end (get-internal-real-time)) internal-time-units-per-second)))
+        (when (<= left 0) (return n))
+        (multiple-value-bind (m ok) (bobbin:channel-receive *owner-requests* :timeout (min left 0.05))
+          (when ok (incf n) (ignore-errors (%owner-answer m))))))))
+
+(add-owner-hook :nostr-stores (lambda () (nostr-owner-service 0)))
+
+(defmacro define-owned (name lambda-list &body body)
+  "DEFUN NAME, run on the stores' owner: as written there, a request (see above) anywhere else.
+LAMBDA-LIST is required, &OPTIONAL and &KEY parameters only; an argument is passed on only if it
+was supplied, so a default is computed where the function runs."
+  (let ((required '()) (optional '()) (keys '()) (mode :req))
+    (dolist (p lambda-list)
+      (case p
+        (&optional (setf mode :opt))
+        (&key (setf mode :key))
+        (t (let* ((spec (if (consp p) p (list p)))
+                  (var (first spec)) (init (second spec))
+                  (sp (or (third spec) (gensym (format nil "~a-P" var)))))
+             (ecase mode
+               (:req (push var required))
+               (:opt (push (list var init sp) optional))
+               (:key (push (list var init sp) keys)))))))
+    (setf required (nreverse required) optional (nreverse optional) keys (nreverse keys))
+    (let ((doc (and (stringp (first body)) (rest body) (list (pop body))))
+          (decls (loop while (and (consp (first body)) (eq (car (first body)) 'declare))
+                       collect (pop body)))
+          (args (gensym "ARGS")))
+      `(defun ,name (,@required
+                     ,@(when optional `(&optional ,@optional))
+                     ,@(when keys `(&key ,@keys)))
+         ,@doc ,@decls
+         (if (%store-owner-p)
+             (progn ,@body)
+             (let ((,args (list ,@required)))
+               ,@(loop for (var nil sp) in optional
+                       collect `(when ,sp (setf ,args (append ,args (list ,var)))))
+               ,@(loop for (var nil sp) in keys
+                       collect `(when ,sp (setf ,args (append ,args (list ,(intern (symbol-name var) :keyword) ,var)))))
+               (%owner-call ',name ,args)))))))
+
 ;;; ---- login tokens ------------------------------------------------------------
 ;;;
 ;;; A code is self-authenticating and stateless to mint and to verify: whoever holds the box secret
@@ -439,7 +591,7 @@ links.  Raise it toward *ENROLMENT-TTL* if you want `via=code' on a next-day col
              do (setf diff (logior diff (logxor (char-code ca) (char-code cb))))
              finally (return (zerop diff)))))
 
-(defun mint-login-token (&key (ttl *login-ttl*) (secret *box-secret*) for)
+(define-owned mint-login-token (&key (ttl *login-ttl*) (secret *box-secret*) for)
   "Mint a login code valid for TTL seconds, keyed by the box SECRET.  NIL without an identity.
 
 FOR NAMES THE RECIPIENT A LINK IS BEING SENT TO, and passing it is what makes this mint SUPERSEDE
@@ -858,17 +1010,17 @@ settles it."
 
 ;;; ---- and the same three, taking the lock, for everybody else -----------------
 
-(defun load-enrolments ()
+(define-owned load-enrolments ()
   (sb-thread:with-mutex (*enrolments-lock*) (%load-enrolments)))
 
-(defun save-enrolments ()
+(define-owned save-enrolments ()
   (sb-thread:with-mutex (*enrolments-lock*) (%save-enrolments)))
 
-(defun sync-enrolments ()
+(define-owned sync-enrolments ()
   "Re-read the store if the file changed underneath us."
   (sb-thread:with-mutex (*enrolments-lock*) (%sync-enrolments)))
 
-(defun enrol-device (pubkey &optional (ttl *enrolment-ttl*) &key via nonce for)
+(define-owned enrol-device (pubkey &optional (ttl *enrolment-ttl*) &key via nonce for)
   "Trust PUBKEY to ask for its own login links for TTL seconds.  Renews an existing enrolment.
 Returns the enrolment's new EXPIRY (a unix time, so a caller can tell the terminal when it runs out),
 or NIL if there was nothing to enrol.
@@ -916,13 +1068,13 @@ each other's rewrite of the file, and a reader between them sees the truncation.
           (%save-enrolments)
           expiry)))))
 
-(defun device-enrolled-p (pubkey)
+(define-owned device-enrolled-p (pubkey)
   (and (stringp pubkey)
        (sb-thread:with-mutex (*enrolments-lock*)
          (%sync-enrolments)
          (enrolment-live-p (gethash (string-downcase pubkey) *enrolments*)))))
 
-(defun device-enrolment (pubkey)
+(define-owned device-enrolment (pubkey)
   "PUBKEY's record — whatever state it is in — or NIL if this box has never heard of it.
 THE ANSWER TO A QUESTION ASKED AFTER THE FACT, which is why it does not filter: `we revoked that
 terminal on Tuesday' is exactly what the caller is trying to find out."
@@ -931,7 +1083,7 @@ terminal on Tuesday' is exactly what the caller is trying to find out."
       (%sync-enrolments)
       (gethash (string-downcase pubkey) *enrolments*))))
 
-(defun list-enrolments ()
+(define-owned list-enrolments ()
   "The live enrolments as ((pubkey . expiry) …), longest remaining first.  A lapsed or revoked
 record is not returned even while the file still holds it: neither is an enrolled terminal.
 
@@ -945,7 +1097,7 @@ than through it (LIST-ENROLMENT-RECORDS) so that a richer store did not become a
                *enrolments*))
     (sort rows #'> :key #'cdr)))
 
-(defun list-enrolment-records (&key (state :active))
+(define-owned list-enrolment-records (&key (state :active))
   "The records this store holds, as ENROLMENT objects.
 
 STATE selects: :ACTIVE (the live ones, the default and what a panel wants), :ALL (everything still
@@ -970,7 +1122,7 @@ most recently settled first, because that is the order somebody reading after an
                          (la (> (enrolment-expiry a) (enrolment-expiry b)))
                          (t (> (enrolment-since a) (enrolment-since b)))))))))
 
-(defun find-enrolments (prefix &key (state :all))
+(define-owned find-enrolments (prefix &key (state :all))
   "The records whose pubkey starts with PREFIX (four characters and up), in any state by default.
 This is the `the alarm named a key — what do we know about it' call."
   (when (and (stringp prefix) (>= (length prefix) 4))
@@ -981,9 +1133,9 @@ This is the `the alarm named a key — what do we know about it' call."
                               (string= prefix (subseq pk 0 (length prefix))))))
                      (list-enrolment-records :state state)))))
 
-(defun enrolment-count () (length (list-enrolments)))
+(define-owned enrolment-count () (length (list-enrolments)))
 
-(defun revoke-enrolments (arg &key by)
+(define-owned revoke-enrolments (arg &key by)
   "Revoke the terminals matching ARG — a pubkey prefix, or \"all\".  Returns the list revoked.
 
 IT MARKS; IT DOES NOT DELETE.  The record moves to :REVOKED with the time and the cause, and its
@@ -1253,7 +1405,7 @@ codes an investigation would have asked about."
 
 ;;; ---- the two public transitions ----------------------------------------------
 
-(defun record-mint (nonce expiry recipient &key (store *login-codes*))
+(define-owned record-mint (nonce expiry recipient &key (store *login-codes*))
   "Record NONCE as outstanding for RECIPIENT, and supersede RECIPIENT's earlier outstanding codes.
 Returns the number superseded, or NIL if there was nothing to record.
 
@@ -1285,7 +1437,7 @@ they are sitting in front of, and a later link must not reach back and log them 
           (%codes-save store)
           killed)))))
 
-(defun redeem-nonce (nonce pubkey expiry &key (bind t) (store *login-codes*))
+(define-owned redeem-nonce (nonce pubkey expiry &key (bind t) (store *login-codes*))
   "Trade NONCE, a code valid until EXPIRY, for PUBKEY's admission.
 
 Returns (values OK STATE HOLDER RECIPIENT):
@@ -1356,7 +1508,7 @@ releasing the lock, so N threads presenting one live code produce exactly one :B
 
 ;;; ---- reading it ---------------------------------------------------------------
 
-(defun list-login-codes (&optional (store *login-codes*))
+(define-owned list-login-codes (&optional (store *login-codes*))
   "Every row the store still holds, as LOGIN-CODE objects, most recently settled first — the
 redeemable ones AND the retained records of ones that are not.  Diagnostic only: nothing decides
 anything from this list, because the decisions are made inside the lock, above.
@@ -1374,17 +1526,17 @@ That used to be the same question; retention is what separated them."
   "T iff C is still redeemable — its own expiry, which is the short of its two lifetimes."
   (and (typep c 'login-code) (%code-redeemable-p c now)))
 
-(defun find-login-code (nonce &optional (store *login-codes*))
+(define-owned find-login-code (nonce &optional (store *login-codes*))
   "The row for NONCE, or NIL."
   (when (stringp nonce)
     (find (string-downcase nonce) (list-login-codes store) :key #'code-nonce :test #'equal)))
 
-(defun login-code-count (&optional (store *login-codes*))
+(define-owned login-code-count (&optional (store *login-codes*))
   "How many codes are still REDEEMABLE.  Not how many rows there are: a retained record is history,
 and counting it here would make the number grow for two weeks after the last person logged in."
   (count-if #'code-live-p (list-login-codes store)))
 
-(defun describe-login-codes (&optional (store *login-codes*))
+(define-owned describe-login-codes (&optional (store *login-codes*))
   "The outstanding, spent and remembered codes in words, for an operator staring at a lockout."
   (let* ((rows (list-login-codes store)) (now (unix-now))
          (live (count-if (lambda (c) (code-live-p c now)) rows)))
@@ -1434,7 +1586,7 @@ and counting it here would make the number grow for two weeks after the last per
 ;;; stated here, and asserted in nostr-gate.lisp, because nothing about the code path's POSITION in
 ;;; the COND makes it true on purpose rather than by accident.
 
-(defun admit-peer (pubkey code &key (enrol t) (ttl *renewal-ttl*))
+(define-owned admit-peer (pubkey code &key (enrol t) (ttl *renewal-ttl*))
   "Decide whether PUBKEY, holding CODE, may open this desktop.
 
 Returns (values VIA TOKEN STATUS EXPIRY):
@@ -1581,7 +1733,7 @@ than a generous match."
           (and (plusp (enrolment-created e)) (%ago (- now (enrolment-created e))))
           (and (not (enrolment-live-p e now)) (enrolment-cause e))))
 
-(defun describe-enrolments (&key (state :active))
+(define-owned describe-enrolments (&key (state :active))
   "Human-readable listing of enrolled terminals.  STATE :ALL includes the records of terminals that
 lapsed or were revoked — which is the listing somebody wants AFTER something has gone wrong, and the
 reason revoking marks instead of deleting."
@@ -1594,7 +1746,7 @@ reason revoking marks instead of deleting."
                 (mapcar (lambda (e) (describe-enrolment e now)) rows)
                 (eq state :active)))))
 
-(defun describe-revoke (arg &key by)
+(define-owned describe-revoke (arg &key by)
   "Run a `revoke' and report it in words.  BY is the authority it is performed on, and it goes onto
 each record's cause — `on whose authority' being one of the questions the record exists to answer."
   (if (null arg)
@@ -1684,7 +1836,7 @@ nothing noticed.  The site was serving /k42.html; this box handed out /k27.html 
 be stale.  Without that system loaded the environment is still where the value comes from, which is
 exactly as good as it ever was and no worse.")
 
-(defun nostr-command-reply (pubkey payload)
+(define-owned nostr-command-reply (pubkey payload)
   "The reply this box owes PUBKEY for a command DM, or NIL if PAYLOAD is not a command.
 
 Returns (values REPLY VERB ROLE).  REPLY is a string to send, or :DENIED — which the caller answers
@@ -1857,6 +2009,7 @@ directions, so one writer serialises a request and a reply."
   (port 0 :type fixnum)
   socket
   thread
+  service-thread
   (running nil)
   (lock (sb-thread:make-mutex :name "glass-admission"))
   (served 0 :type fixnum)
@@ -1866,7 +2019,7 @@ directions, so one writer serialises a request and a reply."
 (defvar *session-admission-service* nil
   "The admission service this image is running, if any.")
 
-(defun admission-serve (verb params)
+(define-owned admission-serve (verb params)
   "Answer one request.  Returns (values REPLY-LINE BODY-LINES).
 
 Every verb that can act on somebody's behalf takes PUB and applies THIS FILE's rules to it, so the
@@ -1954,45 +2107,123 @@ same question of the same function instead of reimplementing the answer."
                    (%net-line :err :reason "no-identity"))))))
       (t (%net-line :err :reason "unknown-op")))))
 
-(defun %serve-admission-client (srv sock)
-  "One connection: a request line, an answer, repeat until the peer goes away."
-  (let ((stream nil))
-    (unwind-protect
-         (handler-case
-             (progn
-               (ignore-errors (setf (sb-bsd-sockets:sockopt-tcp-nodelay sock) t))
-               (setf stream (sb-bsd-sockets:socket-make-stream
-                             sock :input t :output t :element-type '(unsigned-byte 8)
-                             :buffering :full :timeout 30))
-               (loop while (admission-service-running srv) do
-                 (let ((line (%net-read-line stream)))
-                   (when (null line) (return))                     ; peer hung up
-                   (unless (zerop (length line))
-                     (multiple-value-bind (verb params) (%net-params line)
-                       (multiple-value-bind (reply body)
-                           (handler-case (admission-serve (or verb "") params)
-                             (serious-condition (e) (%net-line :err :reason (%one-line e))))
-                         (sb-thread:with-mutex ((admission-service-lock srv))
-                           (incf (admission-service-served srv))
-                           (when (equal verb "admit")
-                             (if (equal "ok" (nth-value 0 (%net-params reply)))
-                                 (incf (admission-service-admitted srv))
-                                 (incf (admission-service-denied srv)))))
-                         (%net-write-line stream reply)
-                         (dolist (b body) (%net-write-line stream b))
-                         (force-output stream)))))))
-           (serious-condition () nil))       ; a peer hanging up is the normal way this ends
-      (ignore-errors (when stream (close stream)))
-      (ignore-errors (sb-bsd-sockets:socket-close sock)))))
+;;; THE SERVICE IS ONE THREAD THAT OWNS EVERY CONNECTION.  On modus a thread may not hand an object
+;;; it made -- an accepted socket, a stream -- to another thread, and the stores are the owner's
+;;; anyway, so a thread per client would buy nothing but a copy.  %ADMISSION-MAIN, started on a
+;;; named function with the service and the listener as its arguments (both made on the owner),
+;;; accepts, reads request lines from whichever connection has one, and asks the OWNER to answer
+;;; each (%ADMISSION-ANSWER, define-owned: parsing and the verbs run there, so a peer's words are
+;;; never interned off the owner).  Answers are serial, as the stores are.  A connection idle for
+;;; *ADMISSION-IDLE* seconds, or sending a line longer than 8192 bytes, is dropped.
+
+(defparameter *admission-idle* 30
+  "Seconds a connection may sit with nothing to say before the service drops it.")
+
+(defparameter *admission-max-connections* 64)
+
+(define-owned %admission-answer (line)
+  "The reply line and body lines for one request LINE."
+  (multiple-value-bind (verb params) (%net-params line)
+    (handler-case (admission-serve (or verb "") params)
+      (serious-condition (e) (%net-line :err :reason (%one-line e))))))
+
+(defun %net-word (line n)
+  "The Nth space-separated word of LINE, or NIL -- without interning anything."
+  (let ((words (remove "" (%split-on-space line) :test #'string=)))
+    (nth n words)))
+
+(defun %fd-readable-p (fd)
+  (and (integerp fd) (ignore-errors (sb-sys:wait-until-fd-usable fd :input 0))))
+
+(defun %admission-main (srv listener)
+  "The admission service's thread: accept on LISTENER, answer lines, until SRV stops running."
+  (let ((conns '())                    ; (socket stream fd bytes last-heard)
+        (lfd (ignore-errors (sb-bsd-sockets:socket-file-descriptor (listener-socket listener)))))
+    (labels ((drop (c)
+               (ignore-errors (close (second c)))
+               (ignore-errors (sb-bsd-sockets:socket-close (first c)))
+               (setf conns (remove c conns)))
+             (accept ()
+               (when (%fd-readable-p lfd)
+                 (let ((sock (ignore-errors (listener-accept listener))))
+                   (when sock
+                     (if (>= (length conns) *admission-max-connections*)
+                         (ignore-errors (sb-bsd-sockets:socket-close sock))
+                         (let ((stream (ignore-errors
+                                        (sb-bsd-sockets:socket-make-stream
+                                         sock :input t :output t
+                                         :element-type '(unsigned-byte 8) :buffering :full))))
+                           (if stream
+                               (push (list sock stream (sb-bsd-sockets:socket-file-descriptor sock)
+                                           (make-string-output-stream) (get-universal-time) 0)
+                                     conns)
+                               (ignore-errors (sb-bsd-sockets:socket-close sock)))))
+                     t))))
+             (answer (c line)
+               (multiple-value-bind (reply body)
+                   (handler-case (%admission-answer line)
+                     (serious-condition (e) (%net-line :err :reason (%one-line e))))
+                 (incf (admission-service-served srv))
+                 (when (equal (%net-word line 1) "admit")
+                   (if (equal (%net-word reply 1) "ok")
+                       (incf (admission-service-admitted srv))
+                       (incf (admission-service-denied srv))))
+                 (let ((s (second c)))
+                   (%net-write-line s reply)
+                   (dolist (b body) (%net-write-line s b))
+                   (force-output s))))
+             (service (c)
+               "Read what C has; answer each whole line.  NIL when C is done with."
+               (let ((s (second c)) (buf (fourth c)) (any nil))
+                 (handler-case
+                     (loop while (or (listen s) (and (not any) (%fd-readable-p (third c))))
+                           do (let ((b (read-byte s nil nil)))
+                                (setf any t)
+                                (cond ((null b) (return-from service nil))
+                                      ((= b 10)
+                                       (let ((line (get-output-stream-string buf)))
+                                         (setf (sixth c) 0)
+                                         (unless (zerop (length line)) (answer c line))))
+                                      ((= b 13))
+                                      ((>= (sixth c) 8192) (return-from service nil))
+                                      (t (incf (sixth c)) (write-char (code-char b) buf)))))
+                   (serious-condition () (return-from service nil)))
+                 (when any (setf (fifth c) (get-universal-time)))
+                 (< (- (get-universal-time) (fifth c)) *admission-idle*))))
+      (unwind-protect
+           (loop while (admission-service-running srv) do
+             (let ((busy (accept)))
+               (dolist (c (copy-list conns))
+                 (let ((before (fifth c)))
+                   (unless (service c) (drop c))
+                   (unless (eql before (fifth c)) (setf busy t))))
+               (unless busy (sleep 0.01))))
+        (dolist (c (copy-list conns)) (drop c))))))
+
+(defun %owner-service-main (srv)
+  "START-ADMISSION-SERVICE :SERVICE :THREAD: serve the stores' owner while SRV runs (SBCL)."
+  (loop while (admission-service-running srv) do (nostr-owner-service 0.1)))
 
 (defun start-admission-service (&key (port *admission-port*) (address "127.0.0.1") path
-                                    (peer-policy *peer-policy*) (install t))
-  "Answer admission questions on PORT, forever.  Returns an ADMISSION-SERVICE, or NIL.
+                                    (peer-policy *peer-policy*) (install t)
+                                    (service #+modus :hook #-modus :thread))
+  "Answer admission questions on PORT (or the socket file PATH), until STOP-ADMISSION-SERVICE.
+Returns an ADMISSION-SERVICE, or NIL.  Call it on the stores' owner, the main thread: the
+listener is made here and the answers are given here (see `the stores' owner').
 
 REFUSES WITHOUT AN IDENTITY, and that refusal is load-bearing: a service answering with no box
 secret could neither verify a code nor mint one, so every code login would be denied while allowlist
 logins carried on — a half-working door, which is worse than a shut one.  A shut one is diagnosable
-in one line: the caller cannot connect."
+in one line: the caller cannot connect.
+
+SERVICE is who answers for the owner: :THREAD a thread of the service's own (SBCL's default), :HOOK
+or NIL the main thread's own loop through GLASS:RUN-OWNER-HOOKS (modus's default; SERVE-WM's
+listener runs them) or NOSTR-OWNER-SERVICE."
+  #+modus
+  (when (eq service :thread)
+    (format *error-output* "~&@@ admission: :SERVICE :THREAD cannot run on modus — service NOT started~%")
+    (finish-output *error-output*)
+    (return-from start-admission-service nil))
   (unless (box-identity-p)
     (format *error-output*
             "~&@@ admission: no box identity — set GLASS_NOSTR_SEC (64 hex) — service NOT started~%")
@@ -2006,24 +2237,32 @@ in one line: the caller cannot connect."
                :port (if path 0 port) :running t
                :socket listener)))
     (setf (admission-service-thread srv)
-          (sb-thread:make-thread
-           (lambda ()
-             (loop while (admission-service-running srv) do
-               (handler-case
-                   (let ((sock (listener-accept (admission-service-socket srv))))
-                     (sb-thread:make-thread (lambda () (%serve-admission-client srv sock))
-                                            :name "glass-admission-client"))
-                 (serious-condition () (sleep 0.2)))))
-           :name "glass-admission"))
+          (sb-thread:make-thread #'%admission-main :name "glass-admission"
+                                                   :arguments (list srv listener)))
+    (when (eq service :thread)
+      (setf (admission-service-service-thread srv)
+            (sb-thread:make-thread #'%owner-service-main :name "glass-nostr-owner"
+                                                         :arguments (list srv))))
     (when install (setf *session-admission-service* srv))
     srv))
 
 (defun stop-admission-service (&optional (srv *session-admission-service*))
+  "Stop SRV: its thread ends, closing every connection, and its listener is closed.  On the owner."
   (when srv
     (setf (admission-service-running srv) nil)
-    ;; CLOSE-LISTENER, not SOCKET-CLOSE: the accept loop is parked on this socket and a bare close
-    ;; leaves the kernel listening.  See GLASS:CLOSE-LISTENER — an admission service that believes
-    ;; it has stopped answering while it is still answering is the worst version of that bug.
+    (let ((th (admission-service-thread srv)))
+      (when (and th (not (eq th sb-thread:*current-thread*)))
+        (loop repeat 250 while (sb-thread:thread-alive-p th)
+              ;; the thread may be waiting on an answer from this very thread
+              do (nostr-owner-service 0.02))
+        (unless (sb-thread:thread-alive-p th) (ignore-errors (sb-thread:join-thread th :default nil)))))
+    (let ((th (admission-service-service-thread srv)))
+      (when (and th (not (eq th sb-thread:*current-thread*)))
+        (loop repeat 250 while (sb-thread:thread-alive-p th) do (sleep 0.02))
+        (unless (sb-thread:thread-alive-p th) (ignore-errors (sb-thread:join-thread th :default nil)))))
+    ;; CLOSE-LISTENER, not SOCKET-CLOSE: a bare close can leave the kernel listening.  See
+    ;; GLASS:CLOSE-LISTENER — an admission service that believes it has stopped answering while it
+    ;; is still answering is the worst version of that bug.
     (ignore-errors (close-listener (admission-service-socket srv)))
     (when (eq srv *session-admission-service*) (setf *session-admission-service* nil)))
   t)
@@ -2036,6 +2275,7 @@ in one line: the caller cannot connect."
               (admission-service-admitted srv) (admission-service-denied srv)
               (enrolment-count) (length *nostr-allow*))))
 
+
 ;;; ---- the client's end --------------------------------------------------------
 ;;;
 ;;; The other half of the same thin thing, carried here for the reason MAKE-AUDIO-TAP is carried in
@@ -2046,6 +2286,15 @@ in one line: the caller cannot connect."
 ;;; EVERY ONE OF THEM DISTINGUISHES `NO' FROM `NO ANSWER'.  A second value of :UNREACHABLE means the
 ;;; service could not be reached — that is what a caller's failure policy turns on, and conflating
 ;;; it with a denial is exactly how a fail-closed door becomes a fail-open one.
+
+(defun %await-answer (sock seconds)
+  "Wait up to SECONDS for SOCK to have something to read.  ON THE MAIN THREAD THE WAIT RUNS THE
+OWNER HOOKS: the service in this image answers through the stores' owner, which is this thread, so
+a question asked here would otherwise wait for itself."
+  (let ((fd (ignore-errors (sb-bsd-sockets:socket-file-descriptor sock)))
+        (end (+ (get-internal-real-time) (round (* seconds internal-time-units-per-second)))))
+    (loop until (or (not (integerp fd)) (%fd-readable-p fd) (>= (get-internal-real-time) end))
+          do (if (sb-thread:main-thread-p) (run-owner-hooks) (sleep 0.005)))))
 
 (defun admission-request (verb &rest params &key host port path &allow-other-keys)
   "Ask the admission service one question.  Returns (values STATUS PLIST BODY), where STATUS is
@@ -2066,6 +2315,7 @@ identical — it is a request line and an answer line, and it never knew what ca
                                   :timeout *admission-timeout*))
                (%net-write-line stream (apply #'%net-line verb params))
                (force-output stream)
+               (%await-answer sock *admission-timeout*)
                (let ((line (or (%net-read-line stream) (error "no answer"))))
                  (multiple-value-bind (status plist) (%net-params line)
                    (let* ((rows (or (ignore-errors (parse-integer (getf plist :rows))) 0))
@@ -2259,12 +2509,12 @@ live credential minted for a request nobody made.")
 ;;;     owner --(:reply sender text at what)--> bot --(:publish json what ...)--> owner -> relays
 ;;;     bot --(:log text)--> owner          every log line is written by the owner
 ;;;
-;;; WHY THE POOL IS NOT THE BOT THREAD'S.  The obvious shape -- the bot thread makes the pool,
-;;; subscribes with :DELIVER :PUMP and pumps -- cannot run on modus with cl-nostr as it is: a relay
-;;; made off the main thread is stored into cl-nostr's process-wide registry (*RELAYS-BY-ID*,
-;;; *OPEN-RELAYS*), which modus refuses, and its state vector, handed to its I/O thread as an
-;;; argument, arrives there as a COPY, so the relay never reads as connected.  Both measured.  The
-;;; owner has to answer commands in any case, so the owner holding the pool costs nothing more.
+;;; WHY THE POOL IS THE OWNER'S AND NOT THE BOT THREAD'S.  cl-nostr would let the bot thread own
+;;; one (CL-NOSTR.RELAY:WITH-RELAY-OWNER), but the commands are answered on the owner whatever holds
+;;; the pool -- `link' and `revoke' write the stores, which are the main thread's -- and the owner
+;;; publishes what it answers, so the pool lives where its replies are published and its OKs are
+;;; pumped (CL-NOSTR.POOL:POOL-PUMP, which on SBCL also lets a :THREAD service pump relays the owner
+;;; made).
 ;;;
 ;;; COUNTERS are fixnums in a vector the owner made; each slot has ONE writer (received and ignored
 ;;; the bot thread, answered and denied the owner), so they need no lock and NOSTR-BOT-REPORT reads
@@ -2289,7 +2539,7 @@ live credential minted for a request nobody made.")
   to-bot                                       ; channel: owner and delivery -> bot thread
   from-bot                                     ; channel: bot thread -> owner
   thread                                       ; the bot thread
-  service                                      ; :THREAD / :HOOK / NIL
+  service-mode                                 ; :THREAD / :HOOK / NIL
   service-thread
   subscription
   log)
@@ -2439,13 +2689,15 @@ many messages it handled."
   (if (null bot)
       0
       (let ((end (+ (get-internal-real-time) (round (* timeout internal-time-units-per-second))))
-            (n 0))
+            (n 0)
+            (*serving-store* sb-thread:*current-thread*))               ; answering commands IS the stores' owner's work
         (loop
+          (incf n (nostr-owner-service 0))
           (loop (multiple-value-bind (m ok) (bobbin:channel-try-receive (nostr-bot-from-bot bot))
                   (unless ok (return))
                   (incf n)
                   (ignore-errors (%bot-owner-message bot m))))
-          (incf n (or (ignore-errors (cl-nostr.relay:pump 0)) 0))
+          (incf n (or (ignore-errors (cl-nostr.pool:pool-pump (nostr-bot-pool bot) 0)) 0))
           (let ((left (/ (- end (get-internal-real-time)) internal-time-units-per-second)))
             (when (<= left 0) (return n))
             (multiple-value-bind (m ok)
@@ -2494,7 +2746,7 @@ still a desktop, and a desktop that did not start is not."
                (counts (make-array 4 :initial-element 0)))
           (setf bot (%make-nostr-bot :keypair kp :pubkey pub :npub (box-npub) :relays relays
                                      :running t :log log :counts counts
-                                     :to-bot to-bot :from-bot from-bot :service service))
+                                     :to-bot to-bot :from-bot from-bot :service-mode service))
           (setf (nostr-bot-thread bot)
                 (sb-thread:make-thread #'%bot-main :name "glass-nostr-bot"
                                        :arguments (list *box-secret* to-bot from-bot counts
@@ -2640,7 +2892,8 @@ with no identity rather than serving as nobody.  Returns (values SERVICE BOT)."
                      @@   every issued login link and every enrolled device stops verifying.~%")
           (finish-output *error-output*)
           (return-from start-session-nostr (values nil nil)))
-        (let ((srv (start-admission-service :port port :address address :path path))
+        (let ((srv (start-admission-service :port port :address address :path path
+                                               :service service))
               (b (and bot (start-nostr-bot :relays relays :service service))))
           (format *error-output* "~&@@ admission on ~a — box ~a, ~a enrolled, ~a allowed~%"
                   (endpoint-string :host address :port port :path path)
