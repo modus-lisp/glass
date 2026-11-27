@@ -2230,6 +2230,54 @@ already names relays is left alone."
 reconnect, so without this a restart re-answers old commands — and `link' answered twice is a second
 live credential minted for a request nobody made.")
 
+;;; ---- who runs what ------------------------------------------------------------------
+;;;
+;;; THREADS SHARE NOTHING (they must not on modus, and on SBCL nothing gains from it), so the bot
+;;; is three parties, each holding only what it made, talking over bobbin channels that copy what
+;;; they carry:
+;;;
+;;;   THE OWNER -- the thread that called START-NOSTR-BOT.  It holds the pool and the bot struct,
+;;;     and it is the one place commands are ANSWERED, because answering touches this file's stores
+;;;     (`link' mints into *LOGIN-CODES*, `revoke' rewrites the enrolments), which belong to the
+;;;     thread that made them -- on modus the main thread, the only one whose objects others may
+;;;     hold.  It publishes the replies and runs their :ON-OK, so it PUMPS: NOSTR-BOT-SERVICE is
+;;;     one turn of its duties.  WHO calls it is START-NOSTR-BOT's :SERVICE --
+;;;       :THREAD  a thread of the bot's own loops it (SBCL's default: the owner's stores take
+;;;                locks, so any thread may do the owner's work there, as the bot always did);
+;;;       :HOOK    the owner's own loop does, through GLASS:RUN-OWNER-HOOKS -- which
+;;;                GLASS-REPL:RUN-LISTENER, SERVE-WM's main thread, calls every turn (modus's
+;;;                default: a worker may not mint into the main thread's store);
+;;;       NIL      the caller does, by calling NOSTR-BOT-SERVICE or NOSTR-BOT-RUN itself.
+;;;   THE BOT THREAD -- %BOT-MAIN, started on a named function with plain arguments (the secret,
+;;;     its channels, a vector of counters).  It does what is slow and touches nothing shared: it
+;;;     de-duplicates (its own seen-set), UNWRAPS (seconds of ECDH on a Zero, which must not hold
+;;;     up the owner's REPL), applies the age guard, asks the owner for an answer, and WRAPS it.
+;;;   THE DELIVERY THREAD -- cl-nostr's, for the subscription (:DELIVER :THREAD).  It hands each
+;;;     wrap to the bot thread as JSON text and does nothing else.
+;;;
+;;;     relay -> delivery --(:wrap json)--> bot --(:ask sender payload at)--> owner
+;;;     owner --(:reply sender text at what)--> bot --(:publish json what ...)--> owner -> relays
+;;;     bot --(:log text)--> owner          every log line is written by the owner
+;;;
+;;; WHY THE POOL IS NOT THE BOT THREAD'S.  The obvious shape -- the bot thread makes the pool,
+;;; subscribes with :DELIVER :PUMP and pumps -- cannot run on modus with cl-nostr as it is: a relay
+;;; made off the main thread is stored into cl-nostr's process-wide registry (*RELAYS-BY-ID*,
+;;; *OPEN-RELAYS*), which modus refuses, and its state vector, handed to its I/O thread as an
+;;; argument, arrives there as a COPY, so the relay never reads as connected.  Both measured.  The
+;;; owner has to answer commands in any case, so the owner holding the pool costs nothing more.
+;;;
+;;; COUNTERS are fixnums in a vector the owner made; each slot has ONE writer (received and ignored
+;;; the bot thread, answered and denied the owner), so they need no lock and NOSTR-BOT-REPORT reads
+;;; them from anywhere.
+
+(defconstant +bot-received+ 0)
+(defconstant +bot-answered+ 1)
+(defconstant +bot-denied+ 2)
+(defconstant +bot-ignored+ 3)
+
+(defparameter *bot-channel-bytes* (* 2 1024 1024)
+  "Capacity of each of the bot's channels.  A wrap is a few KB; this holds a backlog with room.")
+
 (defstruct (nostr-bot (:constructor %make-nostr-bot))
   pool
   keypair
@@ -2237,17 +2285,24 @@ live credential minted for a request nobody made.")
   npub
   (relays '())
   (running nil)
-  (lock (sb-thread:make-mutex :name "glass-nostr-bot"))
-  (seen (make-hash-table :test 'equal))
-  (received 0 :type fixnum)
-  (answered 0 :type fixnum)
-  (denied 0 :type fixnum)
-  (ignored 0 :type fixnum)
+  (counts (make-array 4 :initial-element 0))   ; fixnums: see +BOT-RECEIVED+ ...
+  to-bot                                       ; channel: owner and delivery -> bot thread
+  from-bot                                     ; channel: bot thread -> owner
+  thread                                       ; the bot thread
+  service                                      ; :THREAD / :HOOK / NIL
+  service-thread
+  subscription
   log)
+
+(defun nostr-bot-received (bot) (svref (nostr-bot-counts bot) +bot-received+))
+(defun nostr-bot-answered (bot) (svref (nostr-bot-counts bot) +bot-answered+))
+(defun nostr-bot-denied (bot) (svref (nostr-bot-counts bot) +bot-denied+))
+(defun nostr-bot-ignored (bot) (svref (nostr-bot-counts bot) +bot-ignored+))
 
 (defvar *session-nostr-bot* nil "The DM bot this image is running, if any.")
 
 (defun %bot-say (bot fmt &rest args)
+  "Log one line, on the owner."
   (let ((log (nostr-bot-log bot))
         (msg (apply #'format nil fmt args)))
     (ignore-errors
@@ -2255,40 +2310,20 @@ live credential minted for a request nobody made.")
          (funcall log msg)
          (progn (format *error-output* "~&[nostr] ~a~%" msg) (finish-output *error-output*))))))
 
-(defun %bot-seen-p (bot id)
-  "T if this wrap has already been handled.  Also the fan-out deduplicator."
-  (when id
-    (sb-thread:with-mutex ((nostr-bot-lock bot))
-      (let ((seen (nostr-bot-seen bot)))
-        (prog1 (gethash id seen)
-          ;; Flushed wholesale at a bound rather than aged out one at a time: what that briefly
-          ;; reopens is a duplicate reply to a command sent in the last few minutes, and the
-          ;; alternative costs a timestamp per entry forever.  The age guard covers the rest.
-          (when (> (hash-table-count seen) 4096) (clrhash seen))
-          (setf (gethash id seen) t))))))
-
-(defun %bot-count (bot slot)
-  (sb-thread:with-mutex ((nostr-bot-lock bot))
-    (ecase slot
-      (:received (incf (nostr-bot-received bot)))
-      (:answered (incf (nostr-bot-answered bot)))
-      (:denied (incf (nostr-bot-denied bot)))
-      (:ignored (incf (nostr-bot-ignored bot))))))
-
 (defun %bot-publish (bot wrap what)
   "Publish WRAP on BOT's relays, and log what each relay did with it: one line per relay that
 answers, saying ACCEPTED or REJECTED with the relay's own reason.  Returns the urls of the relays
-it was handed to -- NIL when none was connected, which is said out loud too.
+it was handed to -- NIL when none was connected, which is said out loud too.  On the owner.
 
 POOL-PUBLISH IS FIRE AND FORGET, and the bot's log used to say `-> replied' on the strength of it.
 A reply a relay refused (rate limit, clock skew, policy), or that went to a relay whose socket had
 died, read exactly like one that was delivered -- so `the box said it replied and nothing came' had
 nowhere to be diagnosed from.  The relay's OK is the only evidence an event was published (see
 CL-NOSTR.POOL:POOL-PUBLISH-SYNC); this waits for nothing, it only writes the evidence down when it
-arrives.  WHAT names the message in those lines."
+arrives -- which is when the owner next pumps (NOSTR-BOT-SERVICE).  WHAT names the message."
   (let* ((pool (nostr-bot-pool bot))
          (id8 (subseq (or (ignore-errors (cl-nostr.event:event-id wrap)) "????????") 0 8))
-         (live (loop for relay in (cl-nostr.pool::%relays pool)
+         (live (loop for relay in (cl-nostr.pool:pool-relays pool)
                      when (cl-nostr.relay:relay-connected-p relay)
                        collect (cl-nostr.relay:relay-url relay))))
     (cl-nostr.pool:pool-publish
@@ -2301,47 +2336,140 @@ arrives.  WHAT names the message in those lines."
       (%bot-say bot "~a (~a): NOT SENT — no relay is connected" what id8))
     live))
 
-(defun %bot-handle (bot wrap)
-  "One gift wrap.  Never signals: a bad DM is a log line, not a bot that stops listening."
-  (handler-case
-      (unless (%bot-seen-p bot (ignore-errors (cl-nostr.event:event-id wrap)))
-        (multiple-value-bind (payload sender rumor-at)
-            (cl-nostr.nip59:unwrap-giftwrap (nostr-bot-keypair bot) wrap)
-          (%bot-count bot :received)
-          (multiple-value-bind (reply verb role) (nostr-command-reply sender payload)
-            (cond
-              ;; Not a command: an SDP offer, or somebody's chatter.  The gateway answers offers;
-              ;; this file has no opinion about them and says nothing at all.
-              ((null verb) (%bot-count bot :ignored))
-              ((and (integerp rumor-at) (plusp rumor-at)
-                    (> (- (unix-now) rumor-at) *nostr-command-max-age*))
-               (%bot-count bot :ignored)
-               (%bot-say bot "~(~a~) from ~a… is ~ds old — ignored (backlog replay)"
-                         verb (subseq sender 0 8) (- (unix-now) rumor-at)))
-              ((or (null reply) (eq reply :denied))
-               (%bot-count bot :denied)
-               ;; NO REPLY.  Silence is the denial: an answer would tell an unknown sender that this
-               ;; box exists, is listening, and understood them.
-               (%bot-say bot "~(~a~) DENIED ~a… (~:[not authorised~;device: management is allowlist-only~])"
-                         verb (subseq sender 0 8) (eq role :device)))
-              (t
-               (let ((via (%bot-publish
-                           bot
-                           ;; :AFTER — stamp the reply strictly later than the DM it answers.  We
-                           ;; often reply inside the same second and the box's clock need not agree
-                           ;; with the phone's; either way the answer would otherwise sort ABOVE the
-                           ;; question in the recipient's client, which reads as the box talking to
-                           ;; itself.
-                           (cl-nostr.nip59:build-giftwrap (nostr-bot-keypair bot) sender reply
-                                                          :after rumor-at)
-                           (format nil "~(~a~) reply to ~a…" verb (subseq sender 0 8)))))
-                 (%bot-count bot :answered)
-                 (%bot-say bot "~(~a~) from ~a… (~(~a~)) -> replied~:[ — but NO relay was connected~; via ~:*~{~a~^, ~}~]"
-                           verb (subseq sender 0 8) (or role :unknown) via)))))))
-    (serious-condition (e) (%bot-say bot "dm: ~a" e))))
+;;; ---- the bot thread -----------------------------------------------------------------
 
-(defun start-nostr-bot (&key (relays *nostr-relays*) log (install t))
+(defun %bot-tell (ch message)
+  (ignore-errors (bobbin:channel-send ch message :timeout 5)))
+
+(defun %bot-handle (keypair seen counts max-age wrap-json out)
+  "One gift wrap, on the bot thread.  SEEN is its own wrap-id set.  Never signals: a bad DM is a
+log line, not a bot that stops listening."
+  (flet ((say (fmt &rest args) (%bot-tell out (list :log (apply #'format nil fmt args)))))
+    (handler-case
+        (let* ((wrap (cl-nostr.event:json->event wrap-json))
+               (id (ignore-errors (cl-nostr.event:event-id wrap))))
+          (unless (and id (gethash id seen))
+            (when id
+              ;; Flushed wholesale at a bound rather than aged out one at a time: what that briefly
+              ;; reopens is a duplicate reply to a command sent in the last few minutes, and the
+              ;; alternative costs a timestamp per entry forever.  The age guard covers the rest.
+              (when (> (hash-table-count seen) 4096) (clrhash seen))
+              (setf (gethash id seen) t))
+            (multiple-value-bind (payload sender rumor-at)
+                (cl-nostr.nip59:unwrap-giftwrap keypair wrap)
+              (incf (svref counts +bot-received+))
+              (let ((verb (parse-nostr-command payload)))
+                (cond
+                  ;; Not a command: an SDP offer, or somebody's chatter.  The gateway answers
+                  ;; offers; this file has no opinion about them and says nothing at all.
+                  ((null verb) (incf (svref counts +bot-ignored+)))
+                  ((and (integerp rumor-at) (plusp rumor-at)
+                        (> (- (unix-now) rumor-at) max-age))
+                   (incf (svref counts +bot-ignored+))
+                   (say "~(~a~) from ~a… is ~ds old — ignored (backlog replay)"
+                        verb (subseq sender 0 8) (- (unix-now) rumor-at)))
+                  (t (%bot-tell out (list :ask sender payload rumor-at))))))))
+      (serious-condition (e) (say "dm: ~a" e)))))
+
+(defun %bot-wrap (keypair sender reply rumor-at what out)
+  "Wrap REPLY for SENDER and hand it to the owner to publish."
+  (handler-case
+      (%bot-tell out (list :publish
+                           (cl-nostr.event:event->json
+                            ;; :AFTER — stamp the reply strictly later than the DM it answers.  We
+                            ;; often reply inside the same second and the box's clock need not agree
+                            ;; with the phone's; either way the answer would otherwise sort ABOVE the
+                            ;; question in the recipient's client, which reads as the box talking to
+                            ;; itself.
+                            (cl-nostr.nip59:build-giftwrap keypair sender reply :after rumor-at))
+                           what))
+    (serious-condition (e) (%bot-tell out (list :log (format nil "~a: could not wrap: ~a" what e))))))
+
+(defun %bot-main (secret in out counts max-age)
+  "The bot thread: wraps arrive on IN (from the delivery thread) and so do the owner's replies;
+everything for the owner goes to OUT.  Ends on (:STOP)."
+  (let ((keypair (cl-nostr.keys:keypair-from-secret secret))
+        (seen (make-hash-table :test 'equal)))
+    (loop
+      (multiple-value-bind (m ok) (bobbin:channel-receive in :timeout 1)
+        (when ok
+          (case (first m)
+            (:stop (return :stopped))
+            (:wrap (%bot-handle keypair seen counts max-age (second m) out))
+            (:reply (destructuring-bind (sender reply rumor-at what) (rest m)
+                      (%bot-wrap keypair sender reply rumor-at what out)))))))))
+
+;;; ---- the owner ----------------------------------------------------------------------
+
+(defun %bot-answer (bot sender payload rumor-at)
+  "Answer one command, on the owner: the only place this file's stores are written from."
+  (multiple-value-bind (reply verb role) (nostr-command-reply sender payload)
+    (cond
+      ((null verb) nil)
+      ((or (null reply) (eq reply :denied))
+       (incf (svref (nostr-bot-counts bot) +bot-denied+))
+       ;; NO REPLY.  Silence is the denial: an answer would tell an unknown sender that this box
+       ;; exists, is listening, and understood them.
+       (%bot-say bot "~(~a~) DENIED ~a… (~:[not authorised~;device: management is allowlist-only~])"
+                 verb (subseq sender 0 8) (eq role :device)))
+      (t
+       (%bot-tell (nostr-bot-to-bot bot)
+                  (list :reply sender reply rumor-at
+                        (format nil "~(~a~) reply to ~a… (~(~a~))" verb (subseq sender 0 8)
+                                (or role :unknown))))))))
+
+(defun %bot-owner-message (bot m)
+  (case (first m)
+    (:log (%bot-say bot "~a" (second m)))
+    (:ask (when (nostr-bot-running bot)
+            (destructuring-bind (sender payload rumor-at) (rest m)
+              (handler-case (%bot-answer bot sender payload rumor-at)
+                (serious-condition (e) (%bot-say bot "command from ~a…: ~a" (subseq sender 0 8) e))))))
+    (:publish (destructuring-bind (json what) (rest m)
+                (let ((via (%bot-publish bot (cl-nostr.event:json->event json) what)))
+                  (incf (svref (nostr-bot-counts bot) +bot-answered+))
+                  (%bot-say bot "~a -> replied~:[ — but NO relay was connected~; via ~:*~{~a~^, ~}~]"
+                            what via))))))
+
+(defun nostr-bot-service (&optional (bot *session-nostr-bot*) (timeout 0))
+  "One turn of the bot's owner: answer what the bot thread asks, publish what it wrapped, and pump
+the pool so the relays' OKs are logged -- for up to TIMEOUT seconds (0: what is waiting now).  Call
+it on the thread that started the bot (or let START-NOSTR-BOT's :SERVICE call it).  Returns how
+many messages it handled."
+  (if (null bot)
+      0
+      (let ((end (+ (get-internal-real-time) (round (* timeout internal-time-units-per-second))))
+            (n 0))
+        (loop
+          (loop (multiple-value-bind (m ok) (bobbin:channel-try-receive (nostr-bot-from-bot bot))
+                  (unless ok (return))
+                  (incf n)
+                  (ignore-errors (%bot-owner-message bot m))))
+          (incf n (or (ignore-errors (cl-nostr.relay:pump 0)) 0))
+          (let ((left (/ (- end (get-internal-real-time)) internal-time-units-per-second)))
+            (when (<= left 0) (return n))
+            (multiple-value-bind (m ok)
+                (bobbin:channel-receive (nostr-bot-from-bot bot) :timeout (min left 0.05))
+              (when ok (incf n) (ignore-errors (%bot-owner-message bot m)))))))))
+
+(defun nostr-bot-run (&optional (bot *session-nostr-bot*))
+  "Be BOT's owner until it stops: NOSTR-BOT-SERVICE in a loop.  For a headless launcher whose main
+thread has nothing else to do (START-NOSTR-BOT :SERVICE NIL, then this)."
+  (loop while (and bot (nostr-bot-running bot)) do (nostr-bot-service bot 0.25)))
+
+(defun %bot-service-main (bot)
+  "The :THREAD service: the owner's duties on a thread of their own (SBCL)."
+  (nostr-bot-run bot))
+
+(defun start-nostr-bot (&key (relays *nostr-relays*) log (install t)
+                             (service #+modus :hook #-modus :thread))
   "Listen as this box and answer command DMs.  Returns a NOSTR-BOT, or NIL if it cannot.
+
+The calling thread is the bot's OWNER (see `who runs what' above; on modus, call this on the main
+thread).  SERVICE says who does the owner's work: :THREAD a thread of its own, :HOOK the owner's own
+loop through GLASS:RUN-OWNER-HOOKS (SERVE-WM's listener calls them), NIL whoever calls
+NOSTR-BOT-SERVICE.  LOG, a function of one string, gets every log line (on the owner), else
+*ERROR-OUTPUT* does.
 
 Deliberately total, for the reason START-SESSION-AUDIO is: a desktop that cannot reach a relay is
 still a desktop, and a desktop that did not start is not."
@@ -2349,39 +2477,90 @@ still a desktop, and a desktop that did not start is not."
     (format *error-output* "~&@@ nostr: no box identity — set GLASS_NOSTR_SEC — bot NOT started~%")
     (finish-output *error-output*)
     (return-from start-nostr-bot nil))
-  (handler-case
-      (let* ((kp (cl-nostr.keys:keypair-from-secret *box-secret*))
-             (pub (string-downcase (cl-nostr.keys:public-hex kp)))
-             (pool (cl-nostr.pool:make-pool relays))
-             (bot (%make-nostr-bot :pool pool :keypair kp :pubkey pub :npub (box-npub)
-                                   :relays relays :running t :log log)))
-        (cl-nostr.pool:pool-subscribe
-         pool
-         ;; :LIMIT caps the initial backlog — this pubkey has days of old wraps on the relays.
-         ;; Live DMs still stream after EOSE.  :SINCE: only the last 48 hours, the customary
-         ;; NIP-59 window (a wrap is back-dated by up to two days, so a live one is inside it);
-         ;; anything older is a decrypt (seconds, on a Zero) of a command we would ignore.
-         (list (cl-nostr.filter:make-filter :kinds '(1059)
-                                            :tags (list (cons "p" (list pub)))
-                                            :since (- (unix-now) 172800)
-                                            :limit 20))
-         :on-event (lambda (wrap relay)
-                     (declare (ignore relay))
-                     (when (nostr-bot-running bot) (%bot-handle bot wrap))))
-        (when install (setf *session-nostr-bot* bot))
-        bot)
-    (serious-condition (e)
-      (ignore-errors
-       (format *error-output* "~&@@ nostr: bot unavailable (~a) — no DM command surface~%" e)
-       (finish-output *error-output*))
-      nil)))
+  #+modus
+  (when (eq service :thread)
+    ;; the owner's work writes this file's stores and the caller's log: on modus only the thread
+    ;; that made them may, so a thread of the bot's own cannot do it
+    (format *error-output* "~&@@ nostr: :SERVICE :THREAD cannot run on modus (the owner's work must ~
+                            run on the owner) — use :HOOK or NIL — bot NOT started~%")
+    (finish-output *error-output*)
+    (return-from start-nostr-bot nil))
+  (let ((bot nil))
+    (handler-case
+        (let* ((kp (cl-nostr.keys:keypair-from-secret *box-secret*))
+               (pub (string-downcase (cl-nostr.keys:public-hex kp)))
+               (to-bot (bobbin:make-channel :capacity *bot-channel-bytes* :name "glass nostr bot"))
+               (from-bot (bobbin:make-channel :capacity *bot-channel-bytes* :name "glass nostr owner"))
+               (counts (make-array 4 :initial-element 0)))
+          (setf bot (%make-nostr-bot :keypair kp :pubkey pub :npub (box-npub) :relays relays
+                                     :running t :log log :counts counts
+                                     :to-bot to-bot :from-bot from-bot :service service))
+          (setf (nostr-bot-thread bot)
+                (sb-thread:make-thread #'%bot-main :name "glass-nostr-bot"
+                                       :arguments (list *box-secret* to-bot from-bot counts
+                                                        *nostr-command-max-age*)))
+          (setf (nostr-bot-pool bot) (cl-nostr.pool:make-pool relays))
+          (setf (nostr-bot-subscription bot)
+                (cl-nostr.pool:pool-subscribe
+                 (nostr-bot-pool bot)
+                 ;; :LIMIT caps the initial backlog — this pubkey has days of old wraps on the
+                 ;; relays.  Live DMs still stream after EOSE.  :SINCE: only the last 48 hours, the
+                 ;; customary NIP-59 window (a wrap is back-dated by up to two days, so a live one is
+                 ;; inside it); anything older is a decrypt (seconds, on a Zero) of a command we
+                 ;; would ignore.
+                 (list (cl-nostr.filter:make-filter :kinds '(1059)
+                                                    :tags (list (cons "p" (list pub)))
+                                                    :since (- (unix-now) 172800)
+                                                    :limit 20))
+                 ;; On the subscription's delivery thread: hand the wrap on, change nothing.
+                 :on-event (lambda (wrap relay)
+                             (declare (ignore relay))
+                             (ignore-errors
+                              (bobbin:channel-send to-bot (list :wrap (cl-nostr.event:event->json wrap))
+                                                   :timeout 1)))
+                 :deliver :thread))
+          (ecase service
+            (:thread (setf (nostr-bot-service-thread bot)
+                           (sb-thread:make-thread #'%bot-service-main :name "glass-nostr-owner"
+                                                                      :arguments (list bot))))
+            (:hook (add-owner-hook bot (lambda () (nostr-bot-service bot 0))))
+            ((nil) nil))
+          (when install (setf *session-nostr-bot* bot))
+          bot)
+      (serious-condition (e)
+        (when bot (ignore-errors (stop-nostr-bot bot)))
+        (ignore-errors
+         (format *error-output* "~&@@ nostr: bot unavailable (~a) — no DM command surface~%" e)
+         (finish-output *error-output*))
+        nil))))
+
+(defun %join-within (thread seconds)
+  "Join THREAD if it ends within SECONDS; T if it did."
+  (when (and thread (not (eq thread sb-thread:*current-thread*)))
+    (loop repeat (round (* seconds 50))
+          while (sb-thread:thread-alive-p thread)
+          do (sleep 0.02))
+    (unless (sb-thread:thread-alive-p thread)
+      (ignore-errors (sb-thread:join-thread thread :default nil))
+      t)))
 
 (defun stop-nostr-bot (&optional (bot *session-nostr-bot*))
+  "Stop BOT: its subscription and relays, its thread, and whatever serviced it.  Call it on the
+owner (or from the :THREAD service's own Lisp, on SBCL).  Returns T."
   (when bot
     (setf (nostr-bot-running bot) nil)
-    (ignore-errors (cl-nostr.pool:close-pool (nostr-bot-pool bot)))
+    (remove-owner-hook bot)
+    (ignore-errors (when (nostr-bot-pool bot) (cl-nostr.pool:close-pool (nostr-bot-pool bot))))
+    (when (nostr-bot-to-bot bot) (%bot-tell (nostr-bot-to-bot bot) (list :stop)))
+    (%join-within (nostr-bot-thread bot) 5)
+    (%join-within (nostr-bot-service-thread bot) 5)
     (when (eq bot *session-nostr-bot*) (setf *session-nostr-bot* nil)))
   t)
+
+(defun nostr-bot-stopped-p (bot)
+  "T once every thread BOT started has ended."
+  (notany (lambda (th) (and th (sb-thread:thread-alive-p th)))
+          (list (nostr-bot-thread bot) (nostr-bot-service-thread bot))))
 
 (defun %session-name-for-dm ()
   "The name this desktop wears in its corner, for a DM to say WHICH desktop -- or NIL while it
@@ -2443,9 +2622,11 @@ still has the generic default, which would name nothing."
 ;;; ---- the one line a desktop startup script wants ------------------------------
 
 (defun start-session-nostr (&key (port *admission-port*) (address "127.0.0.1") path
-                                 (relays *nostr-relays*) (bot t))
+                                 (relays *nostr-relays*) (bot t)
+                                 (service #+modus :hook #-modus :thread))
   "Everything this desktop needs to own its own identity: the allowlist read, the enrolment store
-loaded, the admission service on PORT, and the DM command bot on RELAYS.
+loaded, the admission service on PORT, and the DM command bot on RELAYS (SERVICE as
+START-NOSTR-BOT's; the calling thread is the bot's owner).
 
 Deliberately total — a box that cannot reach a relay must still be a desktop — and it refuses loudly
 with no identity rather than serving as nobody.  Returns (values SERVICE BOT)."
@@ -2460,7 +2641,7 @@ with no identity rather than serving as nobody.  Returns (values SERVICE BOT)."
           (finish-output *error-output*)
           (return-from start-session-nostr (values nil nil)))
         (let ((srv (start-admission-service :port port :address address :path path))
-              (b (and bot (start-nostr-bot :relays relays))))
+              (b (and bot (start-nostr-bot :relays relays :service service))))
           (format *error-output* "~&@@ admission on ~a — box ~a, ~a enrolled, ~a allowed~%"
                   (endpoint-string :host address :port port :path path)
                   (or (box-npub) (box-pubkey)) (enrolment-count)

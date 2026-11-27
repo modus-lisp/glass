@@ -183,9 +183,11 @@
 
 (defun run-listener (l)
   "Serve REPL windows from this thread until STOP-LISTENER: evaluate each form a window sends,
-   one at a time, in the order sent."
+   one at a time, in the order sent -- and run GLASS:RUN-OWNER-HOOKS every turn, since this is
+   the main thread's loop."
   (loop
     (when (eq (listener-turn l) :stop) (return nil))
+    (glass:run-owner-hooks)                ; main's other duties: see GLASS:*OWNER-HOOKS*
     (glass::wake-wait (listener-wake l) 1/4)))
 
 (defun listener-interrupt (l)

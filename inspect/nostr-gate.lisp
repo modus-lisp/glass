@@ -1259,8 +1259,10 @@ wherever it matters, because the file is the half that survives a restart."
   (ok "with no relay connected, nothing is handed over -- and the log says NOT SENT"
       (and (null (glass::%bot-publish bot wrap "test reply"))
            (search "NOT SENT" (or (first said) ""))))
+  ;; a relay that has connected and is open, with no I/O thread: POOL-RELAYS is the members that
+  ;; have ever connected
   (setf (cl-nostr.relay::relay-connected-p relay) t
-        (cl-nostr.pool::pool-relays pool) (list relay)
+        (cl-nostr.pool::pool-members pool) (list relay)
         said '())
   (ok "with one connected, it is the relay the reply was handed to"
       (equal (glass::%bot-publish bot wrap "test reply") '("wss://relay.test")))

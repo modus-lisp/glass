@@ -24,7 +24,7 @@
    ;; server: (serve fb port &key on-key on-pointer on-resize name once wake)
    ;; naming things people say out loud (wordlist.lisp)
    #:word-name #:*wordlist*
-   #:serve #:serve-one #:serve-single #:serve-multi #:serve-endpoints #:make-rfb-endpoint #:endpoint-viewers #:*desktop-name* #:make-wake #:wake-signal
+   #:serve #:serve-one #:serve-single #:serve-multi #:serve-endpoints #:make-rfb-endpoint #:endpoint-viewers #:*desktop-name* #:make-wake #:wake-signal #:*owner-hooks* #:add-owner-hook #:remove-owner-hook #:run-owner-hooks
    ;; TRANSPORTS ARE NOT OURS ANY MORE.  Listeners, socket files, peer credentials and
    ;; the platform assumptions that come with them live in cl-transport now, beside DIAL
    ;; and EXPOSE, where "how do bytes travel" already lived.  None of it was ever about
@@ -155,6 +155,7 @@
    #:nostr-bot #:nostr-bot-p #:nostr-bot-report #:nostr-bot-pubkey #:nostr-bot-npub
    #:nostr-bot-received #:nostr-bot-answered #:nostr-bot-denied #:nostr-bot-ignored
    #:*session-nostr-bot* #:start-session-nostr #:send-login-link
+   #:nostr-bot-service #:nostr-bot-run #:nostr-bot-stopped-p
    ;; publishing the client this box hands out links to (the :glass/site system) — the OTHER half
    ;; of a login link, in the same image as the mint, because a URL carried between two processes
    ;; in an environment variable is a URL that freezes the day one of them moves

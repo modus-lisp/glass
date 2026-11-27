@@ -889,6 +889,28 @@ its bytes would land in the middle of a rect."
   (if w (sb-thread:with-mutex ((wake-lock w)) (sb-thread:condition-wait (wake-cv w) (wake-lock w) :timeout timeout))
       (sleep timeout)))
 
+;;; OWNER HOOKS: work that must run on the thread that owns some shared state, done between that
+;;; thread's own work.  On modus only the main thread's objects may be held by other threads, so
+;;; state everybody reads (the nostr bot's stores, say) is the main thread's to change, and a
+;;; service that changes it hands the change to main and has main do it.  Main's loop calls
+;;; RUN-OWNER-HOOKS: GLASS-REPL:RUN-LISTENER, which is SERVE-WM's main thread, does every turn.
+;;; Add and remove hooks on that thread.
+(defvar *owner-hooks* '()
+  "(KEY . FUNCTION) pairs; RUN-OWNER-HOOKS calls each FUNCTION with no arguments.")
+
+(defun add-owner-hook (key function)
+  "Have RUN-OWNER-HOOKS call FUNCTION, replacing any hook under KEY (compared with EQ)."
+  (setf *owner-hooks* (cons (cons key function) (remove key *owner-hooks* :key #'car)))
+  key)
+
+(defun remove-owner-hook (key)
+  (setf *owner-hooks* (remove key *owner-hooks* :key #'car))
+  key)
+
+(defun run-owner-hooks ()
+  "Call every owner hook once.  A hook that signals is skipped, not fatal."
+  (dolist (h *owner-hooks*) (ignore-errors (funcall (cdr h)))))
+
 (defun send-pending-cut-text (client s &optional (clipboard (session-clipboard)))
   "Tell this client about ITS SEAT's selection if it has changed since it last heard.
 

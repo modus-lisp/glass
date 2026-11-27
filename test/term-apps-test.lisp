@@ -136,6 +136,10 @@
     (glass-repl:stop-listener glass-repl:*listener*)
     (nreverse results)))
 
+(defvar *hook-turns* (make-array 1 :initial-element 0)
+  "How many times RUN-LISTENER ran the owner hook: on main, so a plain store.")
+(glass:add-owner-hook :term-apps-test (lambda () (incf (svref *hook-turns* 0))))
+
 (let* ((l (glass-repl:make-listener)))
   (setf glass-repl:*listener* l)
   (let ((th (sb-thread:make-thread 'compositor :arguments (list l) :name "test-compositor")))
@@ -152,6 +156,10 @@
           (check "the compositor thread finished" nil)))))
 
 (check "the DEFUN is in the image, callable from main" (eql (funcall 'cl-user::term-apps-sq 7) 49))
+(unless (equal (sb-ext:posix-getenv "GLASS_TEST_TURN") "1")
+  (check "RUN-LISTENER ran the owner hooks (main's other duties: the nostr bot's :HOOK service)"
+         (plusp (svref *hook-turns* 0))))
+(glass:remove-owner-hook :term-apps-test)
 (format t "~&TERM-APPS: ~:[FAIL (~d)~;PASS~]~%" (zerop *fails*) *fails*)
 (finish-output)
 #+sbcl (sb-ext:exit :code (if (zerop *fails*) 0 1))
