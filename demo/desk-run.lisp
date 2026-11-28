@@ -10,7 +10,10 @@
   (load (merge-pathnames "desk-load.lisp" (or *load-truename* *load-pathname*
                                               (uiop:getenv "DESK_DEMO_DIR")))))
 
-(defun cl-user::desk-env (name default) (let ((v (uiop:getenv name))) (if (and v (plusp (length v))) v default)))
+;; glass-desk.lisp (modus/scripts) defines its own, which reads its command-line flags first
+(unless (fboundp (quote cl-user::desk-env))
+  (defun cl-user::desk-env (name default)
+    (let ((v (uiop:getenv name))) (if (and v (plusp (length v))) v default))))
 
 (let* ((port (parse-integer (cl-user::desk-env "DESK_PORT" "5910")))
        (address (cl-user::desk-env "DESK_ADDRESS" "127.0.0.1"))

@@ -188,6 +188,19 @@ messages, pixels through the shared screen framebuffer -- so it runs where threa
   :serial t
   :components ((:module "src" :serial t :components ((:file "desk-serve")))))
 
+(asdf:defsystem :glass/web
+  :description "The desk in a web browser: an RFB endpoint OPENER that answers HTTP -- the desk's
+page and noVNC's files (vendored in glass-webrtc/novnc/) -- and carries RFB over an RFC 6455
+WebSocket at /websockify, as a Gray stream, so the RFB server itself is untouched.  natrium
+gives the handshake its SHA-1 and base64."
+  :version "0.0.1"
+  :author "ynniv"
+  :license "MIT"
+  :depends-on ("glass" "natrium")
+  :serial t
+  :components ((:module "src" :serial t :components ((:file "web")
+                                                     (:static-file "web/desk.html")))))
+
 (asdf:defsystem :glass/wm-core
   :description "glass.wm's window manager alone -- the chrome, the windows, the menus, the
 pointer and the tick -- with no server, no Lisp listener and no Terminal: what a host that draws
@@ -206,7 +219,7 @@ and one compositor thread that owns every window), so it runs on modus.  Coopera
 session of windows, a screen, pointer, focus, menu, clipboard and arrangement per person watching,
 each seat a loopback RFB port of its own by key (WM-SEAT-PORT); the home seat is PORT.  Its
 root menu adds a Lisp listener (glass/repl) and a Terminal (glass/term) to the desk's apps."
-  :depends-on ("glass/wm-core" "glass/text" "glass/desk-apps" "glass/term" "glass/repl")
+  :depends-on ("glass/wm-core" "glass/text" "glass/desk-apps" "glass/term" "glass/repl" "glass/web")
   :serial t
   :components ((:module "src/wm" :serial t :components ((:file "serve")))))
 

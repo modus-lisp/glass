@@ -428,8 +428,11 @@
 (defun write-rect-raw (s fb x y w h &optional fmt)
   (w-u16 s x) (w-u16 s y) (w-u16 s w) (w-u16 s h) (w-u32 s +enc-raw+)
   ;; modus: the pixels go straight through the socket's I/O page, one store each (no byte array)
+  ;; -- a socket's own stream only: a Gray stream (a WebSocket's, src/web.lisp) takes the byte
+  ;; path, as modus releases before the WebSocket desk signalled on one
   #+modus
-  (when (and (null fmt) (modus.runtime::%fs-write-pixel-rows s (fb-pixels fb) (fb-width fb) x y w h))
+  (when (and (null fmt) (not (typep s 'sb-gray:fundamental-stream))
+             (modus.runtime::%fs-write-pixel-rows s (fb-pixels fb) (fb-width fb) x y w h))
     (return-from write-rect-raw nil))
   (if fmt
       (let* ((px (fb-pixels fb)) (fw (fb-width fb)) (pb (pxfmt-pbytes fmt))
@@ -1410,7 +1413,11 @@ its bytes would land in the middle of a rect."
   "SERVE-MULTI's idle wait, in seconds: how long input can sit unread on a quiet desktop.")
 
 (defstruct (rfb-peer (:conc-name peer-))
-  stream fd conn client)
+  stream fd conn client
+  ;; POLL: may an fd that is readable stand for "this peer has input"?  Not for a stream that
+  ;; decodes what it reads (a WebSocket's): its fd being readable can mean a ping or half a
+  ;; frame, and a read would then block the network thread.  Such a stream's LISTEN answers.
+  (poll t))
 
 (defun %peer-input-p (peer)
   "Has PEER sent something?  A connection the client RESET answers T: LISTEN signals on it
@@ -1420,7 +1427,13 @@ its bytes would land in the middle of a rect."
   (handler-case
       (or (listen (peer-stream peer))
           (let ((fd (peer-fd peer)))
-            (and fd (sb-sys:wait-until-fd-usable fd :input 0))))
+            (and fd (peer-poll peer) (sb-sys:wait-until-fd-usable fd :input 0))))
+    (error () t)))
+
+(defun %stream-input-p (stream fd)
+  "Has STREAM (a socket stream, its descriptor FD) input waiting?  As %PEER-INPUT-P: an error
+   answers T, so the read that follows meets it."
+  (handler-case (or (listen stream) (and fd (sb-sys:wait-until-fd-usable fd :input 0)))
     (error () t)))
 
 (defun %listener-fd (listen)
@@ -1457,13 +1470,30 @@ its bytes would land in the middle of a rect."
   (name *desktop-name*) (password :inherit) clipboard
   (max-clients 16)
   (peers '())          ; the connections on this screen, in arrival order
-  (served 0))          ; connections accepted, ever
+  (served 0)           ; connections accepted, ever
+  ;; OPENER, if given, stands between accepting a connection and RFB: once the connection
+  ;; has sent something, (FUNCALL OPENER STREAM FD) on this thread returns the stream RFB is
+  ;; to speak over -- (values STREAM FD), FD the descriptor whose send queue is the backlog --
+  ;; or NIL when it handled the connection itself (and closed it).  A web endpoint's opener
+  ;; answers HTTP and upgrades /websockify to a WebSocket (src/web.lisp).  Until then the
+  ;; connection waits in PENDING, (STREAM FD . DEADLINE), and nothing blocks on it: a browser
+  ;; opens connections it may never use.
+  opener
+  (pending '()))
+
+(defparameter *opener-patience* 10
+  "Seconds an OPENER endpoint's connection may wait to say something before it is closed.")
+
+(defparameter *opener-max-pending* 32
+  "Connections an OPENER endpoint holds waiting at once; a further one is closed at once.")
 
 (defun endpoint-viewers (ep) "How many clients EP has right now." (length (ep-peers ep)))
 
 (defun %endpoint-close (ep)
   (dolist (peer (ep-peers ep)) (ignore-errors (close (peer-stream peer))))
   (setf (ep-peers ep) '())
+  (dolist (p (ep-pending ep)) (ignore-errors (close (first p))))
+  (setf (ep-pending ep) '())
   (ignore-errors (close-listener (ep-listen ep))))
 
 (defun serve-endpoints (endpoints-fn &key tick (interval 1/60) clients stop)
@@ -1481,6 +1511,24 @@ its bytes would land in the middle of a rect."
              (drop (ep peer)
                (ignore-errors (close (peer-stream peer)))
                (setf (ep-peers ep) (remove peer (ep-peers ep))))
+             (admit (ep stream fd poll)
+               ;; STREAM is a viewer of EP: RFB's handshake, then a peer of its screen
+               (let ((fb (ep-fb ep)))
+                 (if (>= (length (ep-peers ep)) (ep-max-clients ep))
+                     (ignore-errors (close stream))
+                     (let ((ok (ignore-errors (handshake fb stream (ep-name ep) (ep-password ep)))))
+                       (incf (ep-served ep))
+                       (if (not ok)
+                           (ignore-errors (close stream))
+                           (let* ((id (%next-conn-id))
+                                  (client (make-rfb-client
+                                           :id id :last-size (cons (fb-width fb) (fb-height fb))))
+                                  (conn (make-rfb-conn
+                                         :id id :post (lambda (m) (%rfb-apply client m fb)))))
+                             (setf (ep-peers ep)
+                                   (append (ep-peers ep)
+                                           (list (make-rfb-peer :stream stream :fd fd :poll poll
+                                                                :conn conn :client client))))))))))
              (finished-p ()
                (or (and stop (funcall stop))
                    (and clients (>= (served) clients) (every (lambda (ep) (null (ep-peers ep))) (eps))))))
@@ -1491,26 +1539,36 @@ its bytes would land in the middle of a rect."
                (dolist (ep (eps))
                  (when (and (accepting-p)
                             (sb-sys:wait-until-fd-usable (lfd ep) :input 0))
-                   (let ((stream (accept-stream (ep-listen ep))) (fb (ep-fb ep)))
+                   (let ((stream (accept-stream (ep-listen ep))))
                      (when stream
                        (setf busy t)
-                       (if (>= (length (ep-peers ep)) (ep-max-clients ep))
-                           (ignore-errors (close stream))
-                           (let ((ok (ignore-errors (handshake fb stream (ep-name ep) (ep-password ep)))))
-                             (incf (ep-served ep))
-                             (if (not ok)
-                                 (ignore-errors (close stream))
-                                 (let* ((id (%next-conn-id))
-                                        (client (make-rfb-client
-                                                 :id id :last-size (cons (fb-width fb) (fb-height fb))))
-                                        (conn (make-rfb-conn
-                                               :id id :post (lambda (m) (%rfb-apply client m fb)))))
-                                   (setf (ep-peers ep)
-                                         (append (ep-peers ep)
-                                                 (list (make-rfb-peer
-                                                        :stream stream
-                                                        :fd (ignore-errors (sb-sys:fd-stream-fd stream))
-                                                        :conn conn :client client))))))))))))
+                       (let ((fd (ignore-errors (sb-sys:fd-stream-fd stream))))
+                         (cond ((null (ep-opener ep)) (admit ep stream fd t))
+                               ((>= (length (ep-pending ep)) *opener-max-pending*)
+                                (ignore-errors (close stream)))
+                               (t (setf (ep-pending ep)
+                                        (append (ep-pending ep)
+                                                (list (list* stream fd
+                                                             (+ (get-internal-real-time)
+                                                                (* *opener-patience*
+                                                                   internal-time-units-per-second))))))))))))
+                 ;; an opener's connections that have spoken (or waited too long)
+                 (when (ep-pending ep)
+                   (let ((now (get-internal-real-time)))
+                     (dolist (p (ep-pending ep))
+                       (destructuring-bind (stream fd . deadline) p
+                         (cond ((%stream-input-p stream fd)
+                                (setf busy t
+                                      (ep-pending ep) (remove p (ep-pending ep)))
+                                (multiple-value-bind (rs rfd)
+                                    (handler-case (funcall (ep-opener ep) stream fd)
+                                      (error () nil))
+                                  (if rs
+                                      (admit ep rs rfd nil)
+                                      (ignore-errors (close stream)))))
+                               ((> now deadline)
+                                (setf (ep-pending ep) (remove p (ep-pending ep)))
+                                (ignore-errors (close stream)))))))))
                ;; 2. input, from every client that has some
                (dolist (ep (eps))
                  (dolist (peer (ep-peers ep))
@@ -1542,6 +1600,11 @@ its bytes would land in the middle of a rect."
                        (open (eps)))
                    (loop
                      (when (some (lambda (ep) (some #'%peer-input-p (ep-peers ep))) open) (return))
+                     (when (some (lambda (ep)
+                                   (some (lambda (p) (%stream-input-p (first p) (second p)))
+                                         (ep-pending ep)))
+                                 open)
+                       (return))
                      (when (and (accepting-p)
                                 (some (lambda (ep) (sb-sys:wait-until-fd-usable (lfd ep) :input 0)) open))
                        (return))

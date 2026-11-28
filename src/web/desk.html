@@ -1,0 +1,38 @@
+<!doctype html>
+<!-- The glass desk in a browser: served by glass's web endpoint (src/web.lisp), which also
+     serves noVNC's core/ and vendor/ beside this page and carries RFB over the WebSocket at
+     /websockify.  ?resize=1 asks the desk to match the window (RFB SetDesktopSize) instead
+     of scaling the desk to fit it. -->
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>glass desk</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #202020; overflow: hidden; }
+    #screen { width: 100vw; height: 100vh; }
+    #status { position: fixed; top: 8px; left: 50%; transform: translateX(-50%); z-index: 10;
+              font: 13px/1.4 system-ui, sans-serif; color: #eee; background: rgba(0,0,0,.7);
+              padding: 6px 12px; border-radius: 6px; }
+    #status:empty { display: none; }
+  </style>
+</head>
+<body>
+  <div id="screen"></div>
+  <div id="status">connecting&hellip;</div>
+  <script type="module">
+    import RFB from './core/rfb.js';
+    const status = document.getElementById('status');
+    const params = new URLSearchParams(location.search);
+    const url = (location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host + '/websockify';
+    const rfb = new RFB(document.getElementById('screen'), url, { wsProtocols: ['binary'] });
+    if (params.get('resize') === '1') rfb.resizeSession = true; else rfb.scaleViewport = true;
+    rfb.focusOnClick = true;
+    rfb.addEventListener('connect', () => { status.textContent = ''; rfb.focus(); });
+    rfb.addEventListener('disconnect', e => {
+      status.textContent = e.detail.clean ? 'the desk closed the connection' : 'the connection to the desk was lost';
+    });
+    rfb.addEventListener('desktopname', e => { document.title = e.detail.name || 'glass desk'; });
+  </script>
+</body>
+</html>

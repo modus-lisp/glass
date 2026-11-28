@@ -55,17 +55,28 @@
                   collect (list label s :width w :height h))))
 
 (defun serve-wm (port &rest args &key width height apps open address clients stop audio-port
-                                      audio-path)
+                                      audio-path web-port on-ready)
   "Serve the window manager WIDTH x HEIGHT on PORT: a network thread (every viewer), a
    compositor thread, and this thread the Lisp listener REPL windows evaluate on.  APPS is a
    list of (LABEL MAKE-FN &key WIDTH HEIGHT), MAKE-FN a symbol or global function returning the
    app contract (see wm.lisp); OPEN lists labels to open at start.  CLIENTS and STOP are
    SERVE-MULTI's.  AUDIO-PORT (or AUDIO-PATH, a UNIX socket) serves the desktop's sound as
    glass-audio/1 -- the McCLIM desktop's convention is PORT + 10, where the WebRTC gateway
-   looks -- and needs glass/wm-sound loaded (sound.lisp).  Returns when the network side does."
-  (declare (ignore width height apps open address clients stop audio-port audio-path))
-  (multiple-value-bind (listener network compositor) (apply #'start-wm port args)
-    (unwind-protect (glass-repl:run-listener listener)
+   looks -- and needs glass/wm-sound loaded (sound.lisp).  WEB-PORT, if given, also serves the
+   home seat to web browsers on that port (src/web.lisp: noVNC over HTTP, RFB over a WebSocket),
+   on ADDRESS as the RFB port is; 0 for any free port.  ON-READY, if given, is called on this
+   thread once the network has bound its listeners, with the home RFB port and the web port (NIL
+   if there is none, or it could not be bound) -- e.g. to print the URL, or open a browser on it.
+   Returns when the network side does."
+  (declare (ignore width height apps open address clients stop audio-port audio-path web-port))
+  (multiple-value-bind (listener network compositor session)
+      (apply #'start-wm port (progn (remf args :on-ready) args))
+    (unwind-protect
+         (progn
+           (when on-ready
+             (multiple-value-bind (home web) (wm-session-ports session)
+               (when home (funcall on-ready home web))))
+           (glass-repl:run-listener listener))
       (stop-wm listener network compositor))))
 
 ;;; ---- the session: what a caller holds to ask for seats ---------------------------------------
@@ -80,6 +91,8 @@
    (wake     :initarg :wake     :reader %session-wake)
    (requests :initarg :requests :reader %session-requests)    ; to the network: open a seat's listener
    (replies  :initarg :replies  :reader %session-replies)     ; from the network: its port
+   (ports-box :initarg :ports-box :reader %session-ports-box) ; from the network: what it bound
+   (ports    :initform nil :accessor %session-ports)
    (lock     :initform (sb-thread:make-mutex :name "glass-wm-seats") :reader %session-lock)
    ;; KEY -> (ID PORT FB CLIPBOARD), every seat but the home one, for the life of the session
    (seats    :initform (make-hash-table :test 'equal) :reader %session-seats)
@@ -157,6 +170,19 @@
         (setf (gethash key (%session-seats session)) (list id port fb clipboard))
         (values port id)))))
 
+(defun wm-session-ports (session &key (timeout 30))
+  "(values HOME-PORT WEB-PORT): the ports SESSION's network thread bound -- the home seat's RFB
+   port, and the web port or NIL -- waiting (at most TIMEOUT seconds) for it to have bound them.
+   NIL NIL if the network never said (it failed to start).  Call it from START-WM's thread."
+  (let ((session (wm-session session)))
+    (unless (%session-ports session)
+      (let ((deadline (+ (get-internal-real-time) (* timeout internal-time-units-per-second))))
+        (loop until (or (%session-ports session) (> (get-internal-real-time) deadline))
+              do (dolist (m (glass::mb-take (%session-ports-box session)))
+                   (when (eq (first m) :ports) (setf (%session-ports session) (rest m))))
+                 (unless (%session-ports session) (sleep 0.005)))))
+    (values (first (%session-ports session)) (second (%session-ports session)))))
+
 (defun wm-session-seat-keys (session)
   "The keys of every seat SESSION has made (the home seat, NIL, is not among them)."
   (let ((session (wm-session session)) (keys '()))
@@ -183,7 +209,7 @@
   (when (eq glass-repl:*listener* listener) (setf glass-repl:*listener* nil)))
 
 (defun start-wm (port &key (width 800) (height 600) (apps (wm-available-apps)) (open '("Clock"))
-                           (address "127.0.0.1") clients stop audio-port audio-path)
+                           (address "127.0.0.1") clients stop audio-port audio-path web-port)
   "SERVE-WM without its listener loop: start the network and compositor threads and return
    (values LISTENER NETWORK COMPOSITOR SESSION) at once.  THIS thread must then serve LISTENER --
    GLASS-REPL:RUN-LISTENER, or GLASS-REPL:LISTENER-TURN from a loop of its own (one process that
@@ -203,11 +229,15 @@
          ;; WM-SEAT-PORT's asks of the network, and its answers
          (requests (glass::%share (glass::make-rfb-mailbox)))
          (replies (glass::%share (glass::make-rfb-mailbox)))
+         (ports-box (glass::%share (glass::make-rfb-mailbox)))
+         ;; the web's files, found HERE: on modus the network thread may not ask ASDF
+         (web-files (and web-port (list (glass.web:web-root) (glass.web:web-index))))
          (wake (glass:make-wake))
          (listener (glass-repl:make-listener))
          (session (make-instance 'wm-session :port port :address address :width width :height height
                                              :listener listener :inbox inbox :wake wake
-                                             :requests requests :replies replies))
+                                             :requests requests :replies replies
+                                             :ports-box ports-box))
          (compositor (progn
                        (setf glass-repl:*listener* listener)
                        (sb-thread:make-thread #'%wm-compositor
@@ -217,7 +247,7 @@
                                          :arguments (list fb port address clients stop
                                                           inbox wake listener
                                                           sound sound-box audio-port audio-path
-                                                          requests replies)
+                                                          requests replies web-port web-files ports-box)
                                          :name "glass-wm-network")))
     (sb-thread:with-mutex (*wm-sessions-lock*) (push session *wm-sessions*))
     (values listener network compositor session)))
@@ -225,27 +255,52 @@
 ;;; ---- the network thread ----------------------------------------------------------------------
 
 (defun %wm-network (fb port address clients stop inbox wake listener
-                    sound sound-box audio-port audio-path requests replies)
+                    sound sound-box audio-port audio-path requests replies web-port web-files ports-box)
   "The network thread: every seat's viewers, and the sound's listeners, until SERVE-ENDPOINTS
    returns; then stop the others."
   (let ((out nil))
     (flet ((post (m) (glass::mb-post inbox m) (glass:wake-signal wake)))
       (unwind-protect
            (handler-case
-               (let* ((home (glass:make-rfb-endpoint
-                             :listen (glass:tcp-listen port :address address) :fb fb
+               (let* ((on-key (lambda (down key) (post (list :key down key))))
+                      (on-pointer (lambda (mask x y) (post (list :pointer mask x y))))
+                      ;; A CLIENT ASKING FOR A SIZE (SetDesktopSize) gets the screen it
+                      ;; asked for: a phone a phone-shaped desktop, not a letterbox.  The
+                      ;; compositor does it, between frames, as it does input.
+                      (on-resize (lambda (w h) (post (list :resize w h))))
+                      (home-sock (glass:tcp-listen port :address address))
+                      (home-port (nth-value 1 (sb-bsd-sockets:socket-name home-sock)))
+                      (home (glass:make-rfb-endpoint
+                             :listen home-sock :fb fb
                              :clipboard (glass:session-clipboard)
-                             :on-key (lambda (down key) (post (list :key down key)))
-                             :on-pointer (lambda (mask x y) (post (list :pointer mask x y)))
-                             ;; A CLIENT ASKING FOR A SIZE (SetDesktopSize) gets the screen it
-                             ;; asked for: a phone a phone-shaped desktop, not a letterbox.  The
-                             ;; compositor does it, between frames, as it does input.
-                             :on-resize (lambda (w h) (post (list :resize w h)))))
-                      (endpoints (list home))
+                             :on-key on-key :on-pointer on-pointer :on-resize on-resize))
+                      ;; THE WEB: the home seat again, to browsers -- the same screen, input and
+                      ;; clipboard, behind an HTTP opener (src/web.lisp).  A port that will not bind
+                      ;; costs the web, not the desk.
+                      (web (and web-port
+                                (handler-case
+                                    (glass:make-rfb-endpoint
+                                     :listen (glass:tcp-listen web-port :address address) :fb fb
+                                     :clipboard (glass:session-clipboard)
+                                     :on-key on-key :on-pointer on-pointer :on-resize on-resize
+                                     :opener (glass.web:make-web-opener :address address
+                                                                       :root (first web-files)
+                                                                       :index (second web-files)))
+                                  (error (e)
+                                    (format *error-output* "~&glass wm: no web endpoint on port ~d (~a)~%"
+                                            web-port e)
+                                    (force-output *error-output*)
+                                    nil))))
+                      (web-actual (and web (nth-value 1 (sb-bsd-sockets:socket-name
+                                                         (glass::ep-listen web)))))
+                      (endpoints (if web (list home web) (list home)))
                       (seats '()))                ; ((id endpoint . viewers-last-told) ...)
                  (format *error-output* "~&glass: RFB server (all clients, one thread) on port ~d (~dx~d)~%"
-                         port (glass:fb-width fb) (glass:fb-height fb))
+                         home-port (glass:fb-width fb) (glass:fb-height fb))
+                 (when web
+                   (format *error-output* "~&glass: the same desk to web browsers on port ~d~%" web-actual))
                  (force-output *error-output*)
+                 (glass::mb-post ports-box (list :ports home-port web-actual))
                  ;; A desktop whose sound will not come up is a working desktop; one that did not
                  ;; start is not (START-SESSION-AUDIO's rule).  The compositor still mixes -- the
                  ;; mixer is the player's clock -- and posts nothing, nobody having said they listen.
