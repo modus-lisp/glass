@@ -83,8 +83,11 @@ framebuffers, composited and served over RFB --
 `(glass.wm:serve-wm 5900 :width 1024 :height 700)`, then point any VNC client at
 `localhost:5900`.  Its applications are glass windows: Clock, Notes, Paint, Media, a Lisp
 listener and a terminal, and Files (warren), Browser (loom), Podcasts (spool), Speak,
-Listen, Mixer and Remote where their systems are loaded.  modus's
-`scripts/glass-desk.lisp` starts it from a source tree with nothing else installed.
+Listen, Mixer and Remote where their systems are loaded.  `:web-port 6080` also serves it
+to web browsers at `http://localhost:6080/` (`:glass/web`: noVNC, vendored in
+glass-webrtc, over HTTP, and RFB over a WebSocket, from the same network thread).  modus's
+`scripts/glass-desk.lisp` (`modus.com desk`) starts it from a source tree with nothing else
+installed, and opens a browser on it.
 
 It replaced an earlier desktop built on McCLIM (`backend/`, `mcclim-glass`), removed on
 2026-11-25: McCLIM did not run where glass runs, and every application it offered has a
